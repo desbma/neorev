@@ -35,6 +35,7 @@ import base64
 import binascii
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -58,11 +59,19 @@ WHITE = f"{CSI}37m"
 
 ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+HELP_BOX_WIDTH = 57
 
 HUNK_BODY_MAX_LINES = 10
+HUNK_BODY_CONTEXT_LINES = HUNK_BODY_MAX_LINES // 2
 BITS_PER_BYTE = 8
 COMMENT_PREVIEW_MAX = 60
 GLOBAL_NOTES_BOX_WIDTH = 60
+ESC_SEQUENCE_TIMEOUT = 0.05
+CHROME_ROWS = 3  # top bar + markers + footer
+MIN_VISIBLE_ROWS = 3
+MARKER_WIDTH = 3  # each marker is 3 visible chars (e.g. "[✓]" or " · ")
+ARROW_WIDTH = 2  # "◀ " or " ▶"
+SCROLL_INDICATOR_ROWS = 2  # up + down indicators
 
 OUTPUT_PREAMBLE = """\
 # Code Review
@@ -311,7 +320,11 @@ def write_hunk_annotation(out: StringIO, hunk: Hunk) -> None:
 
     body_lines = hunk.body.splitlines()
     if len(body_lines) > HUNK_BODY_MAX_LINES:
-        trimmed = [*body_lines[:5], "# ...", *body_lines[-5:]]
+        trimmed = [
+            *body_lines[:HUNK_BODY_CONTEXT_LINES],
+            "# ...",
+            *body_lines[-HUNK_BODY_CONTEXT_LINES:],
+        ]
     else:
         trimmed = body_lines
 
@@ -353,7 +366,7 @@ def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
         bits = base64.b64decode(encoded)
     except (ValueError, binascii.Error):
         return []
-    expected_bytes = (num_hunks + 7) // 8
+    expected_bytes = (num_hunks + BITS_PER_BYTE - 1) // BITS_PER_BYTE
     if len(bits) != expected_bytes:
         return []
     result: list[bool] = []
@@ -506,6 +519,11 @@ def visible_text_length(line: bytes) -> int:
         return len(stripped)
 
 
+def visible_len(text: str) -> int:
+    """Return the visible character count of *text* (ignoring ANSI escapes)."""
+    return len(ANSI_ESCAPE_TEXT_RE.sub("", text))
+
+
 def estimate_wrapped_rows(line: bytes, term_width: int) -> int:
     """Estimate how many terminal rows *line* occupies after wrapping."""
     vlen = visible_text_length(line)
@@ -602,18 +620,17 @@ def compute_diff_viewport(
     """
     Compute which diff lines are visible given the terminal geometry.
 
-    The fixed chrome occupies 3 rows (top bar + markers + footer).
+    The fixed chrome occupies ``CHROME_ROWS`` rows (top bar + markers + footer).
     Scroll indicators are reserved only when actually needed.
     """
     total_lines = len(line_rows)
     total_content_rows = sum(line_rows)
-    base_chrome = 3  # top bar + markers + footer
-    max_avail = term_height - base_chrome
+    max_avail = term_height - CHROME_ROWS
 
     needs_scrolling = total_content_rows > max_avail
 
     if needs_scrolling:
-        avail_at_bottom = max(max_avail - 1, 3)
+        avail_at_bottom = max(max_avail - 1, MIN_VISIBLE_ROWS)
         max_offset = 0
         for i in range(total_lines):
             if sum(line_rows[i:]) <= avail_at_bottom:
@@ -627,7 +644,7 @@ def compute_diff_viewport(
         can_scroll_down = scroll_offset < max_offset
 
         indicator_rows = (1 if can_scroll_up else 0) + (1 if can_scroll_down else 0)
-        avail_rows = max(max_avail - indicator_rows, 3)
+        avail_rows = max(max_avail - indicator_rows, MIN_VISIBLE_ROWS)
         visible_count = count_fitting_lines(line_rows, scroll_offset, avail_rows)
     else:
         scroll_offset = 0
@@ -709,11 +726,8 @@ def build_progress_markers(
     total = len(hunks)
     prefix = "  "
     prefix_width = 2
-    marker_width = 3  # each marker is 3 visible chars
-    arrow_width = 2  # "◀ " or " ▶"
-
     available = term_width - prefix_width
-    max_markers = available // marker_width
+    max_markers = available // MARKER_WIDTH
 
     if max_markers >= total:
         markers = [
@@ -721,7 +735,7 @@ def build_progress_markers(
         ]
         return prefix + "".join(markers)
 
-    slots = (available - arrow_width * 2) // marker_width
+    slots = (available - ARROW_WIDTH * 2) // MARKER_WIDTH
     slots = max(slots, 1)
 
     half = slots // 2
@@ -739,8 +753,8 @@ def build_progress_markers(
 
     if not need_left or not need_right:
         extra = (
-            available - (arrow_width if need_left or need_right else 0)
-        ) // marker_width
+            available - (ARROW_WIDTH if need_left or need_right else 0)
+        ) // MARKER_WIDTH
         extra = max(extra, 1)
         if extra > slots:
             slots = min(extra, total)
@@ -775,18 +789,19 @@ def build_footer_line(term_width: int) -> str:
         ("?", "help"),
     ]
     parts: list[str] = []
-    visible_len = 0
+    used = 0
     truncated = False
     for i, (key, label) in enumerate(segments):
         sep = "  " if i > 0 else ""
-        segment_visible = len(sep) + len(key) + 1 + len(label)
-        if visible_len + segment_visible > term_width:
+        segment = f"{sep}{DIM}{key}{RESET} {label}"
+        segment_width = visible_len(segment)
+        if used + segment_width > term_width:
             truncated = True
             break
-        parts.append(f"{sep}{DIM}{key}{RESET} {label}")
-        visible_len += segment_visible
-    if truncated and visible_len < term_width:
-        padding = term_width - visible_len - 1
+        parts.append(segment)
+        used += segment_width
+    if truncated and used < term_width:
+        padding = term_width - used - visible_len("…")
         parts.append(f"{' ' * padding}{DIM}…{RESET}")
     return "".join(parts)
 
@@ -870,6 +885,9 @@ class Terminal:
         """Read one keypress, normalising arrow-key escape sequences."""
         ch = os.read(self.fd, 1)
         if ch == self.ESC_BYTE:
+            ready, _, _ = select.select([self.fd], [], [], ESC_SEQUENCE_TIMEOUT)
+            if not ready:
+                return "esc"
             seq = os.read(self.fd, 2)
             if seq == self.ARROW_UP_SEQ:
                 return "up"
@@ -1001,66 +1019,55 @@ class Terminal:
     def render_help_screen(self) -> None:
         """Display the keyboard shortcuts help overlay."""
         self.write(self.CLEAR_SCREEN)
-        box_width = 57
-        border = "─" * box_width
+        border = "─" * HELP_BOX_WIDTH
 
-        def row(text: str, visible_len: int) -> None:
-            """Write a box row, padding to *box_width*."""
-            pad = box_width - visible_len
+        def row(text: str) -> None:
+            """Write a box row, padding to *HELP_BOX_WIDTH*."""
+            pad = HELP_BOX_WIDTH - visible_len(text)
             self.write(f"│{text}{' ' * pad}│\r\n")
 
         def empty() -> None:
             """Write an empty box row."""
-            self.write(f"│{' ' * box_width}│\r\n")
+            self.write(f"│{' ' * HELP_BOX_WIDTH}│\r\n")
 
         self.write(f"┌{border}┐\r\n")
-        row(f"{BOLD}  neorev — Keyboard Shortcuts{RESET}", 29)
+        row(f"{BOLD}  neorev — Keyboard Shortcuts{RESET}")
         self.write(f"├{border}┤\r\n")
         empty()
-        row(f"  {BOLD}j / ↓{RESET}         Next hunk", 27)
-        row(f"  {BOLD}k / ↑{RESET}         Previous hunk", 31)
-        row(f"  {BOLD}Ctrl-D{RESET}        Scroll diff down (half page)", 45)
-        row(f"  {BOLD}Ctrl-U{RESET}        Scroll diff up (half page)", 43)
-        row(f"  {BOLD}a{RESET}             Approve hunk (no comment)", 42)
-        row(f"  {BOLD}A{RESET}             Approve all hunks in current file", 50)
-        row(f"  {BOLD}c{RESET}             Question about this hunk ($EDITOR)", 45)
-        row(f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)", 42)
-        row(f"  {BOLD}gc{RESET}            Global question ($EDITOR)", 39)
-        row(f"  {BOLD}gf{RESET}            Global change request ($EDITOR)", 43)
-        row(f"  {BOLD}G{RESET}             Manage global notes (edit/delete)", 49)
-        row(f"  {BOLD}q / Ctrl-C{RESET}    Quit → write output to file", 43)
-        row(f"  {BOLD}?{RESET}             This help", 25)
+        row(f"  {BOLD}j / ↓{RESET}         Next hunk")
+        row(f"  {BOLD}k / ↑{RESET}         Previous hunk")
+        row(f"  {BOLD}Ctrl-D{RESET}        Scroll diff down (half page)")
+        row(f"  {BOLD}Ctrl-U{RESET}        Scroll diff up (half page)")
+        row(f"  {BOLD}a{RESET}             Approve hunk (no comment)")
+        row(f"  {BOLD}A{RESET}             Approve all hunks in current file")
+        row(f"  {BOLD}c{RESET}             Question about this hunk ($EDITOR)")
+        row(f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)")
+        row(f"  {BOLD}gc{RESET}            Global question ($EDITOR)")
+        row(f"  {BOLD}gf{RESET}            Global change request ($EDITOR)")
+        row(f"  {BOLD}G{RESET}             Manage global notes (edit/delete)")
+        row(f"  {BOLD}q / Ctrl-C{RESET}    Quit → write output to file")
+        row(f"  {BOLD}?{RESET}             This help")
         empty()
-        row(f"  {DIM}a  = looks good, no action needed{RESET}", 36)
-        row(
-            f"  {DIM}c  = ask a question (agent answers, no code change){RESET}",
-            54,
-        )
-        row(f"  {DIM}f  = request a change (agent modifies code){RESET}", 47)
-        row(
-            f"  {DIM}gc = global question (not tied to a specific hunk){RESET}",
-            53,
-        )
-        row(
-            f'  {DIM}gf = global change request (e.g. "add tests for X"){RESET}',
-            54,
-        )
+        row(f"  {DIM}a  = looks good, no action needed{RESET}")
+        row(f"  {DIM}c  = ask a question (agent answers, no code change){RESET}")
+        row(f"  {DIM}f  = request a change (agent modifies code){RESET}")
+        row(f"  {DIM}gc = global question (not tied to a specific hunk){RESET}")
+        row(f'  {DIM}gf = global change request (e.g. "add tests for X"){RESET}')
         empty()
-        row(f"  Set {BOLD}$EDITOR{RESET} (e.g. hx, nvim) for multi-line", 44)
-        row("  comments. Without it, single-line prompt is used.", 51)
+        row(f"  Set {BOLD}$EDITOR{RESET} (e.g. hx, nvim) for multi-line")
+        row("  comments. Without it, single-line prompt is used.")
         empty()
-        row(f"  {DIM}Press any key to return.{RESET}", 26)
+        row(f"  {DIM}Press any key to return.{RESET}")
         self.write(f"└{border}┘\r\n")
 
     def render_global_notes_screen(self, notes: list[GlobalNote]) -> None:
         """Display the global notes management overlay."""
         self.write(self.CLEAR_SCREEN)
         border = "─" * GLOBAL_NOTES_BOX_WIDTH
-        preview_max = GLOBAL_NOTES_BOX_WIDTH - 18
 
-        def row(text: str, visible_len: int) -> None:
-            """Write a box row, padding to box width."""
-            pad = GLOBAL_NOTES_BOX_WIDTH - visible_len
+        def row(text: str) -> None:
+            """Write a box row, padding to *GLOBAL_NOTES_BOX_WIDTH*."""
+            pad = GLOBAL_NOTES_BOX_WIDTH - visible_len(text)
             self.write(f"│{text}{' ' * pad}│\r\n")
 
         def empty() -> None:
@@ -1068,12 +1075,12 @@ class Terminal:
             self.write(f"│{' ' * GLOBAL_NOTES_BOX_WIDTH}│\r\n")
 
         self.write(f"┌{border}┐\r\n")
-        row(f"{BOLD}  Global Notes{RESET}", 14)
+        row(f"{BOLD}  Global Notes{RESET}")
         self.write(f"├{border}┤\r\n")
         empty()
 
         if not notes:
-            row(f"  {DIM}No global notes yet.{RESET}", 22)
+            row(f"  {DIM}No global notes yet.{RESET}")
         else:
             for i, note in enumerate(notes):
                 num = i + 1
@@ -1082,21 +1089,16 @@ class Terminal:
                     if note.kind == "flag"
                     else f"{YELLOW}question{RESET}"
                 )
-                kind_visible = 8 if note.kind == "question" else 4
                 preview = note.text.replace("\n", " ")
-                if len(preview) > preview_max:
-                    preview = preview[: preview_max - 1] + "…"
-                visible = 7 + len(str(num)) + kind_visible + len(preview)
-                row(
-                    f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}",
-                    visible,
+                max_preview = GLOBAL_NOTES_BOX_WIDTH - visible_len(
+                    f"  {BOLD}{num}{RESET}. [{kind_str}] ",
                 )
+                if len(preview) > max_preview:
+                    preview = preview[: max_preview - 1] + "…"
+                row(f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}")
 
         empty()
-        row(
-            f"  {BOLD}e{RESET}N edit  {BOLD}d{RESET}N delete  {BOLD}q{RESET} back",
-            28,
-        )
+        row(f"  {BOLD}e{RESET}N edit  {BOLD}d{RESET}N delete  {BOLD}q{RESET} back")
         self.write(f"└{border}┘\r\n")
 
     def parse_note_index(self, notes: list[GlobalNote]) -> int | None:
@@ -1192,7 +1194,7 @@ class Terminal:
         redraw: Callable[[], None],
     ) -> bool:
         """Handle scroll keys (Ctrl-D/Ctrl-U), returning True if handled."""
-        half = max(1, (self.height - 5) // 2)
+        half = max(1, (self.height - CHROME_ROWS - SCROLL_INDICATOR_ROWS) // 2)
         if key == self.KEY_CTRL_D:
             state.scroll_offset += half
         elif key == self.KEY_CTRL_U:
