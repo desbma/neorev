@@ -1,0 +1,83 @@
+# neorev
+
+**_Human review for agent diffs_**
+
+TUI tool optimized for efficient review of code produced by coding agents.
+
+Pipe diff from `git` or `jj` to `neorev`, view and annotate hunks, then send the output text directly to the agent.
+
+## Features
+
+- Simple terminal UI optimized for efficiency
+- Review annotations can be:
+  - scoped/global
+  - request for change or question
+- Minimal solution:
+  - single file, no Python dependencies
+  - rely on [`delta`](https://github.com/dandavison/delta) for diff formatting and coloring
+  - rely on your editor to write annotations
+- Quit and resume review without losing state
+- Review output:
+  - can be pasted directly in agent terminal
+  - is unambiguous to reduce back and forth
+  - is concise to reduce context window usage
+
+Main screen:
+![TUI](./ui.png)
+
+## Why
+
+This tool may be for you if you use coding agents, but want to keep control of code quality by reviewing every line of code **carefully** and **efficiently**.
+
+Efficiently here means that :
+
+- **you** should view and process the diff, jump between hunks and files quickly, flag hunks or add questions naturally
+- **the agent** should process the review **unambiguously** and understand which actions are required, to minimize round trips
+
+Agents are not like humans. They don't need you to be nice or polite, in fact studies have proven this degrades their output. They however may be eager to change code when you were in fact just asking a question. Also their context window can fill up quickly after several rounds of review. Code review tools made for humans just don't cut it here.
+
+## Install
+
+Install [delta](https://github.com/dandavison/delta) (you haven't already, seriously?), ensure you have a recent Python version, download [`neorev`](https://raw.githubusercontent.com/desbma/neorev/master/neorev) from this repository, make it executable and you are ready to go.
+
+```bash
+curl https://raw.githubusercontent.com/desbma/neorev/master/neorev -o neorev
+chmod +x ./neorev
+```
+
+## Usage
+
+1. Pipe any unified diff into `neorev` with an output file:
+
+```bash
+git diff HEAD~1 | neorev review.txt
+jj show XXX | neorev review.txt
+```
+
+2. Navigate and annotate hunks in the TUI:
+
+```
+j / ↓         Next hunk
+k / ↑         Previous hunk
+Ctrl-D        Scroll diff down (half page)
+Ctrl-U        Scroll diff up (half page)
+a             Approve hunk (no comment needed)
+A             Approve all hunks in current file
+c             Question about this hunk (opens $EDITOR)
+f             Flag hunk: request a change (opens $EDITOR)
+gc            Global question, not tied to a specific hunk
+gf            Global flag (request a change), not tied to a specific hunk
+G             Manage global notes (edit / delete)
+q / Ctrl-C    Quit and write output to file
+?             Show help
+```
+
+3. Send the output to the agent
+
+Pasting `@review.txt` in the agent window is all that is required. Since the output is unambiguous any additional message like "please process the attached review" is a pure waste of tokens and your time typing it.
+
+Pass `-c`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to clipboard (requires `xclip`).
+
+## License
+
+[GPLv3](https://www.gnu.org/licenses/gpl-3.0-standalone.html)
