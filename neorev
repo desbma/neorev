@@ -25,6 +25,7 @@ Keys:
     f             Flag hunk: request a change (opens $EDITOR)
     gc            Global question, not tied to a specific hunk
     gf            Global flag (request a change), not tied to a specific hunk
+    G             Manage global notes (edit / delete)
     q / Ctrl-C    Quit and write output to file
     ?             Show help
 """
@@ -61,6 +62,7 @@ ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 HUNK_BODY_MAX_LINES = 10
 BITS_PER_BYTE = 8
 COMMENT_PREVIEW_MAX = 60
+GLOBAL_NOTES_BOX_WIDTH = 60
 
 OUTPUT_PREAMBLE = """\
 # Code Review
@@ -768,6 +770,7 @@ def build_footer_line(term_width: int) -> str:
         ("a/A", "approve hunk/file"),
         ("c/f", "question/flag"),
         ("gc/gf", "global"),
+        ("G", "manage global"),
         ("q", "quit & save"),
         ("?", "help"),
     ]
@@ -1024,6 +1027,7 @@ class Terminal:
         row(f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)", 42)
         row(f"  {BOLD}gc{RESET}            Global question ($EDITOR)", 39)
         row(f"  {BOLD}gf{RESET}            Global change request ($EDITOR)", 43)
+        row(f"  {BOLD}G{RESET}             Manage global notes (edit/delete)", 49)
         row(f"  {BOLD}q / Ctrl-C{RESET}    Quit → write output to file", 43)
         row(f"  {BOLD}?{RESET}             This help", 25)
         empty()
@@ -1047,6 +1051,95 @@ class Terminal:
         empty()
         row(f"  {DIM}Press any key to return.{RESET}", 26)
         self.write(f"└{border}┘\r\n")
+
+    def render_global_notes_screen(self, notes: list[GlobalNote]) -> None:
+        """Display the global notes management overlay."""
+        self.write(self.CLEAR_SCREEN)
+        border = "─" * GLOBAL_NOTES_BOX_WIDTH
+        preview_max = GLOBAL_NOTES_BOX_WIDTH - 18
+
+        def row(text: str, visible_len: int) -> None:
+            """Write a box row, padding to box width."""
+            pad = GLOBAL_NOTES_BOX_WIDTH - visible_len
+            self.write(f"│{text}{' ' * pad}│\r\n")
+
+        def empty() -> None:
+            """Write an empty box row."""
+            self.write(f"│{' ' * GLOBAL_NOTES_BOX_WIDTH}│\r\n")
+
+        self.write(f"┌{border}┐\r\n")
+        row(f"{BOLD}  Global Notes{RESET}", 14)
+        self.write(f"├{border}┤\r\n")
+        empty()
+
+        if not notes:
+            row(f"  {DIM}No global notes yet.{RESET}", 22)
+        else:
+            for i, note in enumerate(notes):
+                num = i + 1
+                kind_str = (
+                    f"{RED}flag{RESET}"
+                    if note.kind == "flag"
+                    else f"{YELLOW}question{RESET}"
+                )
+                kind_visible = 8 if note.kind == "question" else 4
+                preview = note.text.replace("\n", " ")
+                if len(preview) > preview_max:
+                    preview = preview[: preview_max - 1] + "…"
+                visible = 7 + len(str(num)) + kind_visible + len(preview)
+                row(
+                    f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}",
+                    visible,
+                )
+
+        empty()
+        row(
+            f"  {BOLD}e{RESET}N edit  {BOLD}d{RESET}N delete  {BOLD}q{RESET} back",
+            28,
+        )
+        self.write(f"└{border}┘\r\n")
+
+    def parse_note_index(self, notes: list[GlobalNote]) -> int | None:
+        """Read digit keys and return a zero-based note index, or None."""
+        digits = self.read_key()
+        if not digits.isdigit():
+            return None
+        num = int(digits)
+        if 1 <= num <= len(notes):
+            return num - 1
+        return None
+
+    def handle_manage_global_notes(self, state: ReviewState) -> None:
+        """Interactive screen to edit or delete existing global notes."""
+        while True:
+            self.render_global_notes_screen(state.global_notes)
+            key = self.read_key()
+
+            if key in ("q", "esc", self.KEY_CTRL_C):
+                break
+
+            if key == "e" and state.global_notes:
+                idx = self.parse_note_index(state.global_notes)
+                if idx is not None:
+                    note = state.global_notes[idx]
+                    kind_label = (
+                        "global change request"
+                        if note.kind == "flag"
+                        else "global question (agent answers, no code change)"
+                    )
+                    new_text = self.edit_text_outside_tui(note.text, kind_label)
+                    if new_text:
+                        note.text = new_text
+                    else:
+                        del state.global_notes[idx]
+                    tty.setraw(self.fd)
+                continue
+
+            if key == "d" and state.global_notes:
+                idx = self.parse_note_index(state.global_notes)
+                if idx is not None:
+                    del state.global_notes[idx]
+                continue
 
     def handle_hunk_comment(self, state: ReviewState, key: str) -> None:
         """Handle ``c`` (question) or ``f`` (flag) on the current hunk."""
@@ -1134,6 +1227,8 @@ class Terminal:
             if key2 not in ("c", "f"):
                 return False
             self.handle_global_note(state, key2)
+        elif key == "G":
+            self.handle_manage_global_notes(state)
         elif key == "?":
             self.render_help_screen()
             self.read_key()
