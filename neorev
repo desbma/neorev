@@ -20,6 +20,7 @@ Keys:
     Ctrl-D        Scroll diff down (half page)
     Ctrl-U        Scroll diff up (half page)
     a             Approve hunk (no comment needed)
+    A             Approve all hunks in current file
     c             Question about this hunk (opens $EDITOR)
     f             Flag hunk: request a change (opens $EDITOR)
     gc            Global question, not tied to a specific hunk
@@ -916,6 +917,7 @@ def _render_footer(term_height: int, viewport: DiffViewport) -> None:
     tty_write(
         f"{DIM}j/k{RESET} navigate  "
         f"{DIM}a{RESET} approve  "
+        f"{DIM}A{RESET} approve file  "
         f"{DIM}c{RESET} question  "
         f"{DIM}f{RESET} flag  "
         f"{DIM}gc/gf{RESET} global  "
@@ -952,7 +954,8 @@ def render_help_screen() -> None:
     row(f"  {BOLD}k / ↑{RESET}         Previous hunk", 31)
     row(f"  {BOLD}Ctrl-D{RESET}        Scroll diff down (half page)", 45)
     row(f"  {BOLD}Ctrl-U{RESET}        Scroll diff up (half page)", 43)
-    row(f"  {BOLD}a{RESET}             Approve (no comment)", 37)
+    row(f"  {BOLD}a{RESET}             Approve hunk (no comment)", 42)
+    row(f"  {BOLD}A{RESET}             Approve all hunks in current file", 50)
     row(f"  {BOLD}c{RESET}             Question about this hunk ($EDITOR)", 45)
     row(f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)", 42)
     row(f"  {BOLD}gc{RESET}            Global question ($EDITOR)", 39)
@@ -1011,6 +1014,16 @@ def handle_approve(state: ReviewState) -> None:
         hunk.status = "approved"
         hunk.comment = ""
         state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
+
+
+def handle_approve_file(state: ReviewState) -> None:
+    """Approve all hunks belonging to the same file as the current hunk."""
+    current_file = state.hunks[state.current_index].file_path
+    for hunk in state.hunks:
+        if hunk.file_path == current_file and hunk.status != "approved":
+            hunk.status = "approved"
+            hunk.comment = ""
+    state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
 
 
 def handle_hunk_comment(
@@ -1131,6 +1144,8 @@ def run_review_loop(
             continue
         elif key == "a":
             handle_approve(state)
+        elif key == "A":
+            handle_approve_file(state)
         elif key in ("c", "f"):
             handle_hunk_comment(state, key, tty_in_fd, old_term_attrs)
         elif key == "g":
