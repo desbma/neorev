@@ -31,6 +31,7 @@ Keys:
 
 import argparse
 import base64
+import binascii
 import os
 import re
 import subprocess
@@ -38,8 +39,10 @@ import sys
 import tempfile
 import termios
 import tty
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,6 +67,10 @@ CURSOR_SHOW = f"{CSI}?25h"
 
 ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+HUNK_BODY_MAX_LINES = 10
+BITS_PER_BYTE = 8
+COMMENT_PREVIEW_MAX = 60
 
 OUTPUT_PREAMBLE = """\
 # Code Review
@@ -152,9 +159,11 @@ def parse_diff(diff_text: str) -> list[Hunk]:
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("diff --git") or line.startswith("diff "):
+        if line.startswith(("diff --git", "diff ")):
             current_file_header, current_file_path, i = _parse_file_header(
-                lines, i, current_file_path
+                lines,
+                i,
+                current_file_path,
             )
             continue
 
@@ -169,9 +178,12 @@ def parse_diff(diff_text: str) -> list[Hunk]:
 
 
 def _parse_file_header(
-    lines: list[str], start: int, current_file_path: str
+    lines: list[str],
+    start: int,
+    current_file_path: str,
 ) -> tuple[str, str, int]:
-    """Parse a diff file header block starting at *start*.
+    """
+    Parse a diff file header block starting at *start*.
 
     Returns (file_header, file_path, next_line_index).
     """
@@ -186,8 +198,7 @@ def _parse_file_header(
         header_lines.append(lines[i])
         if lines[i].startswith("+++ "):
             path = lines[i][4:].strip()
-            if path.startswith("b/"):
-                path = path[2:]
+            path = path.removeprefix("b/")
             file_path = path
         i += 1
     file_header = "".join(header_lines).rstrip("\n")
@@ -195,9 +206,13 @@ def _parse_file_header(
 
 
 def _parse_hunk_body(
-    lines: list[str], start: int, file_header: str, file_path: str
+    lines: list[str],
+    start: int,
+    file_header: str,
+    file_path: str,
 ) -> tuple[Hunk, int]:
-    """Parse a single @@ hunk starting at *start*.
+    """
+    Parse a single @@ hunk starting at *start*.
 
     Returns (Hunk, next_line_index).
     """
@@ -270,7 +285,8 @@ def render_through_delta(diff_text: str, width: int = 120) -> bytes:
 
 
 def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
-    """Produce compact, unambiguous review output for an LLM agent.
+    """
+    Produce compact, unambiguous review output for an LLM agent.
 
     Approved hunks are omitted.  Questions and flags include a short diff
     snippet plus the reviewer's comment.  Global notes appear first.
@@ -291,7 +307,7 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
     out.write(OUTPUT_PREAMBLE)
     out.write(
         f"# {len(hunks)} hunks: {approved} approved, "
-        f"{questions} questions, {flags} changes requested\n"
+        f"{questions} questions, {flags} changes requested\n",
     )
     if global_notes:
         out.write(f"# {len(global_notes)} global note(s)\n")
@@ -311,8 +327,7 @@ def _write_global_note(out: StringIO, note: GlobalNote) -> None:
     """Write a single global note section to *out*."""
     label = "CHANGE REQUESTED" if note.kind == "flag" else "QUESTION"
     out.write(f"## [{label}] (global)\n")
-    for comment_line in note.text.splitlines():
-        out.write(f"> {comment_line}\n")
+    out.writelines(f"> {comment_line}\n" for comment_line in note.text.splitlines())
     out.write("\n")
 
 
@@ -322,8 +337,8 @@ def _write_hunk_annotation(out: StringIO, hunk: Hunk) -> None:
     out.write(f"## [{action}] {hunk.file_path}\n")
 
     body_lines = hunk.body.splitlines()
-    if len(body_lines) > 10:
-        trimmed = body_lines[:5] + ["# ..."] + body_lines[-5:]
+    if len(body_lines) > HUNK_BODY_MAX_LINES:
+        trimmed = [*body_lines[:5], "# ...", *body_lines[-5:]]
     else:
         trimmed = body_lines
 
@@ -332,8 +347,7 @@ def _write_hunk_annotation(out: StringIO, hunk: Hunk) -> None:
     out.write("\n".join(trimmed))
     out.write("\n```\n")
 
-    for comment_line in hunk.comment.splitlines():
-        out.write(f"> {comment_line}\n")
+    out.writelines(f"> {comment_line}\n" for comment_line in hunk.comment.splitlines())
     out.write("\n")
 
 
@@ -346,7 +360,7 @@ def _encode_approved_bitmap(hunks: list[Hunk]) -> str:
         if hunk.status == "approved":
             current_byte |= 1 << bit_index
         bit_index += 1
-        if bit_index == 8:
+        if bit_index == BITS_PER_BYTE:
             bits.append(current_byte)
             current_byte = 0
             bit_index = 0
@@ -356,21 +370,22 @@ def _encode_approved_bitmap(hunks: list[Hunk]) -> str:
 
 
 def _decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
-    """Decode a base64 bitmap into a list of booleans (one per hunk).
+    """
+    Decode a base64 bitmap into a list of booleans (one per hunk).
 
     Returns an empty list if *encoded* is invalid or the length does not
     match *num_hunks*.
     """
     try:
         bits = base64.b64decode(encoded)
-    except Exception:
+    except (ValueError, binascii.Error):
         return []
     expected_bytes = (num_hunks + 7) // 8
     if len(bits) != expected_bytes:
         return []
     result: list[bool] = []
     for i in range(num_hunks):
-        byte_idx, bit_idx = divmod(i, 8)
+        byte_idx, bit_idx = divmod(i, BITS_PER_BYTE)
         result.append(bool(bits[byte_idx] & (1 << bit_idx)))
     return result
 
@@ -383,15 +398,15 @@ def _decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
 def load_previous_review(
     path: str,
 ) -> tuple[dict[tuple[str, str], tuple[str, str]], list[GlobalNote], str]:
-    """Parse a previous review output file.
+    """
+    Parse a previous review output file.
 
     Returns a mapping of ``(file_path, range_line) → (status, comment)``
     for hunk annotations, a list of ``GlobalNote`` for global ones, and
     the raw approved-bitmap string (empty if absent).
     """
     try:
-        with open(path) as f:
-            text = f.read()
+        text = Path(path).read_text()
     except (FileNotFoundError, OSError):
         return {}, [], ""
 
@@ -449,9 +464,11 @@ def _extract_comment_lines(section: str) -> str:
 
 
 def apply_previous_review(
-    hunks: list[Hunk], annotations: dict[tuple[str, str], tuple[str, str]]
+    hunks: list[Hunk],
+    annotations: dict[tuple[str, str], tuple[str, str]],
 ) -> int:
-    """Apply previously saved annotations to *hunks*.
+    """
+    Apply previously saved annotations to *hunks*.
 
     Returns the number of annotations that matched.
     """
@@ -468,14 +485,12 @@ def apply_previous_review(
 # Terminal helpers
 # ---------------------------------------------------------------------------
 
-_tty_out: int = -1  # fd for writing to terminal
 
-
-def tty_write(data: bytes | str) -> None:
+def tty_write(tty_fd: int, data: bytes | str) -> None:
     """Write raw bytes or a string to the terminal display."""
     if isinstance(data, str):
         data = data.encode()
-    os.write(_tty_out, data)
+    os.write(tty_fd, data)
 
 
 def read_key(fd: int) -> str:
@@ -496,18 +511,21 @@ def read_key(fd: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def edit_comment(existing: str, location: str) -> str:
+def edit_comment(tty_fd: int, existing: str, location: str) -> str:
     """Edit a review comment using ``$EDITOR`` or an inline TTY prompt."""
     editor = os.environ.get("EDITOR", "")
     if editor:
         return _edit_comment_in_editor(existing, location, editor)
-    return _prompt_inline_comment(existing, location)
+    return _prompt_inline_comment(tty_fd, existing, location)
 
 
 def _edit_comment_in_editor(existing: str, location: str, editor: str) -> str:
     """Open *editor* with a temporary file pre-filled with *existing*."""
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", prefix="review-", delete=False
+        mode="w",
+        suffix=".md",
+        prefix="review-",
+        delete=False,
     ) as tmp:
         jump_line = _write_comment_template(tmp, location, existing)
         tmppath = tmp.name
@@ -531,7 +549,8 @@ def _write_comment_template(
     location: str,
     existing: str,
 ) -> int:
-    """Write the comment template into *file_obj*.
+    """
+    Write the comment template into *file_obj*.
 
     Returns the editor jump-line number (1-indexed).
     """
@@ -547,17 +566,17 @@ def _write_comment_template(
 def _read_comment_file(path: str) -> str:
     """Read a comment file, stripping lines that start with ``#``."""
     with open(path) as f:
-        lines = [line for line in f.readlines() if not line.startswith("#")]
+        lines = [line for line in f if not line.startswith("#")]
     return "".join(lines).strip()
 
 
-def _prompt_inline_comment(existing: str, location: str) -> str:
+def _prompt_inline_comment(tty_fd: int, existing: str, location: str) -> str:
     """Prompt for a single-line comment directly on the TTY."""
     prompt = f"\r\n  Comment for {location}"
     if existing:
         prompt += f" [{existing}]"
     prompt += ": "
-    tty_write(prompt)
+    tty_write(tty_fd, prompt)
 
     with open("/dev/tty", "r") as tty_r:
         fd = tty_r.fileno()
@@ -567,7 +586,7 @@ def _prompt_inline_comment(existing: str, location: str) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, cooked)
         line = tty_r.readline().strip()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return line if line else existing
+    return line or existing
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +595,8 @@ def _prompt_inline_comment(existing: str, location: str) -> str:
 
 
 def find_next_unhandled_hunk(hunks: list[Hunk], current: int) -> int:
-    """Find the next hunk with no status, wrapping around.
+    """
+    Find the next hunk with no status, wrapping around.
 
     Returns *current* if every hunk has been handled.
     """
@@ -606,7 +626,7 @@ def visible_text_length(line: bytes) -> int:
     stripped = ANSI_ESCAPE_RE.sub(b"", line)
     try:
         return len(stripped.decode("utf-8", errors="replace"))
-    except Exception:
+    except UnicodeDecodeError:
         return len(stripped)
 
 
@@ -629,6 +649,15 @@ def count_fitting_lines(line_rows: list[int], start: int, row_budget: int) -> in
         used += needed
         count += 1
     return count
+
+
+def _update_active_sgr(esc: str, active_sgr: list[str]) -> None:
+    """Track active SGR sequences, clearing on reset."""
+    if esc.endswith("m"):
+        if esc in (f"{CSI}0m", f"{CSI}m"):
+            active_sgr.clear()
+        else:
+            active_sgr.append(esc)
 
 
 def wrap_ansi_line_to_rows(line: bytes, term_width: int) -> list[bytes]:
@@ -663,11 +692,7 @@ def wrap_ansi_line_to_rows(line: bytes, term_width: int) -> list[bytes]:
         append_plain(text[pos : match.start()])
         esc = match.group(0)
         current.append(esc)
-        if esc.endswith("m"):
-            if esc in (f"{CSI}0m", f"{CSI}m"):
-                active_sgr.clear()
-            else:
-                active_sgr.append(esc)
+        _update_active_sgr(esc, active_sgr)
         pos = match.end()
     append_plain(text[pos:])
 
@@ -698,7 +723,8 @@ def compute_diff_viewport(
     term_height: int,
     scroll_offset: int,
 ) -> DiffViewport:
-    """Compute which diff lines are visible given the terminal geometry.
+    """
+    Compute which diff lines are visible given the terminal geometry.
 
     The fixed chrome occupies 3 rows (top bar + markers + footer).
     Scroll indicators are reserved only when actually needed.
@@ -765,8 +791,8 @@ def build_top_bar(
     comment_bit = ""
     if hunk.comment:
         preview = hunk.comment.replace("\n", " ")
-        if len(preview) > 60:
-            preview = preview[:60] + "…"
+        if len(preview) > COMMENT_PREVIEW_MAX:
+            preview = preview[:COMMENT_PREVIEW_MAX] + "…"
         comment_bit = f"  {YELLOW}\U000f0184 {preview}{RESET}"
 
     global_bit = ""
@@ -783,7 +809,7 @@ def build_top_bar(
     )
 
 
-def _hunk_marker(hunk: Hunk, is_current: bool) -> str:
+def _hunk_marker(hunk: Hunk, *, is_current: bool) -> str:
     """Return the ANSI-styled marker for a single hunk (3 visible chars)."""
     icon = "·"
     color = DIM
@@ -799,7 +825,9 @@ def _hunk_marker(hunk: Hunk, is_current: bool) -> str:
 
 
 def build_progress_markers(
-    hunks: list[Hunk], current_index: int, term_width: int
+    hunks: list[Hunk],
+    current_index: int,
+    term_width: int,
 ) -> str:
     """Build the hunk progress marker line, with overflow arrows."""
     total = len(hunks)
@@ -812,8 +840,10 @@ def build_progress_markers(
     max_markers = available // marker_width
 
     if max_markers >= total:
-        # Everything fits – no arrows needed.
-        markers = [_hunk_marker(hunks[i], i == current_index) for i in range(total)]
+        # Everything fits - no arrows needed.
+        markers = [
+            _hunk_marker(hunks[i], is_current=i == current_index) for i in range(total)
+        ]
         return prefix + "".join(markers)
 
     # We need arrows; compute how many markers fit with arrow slots.
@@ -855,7 +885,9 @@ def build_progress_markers(
             need_left = start > 0
             need_right = end < total
 
-    markers = [_hunk_marker(hunks[i], i == current_index) for i in range(start, end)]
+    markers = [
+        _hunk_marker(hunks[i], is_current=i == current_index) for i in range(start, end)
+    ]
     left = f"{DIM}◀ {RESET}" if need_left else ""
     right = f"{DIM} ▶{RESET}" if need_right else ""
     return prefix + left + "".join(markers) + right
@@ -867,6 +899,7 @@ def build_progress_markers(
 
 
 def render_review_screen(
+    tty_fd: int,
     hunks: list[Hunk],
     current_index: int,
     delta_output: bytes,
@@ -881,46 +914,57 @@ def render_review_screen(
     line_rows = [1] * len(diff_lines)
     viewport = compute_diff_viewport(line_rows, term_height, scroll_offset)
 
-    tty_write(CLEAR_SCREEN)
+    tty_write(tty_fd, CLEAR_SCREEN)
 
     top_bar = build_top_bar(hunk, current_index, len(hunks), len(global_notes))
-    tty_write(top_bar + "\r\n")
+    tty_write(tty_fd, top_bar + "\r\n")
 
-    tty_write(build_progress_markers(hunks, current_index, term_width) + "\r\n")
+    tty_write(tty_fd, build_progress_markers(hunks, current_index, term_width) + "\r\n")
 
-    _render_diff_body(diff_lines, viewport)
-    _render_footer(term_height, term_width, viewport)
+    _render_diff_body(tty_fd, diff_lines, viewport)
+    _render_footer(tty_fd, term_height, term_width, viewport)
 
     return viewport.scroll_offset
 
 
-def _render_diff_body(diff_lines: list[bytes], viewport: DiffViewport) -> None:
+def _render_diff_body(
+    tty_fd: int,
+    diff_lines: list[bytes],
+    viewport: DiffViewport,
+) -> None:
     """Render the visible diff lines with scroll indicators."""
     if viewport.can_scroll_up:
         tty_write(
+            tty_fd,
             f"  {BOLD}{WHITE}▲ Ctrl-U to scroll up "
-            f"({viewport.lines_above} lines above){RESET}\r\n"
+            f"({viewport.lines_above} lines above){RESET}\r\n",
         )
 
     start = viewport.scroll_offset
     end = start + viewport.visible_line_count
     for line in diff_lines[start:end]:
-        tty_write(line)
-        tty_write(b"\r\n")
+        tty_write(tty_fd, line)
+        tty_write(tty_fd, b"\r\n")
 
 
-def _render_footer(term_height: int, term_width: int, viewport: DiffViewport) -> None:
+def _render_footer(
+    tty_fd: int,
+    term_height: int,
+    term_width: int,
+    viewport: DiffViewport,
+) -> None:
     """Render the scroll-down indicator and bottom key hints."""
     if viewport.can_scroll_down:
-        tty_write(f"{CSI}{term_height - 1};1H")
+        tty_write(tty_fd, f"{CSI}{term_height - 1};1H")
         tty_write(
+            tty_fd,
             f"  {BOLD}{WHITE}▼ Ctrl-D to scroll down "
-            f"({viewport.lines_below} lines below){RESET}"
+            f"({viewport.lines_below} lines below){RESET}",
         )
 
-    tty_write(f"{CSI}{term_height};1H")
+    tty_write(tty_fd, f"{CSI}{term_height};1H")
     footer = _build_footer_line(term_width)
-    tty_write(footer)
+    tty_write(tty_fd, footer)
 
 
 def _build_footer_line(term_width: int) -> str:
@@ -955,24 +999,24 @@ def _build_footer_line(term_width: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_help_screen() -> None:
+def render_help_screen(tty_fd: int) -> None:
     """Display the keyboard shortcuts help overlay."""
-    tty_write(CLEAR_SCREEN)
+    tty_write(tty_fd, CLEAR_SCREEN)
     box_width = 57
     border = "─" * box_width
 
     def row(text: str, visible_len: int) -> None:
         """Write a box row, padding to *box_width*."""
         pad = box_width - visible_len
-        tty_write(f"│{text}{' ' * pad}│\r\n")
+        tty_write(tty_fd, f"│{text}{' ' * pad}│\r\n")
 
     def empty() -> None:
         """Write an empty box row."""
-        tty_write(f"│{' ' * box_width}│\r\n")
+        tty_write(tty_fd, f"│{' ' * box_width}│\r\n")
 
-    tty_write(f"┌{border}┐\r\n")
+    tty_write(tty_fd, f"┌{border}┐\r\n")
     row(f"{BOLD}  neorev — Keyboard Shortcuts{RESET}", 29)
-    tty_write(f"├{border}┤\r\n")
+    tty_write(tty_fd, f"├{border}┤\r\n")
     empty()
     row(f"  {BOLD}j / ↓{RESET}         Next hunk", 27)
     row(f"  {BOLD}k / ↑{RESET}         Previous hunk", 31)
@@ -1006,7 +1050,7 @@ def render_help_screen() -> None:
     row("  comments. Without it, single-line prompt is used.", 51)
     empty()
     row(f"  {DIM}Press any key to return.{RESET}", 26)
-    tty_write(f"└{border}┘\r\n")
+    tty_write(tty_fd, f"└{border}┘\r\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1015,16 +1059,17 @@ def render_help_screen() -> None:
 
 
 def edit_text_outside_tui(
+    tty_out_fd: int,
     tty_in_fd: int,
     old_term_attrs: list[int | list[bytes | int]],
     existing_text: str,
     prompt_label: str,
 ) -> str:
     """Temporarily suspend the TUI, edit text, and restore raw mode."""
-    tty_write(f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
+    tty_write(tty_out_fd, f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
     termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_term_attrs)
-    comment = edit_comment(existing_text, prompt_label)
-    tty_write(f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
+    comment = edit_comment(tty_out_fd, existing_text, prompt_label)
+    tty_write(tty_out_fd, f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
     tty.setraw(tty_in_fd)
     return comment
 
@@ -1053,6 +1098,7 @@ def handle_approve_file(state: ReviewState) -> None:
 def handle_hunk_comment(
     state: ReviewState,
     key: str,
+    tty_out_fd: int,
     tty_in_fd: int,
     old_term_attrs: list[int | list[bytes | int]],
 ) -> None:
@@ -1065,6 +1111,7 @@ def handle_hunk_comment(
         else "question (agent will answer, not change code)"
     )
     comment = edit_text_outside_tui(
+        tty_out_fd,
         tty_in_fd,
         old_term_attrs,
         hunk.comment,
@@ -1076,20 +1123,23 @@ def handle_hunk_comment(
             hunk.status = "flag"
             hunk.comment = comment
             state.current_index = find_next_unhandled_hunk(
-                state.hunks, state.current_index
+                state.hunks,
+                state.current_index,
             )
     else:
         hunk.comment = comment
         hunk.status = "question" if comment else ""
         if comment:
             state.current_index = find_next_unhandled_hunk(
-                state.hunks, state.current_index
+                state.hunks,
+                state.current_index,
             )
 
 
 def handle_global_note(
     state: ReviewState,
     key: str,
+    tty_out_fd: int,
     tty_in_fd: int,
     old_term_attrs: list[int | list[bytes | int]],
 ) -> None:
@@ -1100,7 +1150,7 @@ def handle_global_note(
         if is_flag
         else "global question (agent answers, no code change)"
     )
-    text = edit_text_outside_tui(tty_in_fd, old_term_attrs, "", label)
+    text = edit_text_outside_tui(tty_out_fd, tty_in_fd, old_term_attrs, "", label)
     if text:
         kind = "flag" if is_flag else "question"
         state.global_notes.append(GlobalNote(kind=kind, text=text))
@@ -1111,8 +1161,75 @@ def handle_global_note(
 # ---------------------------------------------------------------------------
 
 
+def _handle_navigation(key: str, state: ReviewState) -> bool:
+    """Handle navigation keys (j/k/arrows), returning True if index changed."""
+    if key in ("j", "n", "down"):
+        if state.current_index < len(state.hunks) - 1:
+            state.current_index += 1
+            return True
+    elif key in ("k", "p", "up") and state.current_index > 0:
+        state.current_index -= 1
+        return True
+    return False
+
+
+def _handle_scroll(
+    key: str,
+    state: ReviewState,
+    term_height: int,
+    redraw: Callable[[], None],
+) -> bool:
+    """Handle scroll keys (Ctrl-D/Ctrl-U), returning True if handled."""
+    half = max(1, (term_height - 5) // 2)
+    if key == "\x04":
+        state.scroll_offset += half
+    elif key == "\x15":
+        state.scroll_offset = max(0, state.scroll_offset - half)
+    else:
+        return False
+    redraw()
+    return True
+
+
+def _dispatch_key(
+    key: str,
+    state: ReviewState,
+    tty_out_fd: int,
+    tty_in_fd: int,
+    old_term_attrs: list[int | list[bytes | int]],
+    term_height: int,
+    redraw: Callable[[], None],
+) -> bool:
+    """Handle a single keypress, returning True if a full redraw is needed."""
+    if _handle_scroll(key, state, term_height, redraw):
+        return False
+
+    if _handle_navigation(key, state):
+        state.scroll_offset = 0
+        return True
+
+    if key == "a":
+        handle_approve(state)
+    elif key == "A":
+        handle_approve_file(state)
+    elif key in ("c", "f"):
+        handle_hunk_comment(state, key, tty_out_fd, tty_in_fd, old_term_attrs)
+    elif key == "g":
+        key2 = read_key(tty_in_fd)
+        if key2 not in ("c", "f"):
+            return False
+        handle_global_note(state, key2, tty_out_fd, tty_in_fd, old_term_attrs)
+    elif key == "?":
+        render_help_screen(tty_out_fd)
+        read_key(tty_in_fd)
+    else:
+        return False
+    return True
+
+
 def run_review_loop(
     state: ReviewState,
+    tty_out_fd: int,
     tty_in_fd: int,
     old_term_attrs: list[int | list[bytes | int]],
     term_width: int,
@@ -1125,13 +1242,15 @@ def run_review_loop(
         """Return cached delta output for hunk at *index*."""
         if index not in delta_cache:
             delta_cache[index] = render_through_delta(
-                state.hunks[index].raw, width=term_width
+                state.hunks[index].raw,
+                width=term_width,
             )
         return delta_cache[index]
 
     def redraw() -> None:
         """Redraw the review screen."""
         state.scroll_offset = render_review_screen(
+            tty_out_fd,
             state.hunks,
             state.current_index,
             get_delta(state.current_index),
@@ -1146,46 +1265,21 @@ def run_review_loop(
 
     while True:
         key = read_key(tty_in_fd)
-        prev_index = state.current_index
 
         if key in ("q", "\x03"):
             break
-        elif key in ("j", "n", "down"):
-            if state.current_index < len(state.hunks) - 1:
-                state.current_index += 1
-        elif key in ("k", "p", "up"):
-            if state.current_index > 0:
-                state.current_index -= 1
-        elif key == "\x04":
-            half = max(1, (term_height - 5) // 2)
-            state.scroll_offset += half
-            redraw()
-            continue
-        elif key == "\x15":
-            half = max(1, (term_height - 5) // 2)
-            state.scroll_offset = max(0, state.scroll_offset - half)
-            redraw()
-            continue
-        elif key == "a":
-            handle_approve(state)
-        elif key == "A":
-            handle_approve_file(state)
-        elif key in ("c", "f"):
-            handle_hunk_comment(state, key, tty_in_fd, old_term_attrs)
-        elif key == "g":
-            key2 = read_key(tty_in_fd)
-            if key2 not in ("c", "f"):
-                continue
-            handle_global_note(state, key2, tty_in_fd, old_term_attrs)
-        elif key == "?":
-            render_help_screen()
-            read_key(tty_in_fd)
-        else:
-            continue
 
-        if state.current_index != prev_index:
-            state.scroll_offset = 0
-        redraw()
+        handled = _dispatch_key(
+            key,
+            state,
+            tty_out_fd,
+            tty_in_fd,
+            old_term_attrs,
+            term_height,
+            redraw,
+        )
+        if handled:
+            redraw()
 
 
 # ---------------------------------------------------------------------------
@@ -1239,13 +1333,14 @@ def parse_diff_or_exit(diff_text: str) -> list[Hunk]:
 
 
 def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNote]:
-    """Load a previous review from *output_path* if it exists.
+    """
+    Load a previous review from *output_path* if it exists.
 
     Applies matching annotations and the approved-hunk bitmap to *hunks*
     in place and returns the list of global notes.
     """
     previous_annotations, previous_global_notes, bitmap_encoded = load_previous_review(
-        output_path
+        output_path,
     )
     if not previous_annotations and not previous_global_notes and not bitmap_encoded:
         return []
@@ -1264,11 +1359,11 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     sys.stderr.write(
         f"Loaded {matched} hunk annotation(s), "
         f"{approved_from_bitmap} approved hunk(s), and "
-        f"{len(previous_global_notes)} global note(s) from {output_path}\n"
+        f"{len(previous_global_notes)} global note(s) from {output_path}\n",
     )
     if stale:
         sys.stderr.write(
-            f"  ({stale} previous annotation(s) no longer match any hunk)\n"
+            f"  ({stale} previous annotation(s) no longer match any hunk)\n",
         )
     return previous_global_notes
 
@@ -1277,9 +1372,10 @@ def get_terminal_size_or_default(fd: int) -> tuple[int, int]:
     """Return ``(width, height)`` of the terminal, with sensible defaults."""
     try:
         ts = os.get_terminal_size(fd)
-        return ts.columns, ts.lines
     except OSError:
         return 120, 40
+    else:
+        return ts.columns, ts.lines
 
 
 def write_review_output(
@@ -1289,8 +1385,7 @@ def write_review_output(
 ) -> None:
     """Write the final review output to *output_path*."""
     review_output = format_output(hunks, global_notes)
-    with open(output_path, "w") as f:
-        f.write(review_output)
+    Path(output_path).write_text(review_output)
     sys.stderr.write(f"Review written to {output_path}\n")
 
 
@@ -1318,8 +1413,6 @@ def copy_output_reference_to_clipboard(output_path: str) -> None:
 
 def main() -> None:
     """Run the neorev command-line entry point."""
-    global _tty_out
-
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -1327,7 +1420,7 @@ def main() -> None:
     hunks = parse_diff_or_exit(diff_text)
     global_notes = load_or_resume_review(hunks, args.output)
 
-    _tty_out = os.open("/dev/tty", os.O_WRONLY)
+    tty_out_fd = os.open("/dev/tty", os.O_WRONLY)
     tty_in_fd = os.open("/dev/tty", os.O_RDONLY)
 
     term_width, term_height = get_terminal_size_or_default(tty_in_fd)
@@ -1340,17 +1433,23 @@ def main() -> None:
     )
 
     old_attrs = termios.tcgetattr(tty_in_fd)
-    tty_write(f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
+    tty_write(tty_out_fd, f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
 
     try:
         run_review_loop(
-            state, tty_in_fd, old_attrs, term_width, term_height, delta_cache
+            state,
+            tty_out_fd,
+            tty_in_fd,
+            old_attrs,
+            term_width,
+            term_height,
+            delta_cache,
         )
     finally:
         termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_attrs)
-        tty_write(f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
+        tty_write(tty_out_fd, f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
         os.close(tty_in_fd)
-        os.close(_tty_out)
+        os.close(tty_out_fd)
 
     write_review_output(args.output, hunks, global_notes)
     if args.clip:
