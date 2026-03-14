@@ -57,6 +57,11 @@ CYAN = f"{CSI}36m"
 BG_BLUE = f"{CSI}44m"
 WHITE = f"{CSI}37m"
 
+ALT_SCREEN_ON = f"{CSI}?1049h"
+ALT_SCREEN_OFF = f"{CSI}?1049l"
+CURSOR_HIDE = f"{CSI}?25l"
+CURSOR_SHOW = f"{CSI}?25h"
+
 ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -884,7 +889,7 @@ def render_review_screen(
     tty_write(build_progress_markers(hunks, current_index, term_width) + "\r\n")
 
     _render_diff_body(diff_lines, viewport)
-    _render_footer(term_height, viewport)
+    _render_footer(term_height, term_width, viewport)
 
     return viewport.scroll_offset
 
@@ -904,7 +909,7 @@ def _render_diff_body(diff_lines: list[bytes], viewport: DiffViewport) -> None:
         tty_write(b"\r\n")
 
 
-def _render_footer(term_height: int, viewport: DiffViewport) -> None:
+def _render_footer(term_height: int, term_width: int, viewport: DiffViewport) -> None:
     """Render the scroll-down indicator and bottom key hints."""
     if viewport.can_scroll_down:
         tty_write(f"{CSI}{term_height - 1};1H")
@@ -914,16 +919,37 @@ def _render_footer(term_height: int, viewport: DiffViewport) -> None:
         )
 
     tty_write(f"{CSI}{term_height};1H")
-    tty_write(
-        f"{DIM}j/k{RESET} navigate  "
-        f"{DIM}a{RESET} approve  "
-        f"{DIM}A{RESET} approve file  "
-        f"{DIM}c{RESET} question  "
-        f"{DIM}f{RESET} flag  "
-        f"{DIM}gc/gf{RESET} global  "
-        f"{DIM}q{RESET} quit & save  "
-        f"{DIM}?{RESET} help"
-    )
+    footer = _build_footer_line(term_width)
+    tty_write(footer)
+
+
+def _build_footer_line(term_width: int) -> str:
+    """Build a key-hints footer line truncated to *term_width* visible chars."""
+    segments = [
+        ("j/k", "navigate"),
+        ("a", "approve"),
+        ("A", "approve file"),
+        ("c", "question"),
+        ("f", "flag"),
+        ("gc/gf", "global"),
+        ("q", "quit & save"),
+        ("?", "help"),
+    ]
+    parts: list[str] = []
+    visible_len = 0
+    truncated = False
+    for i, (key, label) in enumerate(segments):
+        sep = "  " if i > 0 else ""
+        segment_visible = len(sep) + len(key) + 1 + len(label)
+        if visible_len + segment_visible > term_width:
+            truncated = True
+            break
+        parts.append(f"{sep}{DIM}{key}{RESET} {label}")
+        visible_len += segment_visible
+    if truncated and visible_len < term_width:
+        padding = term_width - visible_len - 1
+        parts.append(f"{' ' * padding}{DIM}…{RESET}")
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -997,10 +1023,10 @@ def edit_text_outside_tui(
     prompt_label: str,
 ) -> str:
     """Temporarily suspend the TUI, edit text, and restore raw mode."""
-    tty_write(f"{CSI}?1049l")
+    tty_write(f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
     termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_term_attrs)
     comment = edit_comment(existing_text, prompt_label)
-    tty_write(f"{CSI}?1049h")
+    tty_write(f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
     tty.setraw(tty_in_fd)
     return comment
 
@@ -1316,7 +1342,7 @@ def main() -> None:
     )
 
     old_attrs = termios.tcgetattr(tty_in_fd)
-    tty_write(f"{CSI}?1049h")
+    tty_write(f"{ALT_SCREEN_ON}{CURSOR_HIDE}")
 
     try:
         run_review_loop(
@@ -1324,7 +1350,7 @@ def main() -> None:
         )
     finally:
         termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_attrs)
-        tty_write(f"{CSI}?1049l")
+        tty_write(f"{CURSOR_SHOW}{ALT_SCREEN_OFF}")
         os.close(tty_in_fd)
         os.close(_tty_out)
 

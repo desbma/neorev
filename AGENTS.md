@@ -33,7 +33,7 @@ Single script: `neorev` (~1260 lines). Key sections separated by comment banners
 - Typing annotations mandatory on all function signatures.
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
-- ANSI escape codes via module-level constants (`CSI`, `BOLD`, etc.), not a library.
+- All values that carry functionality (ANSI escape sequences, magic strings, thresholds, etc.) must be defined as named module-level constants. Never inline raw escape codes or unexplained literal values.
 
 ## Linting & Formatting
 
