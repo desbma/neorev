@@ -927,10 +927,8 @@ def _build_footer_line(term_width: int) -> str:
     """Build a key-hints footer line truncated to *term_width* visible chars."""
     segments = [
         ("j/k", "navigate"),
-        ("a", "approve"),
-        ("A", "approve file"),
-        ("c", "question"),
-        ("f", "flag"),
+        ("a/A", "approve hunk/file"),
+        ("c/f", "question/flag"),
         ("gc/gf", "global"),
         ("q", "quit & save"),
         ("?", "help"),
