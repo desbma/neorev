@@ -600,10 +600,12 @@ def build_display_lines(delta_output: bytes, term_width: int) -> list[bytes]:
     """Return physical terminal rows for rendered diff output."""
     raw_lines = delta_output.split(b"\n")
 
-    # Delta output ends with a trailing newline; ``split`` would otherwise add
-    # a synthetic empty line that shows up as a visual gap above the footer.
+    # Delta output ends with a trailing newline and may start with a leading
+    # blank line; strip both to avoid visual gaps in the chrome.
     if raw_lines and raw_lines[-1] == b"":
         raw_lines = raw_lines[:-1]
+    if raw_lines and raw_lines[0] == b"":
+        raw_lines = raw_lines[1:]
 
     display_lines: list[bytes] = []
     for line in raw_lines:
