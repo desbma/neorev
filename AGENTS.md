@@ -21,7 +21,26 @@ git diff HEAD~1 | ./neorev --clip review.txt
 - Typing annotations mandatory on all function signatures.
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
-- Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.
+- **IMPORTANT: Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.**
+- Do not add large section-separator comment blocks (e.g. `# ===...` banners). Use class docstrings and natural whitespace to organize code.
+
+## Testing
+
+Tests use `unittest` (stdlib only) and live in `test.py`.
+
+- Tests must follow the same code style conventions as the main code (docstrings, type annotations, named constants, etc.).
+- Tests must pass the same formatter, linter, and type checker as the main code.
+
+```sh
+# Run all tests:
+./test.py
+
+# Run a single test class:
+python3 -m unittest test.TestParseDiff
+
+# Run a single test method:
+python3 -m unittest test.TestParseDiff.test_single_hunk
+```
 
 ## Linting & Formatting
 
@@ -31,4 +50,12 @@ Code must pass all three:
 ty check neorev
 ruff check neorev
 ruff format --check neorev
+```
+
+Tests must also pass:
+
+```sh
+ty check test.py
+ruff check test.py
+ruff format --check test.py
 ```

@@ -831,11 +831,11 @@ def handle_approve_file(state: ReviewState) -> None:
 
 def handle_navigation(key: str, state: ReviewState) -> bool:
     """Handle navigation keys (j/k/arrows), returning True if index changed."""
-    if key in ("j", "n", "down"):
+    if key in ("j", "down"):
         if state.current_index < len(state.hunks) - 1:
             state.current_index += 1
             return True
-    elif key in ("k", "p", "up") and state.current_index > 0:
+    elif key in ("k", "up") and state.current_index > 0:
         state.current_index -= 1
         return True
     return False

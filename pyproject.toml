@@ -4,7 +4,9 @@ ignore = [
     "COM812",  # missing trailing comma
     "D203",    # incompatible with D211
     "D212",    # incompatible with D213
+    "D401",    # imperative docstrings
     "PLW1510", # subprocess.run without check
+    "PT",      # pytest
     "PTH108",  # os.unlink -> Path.unlink
     "PTH123",  # open() -> Path.open()
     "S603",    # subprocess call
