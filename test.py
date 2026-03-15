@@ -25,6 +25,7 @@ TERM_PIXEL_SIZE = 0  # pixel dimensions unused by tests
 WINSIZE_FORMAT = "HHHH"
 READ_BUFFER_SIZE = 8192
 SELECT_TIMEOUT = 0.1
+TINY_WIDTH = 5
 NARROW_FOOTER_WIDTH = 15
 WIDE_FOOTER_WIDTH = 120
 NARROW_PROGRESS_WIDTH = 40
@@ -48,6 +49,8 @@ SCROLL_HALF_PAGE = max(
 ESC_ARROW_UP = b"\x1b[A"
 ESC_ARROW_DOWN = b"\x1b[B"
 KEY_CTRL_C = b"\x03"
+SIGWINCH_BYTE = b"\x1c"  # signal number written by set_wakeup_fd
+RESIZE_WIDTH_DELTA = 10
 
 
 BINARY_DIFF = """\
@@ -1426,6 +1429,275 @@ class TestArgParser(unittest.TestCase):
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             parser.parse_args([])
+
+
+class TestTruncateAnsiText(unittest.TestCase):
+    """Tests for truncate_ansi_text."""
+
+    def test_no_truncation_needed(self) -> None:
+        """Return text unchanged when it fits within max_visible."""
+        text = "hello"
+        result = neorev.truncate_ansi_text(text, TERM_WIDTH)
+        self.assertEqual(result, text)
+
+    def test_plain_text_truncated(self) -> None:
+        """Truncate plain text and append ellipsis."""
+        text = "hello world"
+        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
+        visible = neorev.ANSI_ESCAPE_TEXT_RE.sub("", result)
+        self.assertEqual(len(visible), TINY_WIDTH)
+        self.assertTrue(visible.endswith(neorev.TRUNCATION_ELLIPSIS))
+
+    def test_ansi_sequences_preserved(self) -> None:
+        """ANSI escape sequences pass through without consuming visible budget."""
+        text = f"{neorev.BOLD}hello world{neorev.RESET}"
+        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
+        visible = neorev.ANSI_ESCAPE_TEXT_RE.sub("", result)
+        self.assertEqual(len(visible), TINY_WIDTH)
+        self.assertIn(neorev.BOLD, result)
+
+    def test_zero_width_returns_empty(self) -> None:
+        """A max_visible of zero produces an empty string."""
+        self.assertEqual(neorev.truncate_ansi_text("hello", 0), "")
+
+    def test_width_one_returns_ellipsis(self) -> None:
+        """A max_visible of one returns just the ellipsis character."""
+        result = neorev.truncate_ansi_text("hello world", 1)
+        self.assertEqual(result, neorev.TRUNCATION_ELLIPSIS)
+
+    def test_ends_with_reset(self) -> None:
+        """Truncated ANSI text ends with RESET before ellipsis."""
+        text = f"{neorev.RED}a long red string{neorev.RESET}"
+        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
+        self.assertIn(neorev.RESET, result)
+
+
+class TestTopBarTruncation(unittest.TestCase):
+    """Tests for build_top_bar width truncation."""
+
+    def test_narrow_width_truncates(self) -> None:
+        """Top bar is truncated when term_width is small."""
+        hunk = make_hunk(comment="a" * LONG_COMMENT_LENGTH)
+        bar = neorev.build_top_bar(hunk, 0, 1, 0, term_width=NARROW_PROGRESS_WIDTH)
+        visible = neorev.visible_len(bar)
+        self.assertLessEqual(visible, NARROW_PROGRESS_WIDTH)
+
+    def test_no_truncation_without_width(self) -> None:
+        """Top bar is not truncated when term_width is 0 (default)."""
+        hunk = make_hunk(comment="a" * LONG_COMMENT_LENGTH)
+        bar = neorev.build_top_bar(hunk, 0, 1, 0, term_width=0)
+        visible = neorev.visible_len(bar)
+        self.assertGreater(visible, NARROW_PROGRESS_WIDTH)
+
+
+class TestProgressMarkersTinyWidth(unittest.TestCase):
+    """Tests for build_progress_markers with tiny terminal widths."""
+
+    def test_very_narrow_returns_empty(self) -> None:
+        """Extremely narrow terminals produce an empty marker line."""
+        hunks = [
+            neorev.Hunk(
+                file_header="", range_line="", body="", raw="", file_path="f.py"
+            )
+        ]
+        # prefix_width=2, so available < MARKER_WIDTH
+        too_narrow = neorev.MARKER_WIDTH + 1
+        result = neorev.build_progress_markers(hunks, 0, too_narrow)
+        self.assertEqual(result, "")
+
+    def test_marker_width_boundary(self) -> None:
+        """Widths exactly fitting one marker still produce output."""
+        hunks = [
+            neorev.Hunk(
+                file_header="", range_line="", body="", raw="", file_path="f.py"
+            )
+        ]
+        min_working_width = neorev.MARKER_WIDTH + 2  # prefix_width = 2
+        result = neorev.build_progress_markers(hunks, 0, min_working_width)
+        self.assertNotEqual(result, "")
+
+
+class TestFooterTinyWidth(unittest.TestCase):
+    """Tests for build_footer_line with very small widths."""
+
+    def test_zero_width(self) -> None:
+        """Zero width produces empty footer."""
+        result = neorev.build_footer_line(0)
+        self.assertEqual(result, "")
+
+    def test_tiny_width_no_crash(self) -> None:
+        """Tiny widths produce a footer without crashing."""
+        for w in range(1, TINY_WIDTH + 1):
+            result = neorev.build_footer_line(w)
+            visible = neorev.visible_len(result)
+            self.assertLessEqual(visible, w)
+
+
+class TestViewportClampOnResize(unittest.TestCase):
+    """Tests for viewport clamping after height changes."""
+
+    def test_scroll_clamped_after_height_increase(self) -> None:
+        """Increasing height clamps scroll offset to valid range."""
+        line_rows = [1] * OVERFLOWING_LINE_COUNT
+        small_height = TERM_HEIGHT
+        vp_small = neorev.compute_diff_viewport(
+            line_rows, small_height, OUT_OF_BOUNDS_OFFSET
+        )
+        big_height = TERM_HEIGHT * 2
+        vp_big = neorev.compute_diff_viewport(
+            line_rows, big_height, vp_small.scroll_offset
+        )
+        self.assertLessEqual(vp_big.scroll_offset, vp_small.scroll_offset)
+
+    def test_scroll_clamped_after_height_decrease(self) -> None:
+        """Decreasing height still produces a valid viewport."""
+        line_rows = [1] * OVERFLOWING_LINE_COUNT
+        vp = neorev.compute_diff_viewport(
+            line_rows, neorev.MIN_TERMINAL_HEIGHT, MIDDLE_SCROLL_OFFSET
+        )
+        self.assertGreaterEqual(vp.visible_line_count, 1)
+
+
+class TestDrainFd(unittest.TestCase):
+    """Tests for drain_fd."""
+
+    def setUp(self) -> None:
+        """Create a pipe for testing."""
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+        os.set_blocking(self.write_fd, False)
+
+    def tearDown(self) -> None:
+        """Close both pipe ends."""
+        for fd in (self.read_fd, self.write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_drains_all_bytes(self) -> None:
+        """All pending bytes are consumed from the fd."""
+        os.write(self.write_fd, b"abc")
+        neorev.drain_fd(self.read_fd)
+        ready, _, _ = select.select([self.read_fd], [], [], neorev.SELECT_IMMEDIATE)
+        self.assertFalse(ready)
+
+    def test_no_data_does_not_block(self) -> None:
+        """Calling drain_fd with no pending data returns immediately."""
+        neorev.drain_fd(self.read_fd)
+
+
+class TestDebounceResize(unittest.TestCase):
+    """Tests for debounce_resize."""
+
+    def setUp(self) -> None:
+        """Create a pipe for testing."""
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+        os.set_blocking(self.write_fd, False)
+
+    def tearDown(self) -> None:
+        """Close both pipe ends."""
+        for fd in (self.read_fd, self.write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_no_followup_returns_quickly(self) -> None:
+        """When no further signal arrives, debounce returns after timeout."""
+        neorev.debounce_resize(self.read_fd)
+
+    def test_coalesces_pending_bytes(self) -> None:
+        """Pending bytes written before call are drained."""
+        os.write(self.write_fd, SIGWINCH_BYTE * 2)
+        neorev.debounce_resize(self.read_fd)
+        ready, _, _ = select.select([self.read_fd], [], [], neorev.SELECT_IMMEDIATE)
+        self.assertFalse(ready)
+
+
+class TestReadKeyWithWakeup(unittest.TestCase):
+    """Tests for Terminal.read_key with a wakeup pipe fd."""
+
+    def setUp(self) -> None:
+        """Create a fake TTY, Terminal, and a wakeup pipe."""
+        self.fake = FakeTTY()
+        self.term = self.fake.make_terminal()
+        self.wakeup_r, self.wakeup_w = os.pipe()
+        os.set_blocking(self.wakeup_r, False)
+        os.set_blocking(self.wakeup_w, False)
+
+    def tearDown(self) -> None:
+        """Close all fds."""
+        with contextlib.suppress(OSError):
+            self.term.close()
+        self.fake.close()
+        for fd in (self.wakeup_r, self.wakeup_w):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_wakeup_returns_resize_key(self) -> None:
+        """A byte on the wakeup pipe makes read_key return RESIZE_KEY."""
+        tty.setraw(self.fake.slave_fd)
+        os.write(self.wakeup_w, SIGWINCH_BYTE)
+        key = self.term.read_key(wakeup_read_fd=self.wakeup_r)
+        self.assertEqual(key, neorev.Terminal.KEY_RESIZE)
+
+    def test_tty_input_still_works_with_wakeup(self) -> None:
+        """Normal keypresses are returned even when wakeup fd is set."""
+        tty.setraw(self.fake.slave_fd)
+        self.fake.inject_keys(b"x")
+        key = self.term.read_key(wakeup_read_fd=self.wakeup_r)
+        self.assertEqual(key, "x")
+
+    def test_no_wakeup_fd_reads_normally(self) -> None:
+        """Negative wakeup_read_fd falls through to normal read."""
+        tty.setraw(self.fake.slave_fd)
+        self.fake.inject_keys(b"k")
+        key = self.term.read_key(wakeup_read_fd=None)
+        self.assertEqual(key, "k")
+
+    def test_wakeup_drains_pipe(self) -> None:
+        """After returning RESIZE_KEY the pipe is fully drained."""
+        tty.setraw(self.fake.slave_fd)
+        os.write(self.wakeup_w, SIGWINCH_BYTE * 3)
+        self.term.read_key(wakeup_read_fd=self.wakeup_r)
+        ready, _, _ = select.select([self.wakeup_r], [], [], neorev.SELECT_IMMEDIATE)
+        self.assertFalse(ready)
+
+
+class TestApplyResize(unittest.TestCase):
+    """Tests for Terminal.apply_resize cache invalidation."""
+
+    def setUp(self) -> None:
+        """Create a fake TTY and Terminal."""
+        self.fake = FakeTTY()
+        self.term = self.fake.make_terminal()
+
+    def tearDown(self) -> None:
+        """Close terminal and pty."""
+        with contextlib.suppress(OSError):
+            self.term.close()
+        self.fake.close()
+
+    def test_cache_cleared_on_width_change(self) -> None:
+        """Delta cache is cleared when terminal width changes."""
+        cache: dict[int, bytes] = {0: b"old"}
+        self.term.width = TERM_WIDTH
+        new_width = TERM_WIDTH + RESIZE_WIDTH_DELTA
+        winsize = struct.pack(
+            WINSIZE_FORMAT,
+            TERM_HEIGHT,
+            new_width,
+            TERM_PIXEL_SIZE,
+            TERM_PIXEL_SIZE,
+        )
+        fcntl.ioctl(self.fake.slave_fd, termios.TIOCSWINSZ, winsize)
+        self.term.apply_resize(cache)
+        self.assertEqual(cache, {})
+        self.assertEqual(self.term.width, new_width)
+
+    def test_cache_kept_on_same_width(self) -> None:
+        """Delta cache is kept when width does not change."""
+        cache: dict[int, bytes] = {0: b"old"}
+        self.term.apply_resize(cache)
+        self.assertEqual(cache, {0: b"old"})
 
 
 if __name__ == "__main__":

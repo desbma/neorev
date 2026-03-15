@@ -36,6 +36,7 @@ import binascii
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,11 @@ MIN_VISIBLE_ROWS = 3
 MARKER_WIDTH = 3  # each marker is 3 visible chars (e.g. "[✓]" or " · ")
 ARROW_WIDTH = 2  # "◀ " or " ▶"
 SCROLL_INDICATOR_ROWS = 2  # up + down indicators
+MIN_TERMINAL_WIDTH = 20
+MIN_TERMINAL_HEIGHT = CHROME_ROWS + MIN_VISIBLE_ROWS
+TRUNCATION_ELLIPSIS = "…"
+RESIZE_DEBOUNCE_TIMEOUT = 0.05
+SELECT_IMMEDIATE = 0
 
 OUTPUT_PREAMBLE = """\
 # Code Review
@@ -524,6 +530,32 @@ def visible_len(text: str) -> int:
     return len(ANSI_ESCAPE_TEXT_RE.sub("", text))
 
 
+def truncate_ansi_text(text: str, max_visible: int) -> str:
+    """Truncate *text* to *max_visible* visible chars, preserving ANSI escapes."""
+    if max_visible <= 0:
+        return ""
+    if visible_len(text) <= max_visible:
+        return text
+    budget = max_visible - len(TRUNCATION_ELLIPSIS)
+    if budget <= 0:
+        return TRUNCATION_ELLIPSIS[:max_visible]
+    result: list[str] = []
+    visible_count = 0
+    pos = 0
+    while pos < len(text) and visible_count < budget:
+        m = ANSI_ESCAPE_TEXT_RE.match(text, pos)
+        if m:
+            result.append(m.group())
+            pos = m.end()
+        else:
+            result.append(text[pos])
+            visible_count += 1
+            pos += 1
+    result.append(RESET)
+    result.append(TRUNCATION_ELLIPSIS)
+    return "".join(result)
+
+
 def estimate_wrapped_rows(line: bytes, term_width: int) -> int:
     """Estimate how many terminal rows *line* occupies after wrapping."""
     vlen = visible_text_length(line)
@@ -673,6 +705,7 @@ def build_top_bar(
     current_index: int,
     total_hunks: int,
     global_note_count: int,
+    term_width: int = 0,
 ) -> str:
     """Build the top status bar string for the current hunk."""
     status_map = {
@@ -687,14 +720,14 @@ def build_top_bar(
     if hunk.comment:
         preview = hunk.comment.replace("\n", " ")
         if len(preview) > COMMENT_PREVIEW_MAX:
-            preview = preview[:COMMENT_PREVIEW_MAX] + "…"
+            preview = preview[:COMMENT_PREVIEW_MAX] + TRUNCATION_ELLIPSIS
         comment_bit = f"  {YELLOW}\U000f0184 {preview}{RESET}"
 
     global_bit = ""
     if global_note_count:
         global_bit = f"  {CYAN}[{global_note_count} global]{RESET}"
 
-    return (
+    bar = (
         f"{BOLD}{WHITE}{BG_BLUE} neorev {RESET}  "
         f"Hunk {BOLD}{current_index + 1}{RESET}/{total_hunks}  "
         f"{DIM}│{RESET} {BOLD}{hunk.short_location}{RESET}  "
@@ -702,6 +735,9 @@ def build_top_bar(
         f"{comment_bit}"
         f"{global_bit}"
     )
+    if term_width > 0:
+        bar = truncate_ansi_text(bar, term_width)
+    return bar
 
 
 def hunk_marker(hunk: Hunk, *, is_current: bool) -> str:
@@ -729,6 +765,8 @@ def build_progress_markers(
     prefix = "  "
     prefix_width = 2
     available = term_width - prefix_width
+    if available < MARKER_WIDTH:
+        return ""
     max_markers = available // MARKER_WIDTH
 
     if max_markers >= total:
@@ -803,8 +841,9 @@ def build_footer_line(term_width: int) -> str:
         parts.append(segment)
         used += segment_width
     if truncated and used < term_width:
-        padding = term_width - used - visible_len("…")
-        parts.append(f"{' ' * padding}{DIM}…{RESET}")
+        padding = term_width - used - len(TRUNCATION_ELLIPSIS)
+        if padding >= 0:
+            parts.append(f"{' ' * padding}{DIM}{TRUNCATION_ELLIPSIS}{RESET}")
     return "".join(parts)
 
 
@@ -841,6 +880,28 @@ def handle_navigation(key: str, state: ReviewState) -> bool:
     return False
 
 
+DRAIN_READ_SIZE = 256
+
+
+def drain_fd(fd: int) -> None:
+    """Read and discard all currently available bytes from *fd*."""
+    while True:
+        ready, _, _ = select.select([fd], [], [], SELECT_IMMEDIATE)
+        if not ready:
+            break
+        if not os.read(fd, DRAIN_READ_SIZE):
+            break
+
+
+def debounce_resize(wakeup_read_fd: int) -> None:
+    """Wait briefly to coalesce rapid resize signals into one redraw."""
+    while True:
+        ready, _, _ = select.select([wakeup_read_fd], [], [], RESIZE_DEBOUNCE_TIMEOUT)
+        if not ready:
+            break
+        drain_fd(wakeup_read_fd)
+
+
 class Terminal:
     """Terminal I/O state for the interactive TUI."""
 
@@ -859,18 +920,34 @@ class Terminal:
     KEY_CTRL_C = "\x03"
     KEY_CTRL_D = "\x04"
     KEY_CTRL_U = "\x15"
+    KEY_RESIZE = "resize"
 
     def __init__(self) -> None:
         """Open ``/dev/tty`` read-write and capture geometry and attributes."""
         self.fd = os.open("/dev/tty", os.O_RDWR)
+        self.refresh_geometry()
+        self.old_attrs: list[int | list[bytes | int]] = termios.tcgetattr(self.fd)
+
+    def refresh_geometry(self) -> None:
+        """Re-read terminal dimensions, clamping to safe minimums."""
         try:
             ts = os.get_terminal_size(self.fd)
-            self.width = ts.columns
-            self.height = ts.lines
+            self.width = max(ts.columns, MIN_TERMINAL_WIDTH)
+            self.height = max(ts.lines, MIN_TERMINAL_HEIGHT)
         except OSError:
-            self.width = self.DEFAULT_WIDTH
-            self.height = self.DEFAULT_HEIGHT
-        self.old_attrs: list[int | list[bytes | int]] = termios.tcgetattr(self.fd)
+            self.width = max(
+                getattr(self, "width", self.DEFAULT_WIDTH), MIN_TERMINAL_WIDTH
+            )
+            self.height = max(
+                getattr(self, "height", self.DEFAULT_HEIGHT), MIN_TERMINAL_HEIGHT
+            )
+
+    def apply_resize(self, delta_cache: dict[int, bytes]) -> None:
+        """Refresh geometry and clear cache if width changed."""
+        old_width = self.width
+        self.refresh_geometry()
+        if self.width != old_width:
+            delta_cache.clear()
 
     def close(self) -> None:
         """Restore terminal attributes and close the file descriptor."""
@@ -883,8 +960,14 @@ class Terminal:
             data = data.encode()
         os.write(self.fd, data)
 
-    def read_key(self) -> str:
-        """Read one keypress, normalising arrow-key escape sequences."""
+    def read_key(self, wakeup_read_fd: int | None = None) -> str:
+        """Read one keypress, with optional wakeup pipe for resize signals."""
+        if wakeup_read_fd is not None:
+            readable, _, _ = select.select([self.fd, wakeup_read_fd], [], [])
+            if wakeup_read_fd in readable:
+                drain_fd(wakeup_read_fd)
+                debounce_resize(wakeup_read_fd)
+                return self.KEY_RESIZE
         ch = os.read(self.fd, 1)
         if ch == self.ESC_BYTE:
             ready, _, _ = select.select([self.fd], [], [], ESC_SEQUENCE_TIMEOUT)
@@ -957,6 +1040,7 @@ class Terminal:
         self.write(f"{self.CURSOR_SHOW}{self.ALT_SCREEN_OFF}")
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
         comment = self.edit_comment(existing_text, prompt_label)
+        self.refresh_geometry()
         self.write(f"{self.ALT_SCREEN_ON}{self.CURSOR_HIDE}")
         tty.setraw(self.fd)
         return comment
@@ -977,7 +1061,9 @@ class Terminal:
 
         self.write(self.CLEAR_SCREEN)
 
-        top_bar = build_top_bar(hunk, current_index, len(hunks), len(global_notes))
+        top_bar = build_top_bar(
+            hunk, current_index, len(hunks), len(global_notes), self.width
+        )
         self.write(top_bar + "\r\n")
 
         self.write(build_progress_markers(hunks, current_index, self.width) + "\r\n")
@@ -1096,7 +1182,7 @@ class Terminal:
                     f"  {BOLD}{num}{RESET}. [{kind_str}] ",
                 )
                 if len(preview) > max_preview:
-                    preview = preview[: max_preview - 1] + "…"
+                    preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
                 row(f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}")
 
         empty()
@@ -1246,6 +1332,9 @@ class Terminal:
         delta_cache: dict[int, bytes],
     ) -> None:
         """Run the interactive key-handling loop until the user quits."""
+        wakeup_r, wakeup_w = os.pipe()
+        os.set_blocking(wakeup_r, False)
+        os.set_blocking(wakeup_w, False)
 
         def get_delta(index: int) -> bytes:
             """Return cached delta output for hunk at *index*."""
@@ -1266,18 +1355,32 @@ class Terminal:
                 state.scroll_offset,
             )
 
-        tty.setraw(self.fd)
-        redraw()
+        prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
+        prev_handler = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, lambda *_: None)
+        try:
+            tty.setraw(self.fd)
+            redraw()
 
-        while True:
-            key = self.read_key()
+            while True:
+                key = self.read_key(wakeup_read_fd=wakeup_r)
 
-            if key in ("q", self.KEY_CTRL_C):
-                break
+                if key == self.KEY_RESIZE:
+                    self.apply_resize(delta_cache)
+                    redraw()
+                    continue
 
-            handled = self.dispatch_key(key, state, redraw)
-            if handled:
-                redraw()
+                if key in ("q", self.KEY_CTRL_C):
+                    break
+
+                handled = self.dispatch_key(key, state, redraw)
+                if handled:
+                    redraw()
+        finally:
+            signal.signal(signal.SIGWINCH, prev_handler)
+            signal.set_wakeup_fd(prev_wakeup_fd)
+            os.close(wakeup_r)
+            os.close(wakeup_w)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
