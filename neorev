@@ -33,6 +33,7 @@ Keys:
 import argparse
 import base64
 import binascii
+import contextlib
 import os
 import re
 import select
@@ -42,10 +43,12 @@ import sys
 import tempfile
 import termios
 import tty
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
+from typing import Literal, Self, TextIO, cast
 
 CSI = "\033["
 BOLD = f"{CSI}1m"
@@ -58,15 +61,13 @@ CYAN = f"{CSI}36m"
 BG_BLUE = f"{CSI}44m"
 WHITE = f"{CSI}37m"
 
-ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-HELP_BOX_WIDTH = 57
 
 HUNK_BODY_MAX_LINES = 10
 HUNK_BODY_CONTEXT_LINES = HUNK_BODY_MAX_LINES // 2
 BITS_PER_BYTE = 8
 COMMENT_PREVIEW_MAX = 60
-GLOBAL_NOTES_BOX_WIDTH = 60
+DRAIN_READ_SIZE = 256
 ESC_SEQUENCE_TIMEOUT = 0.05
 CHROME_ROWS = 3  # top bar + markers + footer
 MIN_VISIBLE_ROWS = 3
@@ -78,6 +79,30 @@ MIN_TERMINAL_HEIGHT = CHROME_ROWS + MIN_VISIBLE_ROWS
 TRUNCATION_ELLIPSIS = "…"
 RESIZE_DEBOUNCE_TIMEOUT = 0.05
 SELECT_IMMEDIATE = 0
+GLOBAL_TARGET = "(global)"
+
+STATUS_APPROVED = "approved"
+STATUS_FLAG = "flag"
+STATUS_QUESTION = "question"
+
+ReviewStatus = Literal["approved", "flag", "question"]
+ReviewKind = Literal["flag", "question"]
+
+REVIEW_ACTION_LABEL: dict[ReviewKind, str] = {
+    STATUS_FLAG: "CHANGE REQUESTED",
+    STATUS_QUESTION: "QUESTION",
+}
+ACTION_TO_STATUS: dict[str, ReviewKind] = {
+    "CHANGE REQUESTED": STATUS_FLAG,
+    "QUESTION": STATUS_QUESTION,
+}
+STATUS_DISPLAY: dict[ReviewStatus | None, str] = {
+    STATUS_APPROVED: f"{GREEN}✓ approved{RESET}",
+    STATUS_FLAG: f"{RED}✗ change requested{RESET}",
+    STATUS_QUESTION: f"{YELLOW}? question{RESET}",
+    None: f"{DIM}—{RESET}",
+}
+
 
 OUTPUT_PREAMBLE = """\
 # Code Review
@@ -103,7 +128,7 @@ class Hunk:
     file_path: str = ""
     start_line: int = 0
     comment: str = ""
-    status: str = ""
+    status: ReviewStatus | None = None
 
     @property
     def short_location(self) -> str:
@@ -119,7 +144,7 @@ class Hunk:
 class GlobalNote:
     """A review annotation not tied to any specific hunk."""
 
-    kind: str  # "flag" or "question"
+    kind: ReviewKind
     text: str
 
 
@@ -280,18 +305,18 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
     snippet plus the reviewer's comment.  Global notes appear first.
     """
     out = StringIO()
-    actionable = [h for h in hunks if h.status in ("question", "flag")]
+    actionable = [h for h in hunks if h.status in (STATUS_QUESTION, STATUS_FLAG)]
 
     if not actionable and not global_notes:
-        approved = sum(1 for h in hunks if h.status == "approved")
+        approved = sum(1 for h in hunks if h.status == STATUS_APPROVED)
         out.write("# Review: all clear, no action needed.\n")
         out.write(f"# {approved}/{len(hunks)} hunks approved.\n")
         out.write(f"# neorev:{encode_approved_bitmap(hunks)}\n")
         return out.getvalue()
 
-    approved = sum(1 for h in hunks if h.status == "approved")
-    flags = sum(1 for h in hunks if h.status == "flag")
-    questions = sum(1 for h in hunks if h.status == "question")
+    approved = sum(1 for h in hunks if h.status == STATUS_APPROVED)
+    flags = sum(1 for h in hunks if h.status == STATUS_FLAG)
+    questions = sum(1 for h in hunks if h.status == STATUS_QUESTION)
     out.write(OUTPUT_PREAMBLE)
     out.write(
         f"# {len(hunks)} hunks: {approved} approved, "
@@ -313,15 +338,17 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
 
 def write_global_note(out: StringIO, note: GlobalNote) -> None:
     """Write a single global note section to *out*."""
-    label = "CHANGE REQUESTED" if note.kind == "flag" else "QUESTION"
-    out.write(f"## [{label}] (global)\n")
+    label = REVIEW_ACTION_LABEL[note.kind]
+    out.write(f"## [{label}] {GLOBAL_TARGET}\n")
     out.writelines(f"> {comment_line}\n" for comment_line in note.text.splitlines())
     out.write("\n")
 
 
 def write_hunk_annotation(out: StringIO, hunk: Hunk) -> None:
     """Write a single hunk annotation section to *out*."""
-    action = "CHANGE REQUESTED" if hunk.status == "flag" else "QUESTION"
+    if hunk.status not in REVIEW_ACTION_LABEL:
+        return
+    action = REVIEW_ACTION_LABEL[hunk.status]
     out.write(f"## [{action}] {hunk.file_path}\n")
 
     body_lines = hunk.body.splitlines()
@@ -349,7 +376,7 @@ def encode_approved_bitmap(hunks: list[Hunk]) -> str:
     current_byte = 0
     bit_index = 0
     for hunk in hunks:
-        if hunk.status == "approved":
+        if hunk.status == STATUS_APPROVED:
             current_byte |= 1 << bit_index
         bit_index += 1
         if bit_index == BITS_PER_BYTE:
@@ -384,7 +411,7 @@ def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
 
 def load_previous_review(
     path: str,
-) -> tuple[dict[tuple[str, str], tuple[str, str]], list[GlobalNote], str]:
+) -> tuple[dict[tuple[str, str], tuple[ReviewKind, str]], list[GlobalNote], str]:
     """
     Parse a previous review output file.
 
@@ -400,7 +427,7 @@ def load_previous_review(
     if not text.strip():
         return {}, [], ""
 
-    annotations: dict[tuple[str, str], tuple[str, str]] = {}
+    annotations: dict[tuple[str, str], tuple[ReviewKind, str]] = {}
     global_notes: list[GlobalNote] = []
     bitmap_encoded = ""
 
@@ -420,11 +447,11 @@ def load_previous_review(
 
         action_str = header_match.group(1)
         target = header_match.group(2).strip()
-        status = "flag" if action_str == "CHANGE REQUESTED" else "question"
+        status = ACTION_TO_STATUS[action_str]
 
         comment = extract_comment_lines(section)
 
-        if target == "(global)":
+        if target == GLOBAL_TARGET:
             if comment:
                 global_notes.append(GlobalNote(kind=status, text=comment))
             continue
@@ -452,7 +479,7 @@ def extract_comment_lines(section: str) -> str:
 
 def apply_previous_review(
     hunks: list[Hunk],
-    annotations: dict[tuple[str, str], tuple[str, str]],
+    annotations: dict[tuple[str, str], tuple[ReviewKind, str]],
 ) -> int:
     """
     Apply previously saved annotations to *hunks*.
@@ -469,7 +496,7 @@ def apply_previous_review(
 
 
 def write_comment_template(
-    file_obj: "tempfile._TemporaryFileWrapper[str]",
+    file_obj: TextIO,
     location: str,
     existing: str,
 ) -> int:
@@ -494,6 +521,29 @@ def read_comment_file(path: str) -> str:
     return "".join(lines).strip()
 
 
+@contextmanager
+def duplicated_fd(fd: int) -> Iterator[int]:
+    """Yield a duplicate of *fd* and close it automatically."""
+    dup_fd = os.dup(fd)
+    try:
+        yield dup_fd
+    finally:
+        os.close(dup_fd)
+
+
+@contextmanager
+def nonblocking_pipe() -> Iterator[tuple[int, int]]:
+    """Yield a non-blocking pipe pair and close both ends automatically."""
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+        yield read_fd, write_fd
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def find_next_unhandled_hunk(hunks: list[Hunk], current: int) -> int:
     """
     Find the next hunk with no status, wrapping around.
@@ -503,7 +553,7 @@ def find_next_unhandled_hunk(hunks: list[Hunk], current: int) -> int:
     n = len(hunks)
     for offset in range(1, n + 1):
         candidate = (current + offset) % n
-        if hunks[candidate].status == "":
+        if hunks[candidate].status is None:
             return candidate
     return current
 
@@ -511,18 +561,9 @@ def find_next_unhandled_hunk(hunks: list[Hunk], current: int) -> int:
 def find_initial_hunk_index(hunks: list[Hunk]) -> int:
     """Return the index of the first unhandled hunk, or 0."""
     for i, hunk in enumerate(hunks):
-        if hunk.status == "":
+        if hunk.status is None:
             return i
     return 0
-
-
-def visible_text_length(line: bytes) -> int:
-    """Return the visible character count of *line* (ignoring ANSI escapes)."""
-    stripped = ANSI_ESCAPE_RE.sub(b"", line)
-    try:
-        return len(stripped.decode("utf-8", errors="replace"))
-    except UnicodeDecodeError:
-        return len(stripped)
 
 
 def visible_len(text: str) -> int:
@@ -556,25 +597,22 @@ def truncate_ansi_text(text: str, max_visible: int) -> str:
     return "".join(result)
 
 
-def estimate_wrapped_rows(line: bytes, term_width: int) -> int:
-    """Estimate how many terminal rows *line* occupies after wrapping."""
-    vlen = visible_text_length(line)
-    if vlen == 0:
-        return 1
-    return (vlen + term_width - 1) // term_width
-
-
-def count_fitting_lines(line_rows: list[int], start: int, row_budget: int) -> int:
-    """Count how many diff lines fit within *row_budget* rows from *start*."""
-    used = 0
-    count = 0
-    for i in range(start, len(line_rows)):
-        needed = line_rows[i]
-        if used + needed > row_budget:
-            break
-        used += needed
-        count += 1
-    return count
+def compute_visible_count(
+    total_lines: int,
+    max_available_rows: int,
+    scroll_offset: int,
+) -> tuple[int, bool, bool]:
+    """Compute visible diff lines and scroll indicators for *scroll_offset*."""
+    can_scroll_up = scroll_offset > 0
+    rows_with_both_indicators = max_available_rows - (1 if can_scroll_up else 0) - 1
+    available_rows = max(rows_with_both_indicators, MIN_VISIBLE_ROWS)
+    visible_count = min(available_rows, total_lines - scroll_offset)
+    can_scroll_down = scroll_offset + visible_count < total_lines
+    if not can_scroll_down:
+        rows_without_down_indicator = max_available_rows - (1 if can_scroll_up else 0)
+        available_rows = max(rows_without_down_indicator, MIN_VISIBLE_ROWS)
+        visible_count = min(available_rows, total_lines - scroll_offset)
+    return visible_count, can_scroll_up, can_scroll_down
 
 
 def update_active_sgr(esc: str, active_sgr: list[str]) -> None:
@@ -647,7 +685,7 @@ def build_display_lines(delta_output: bytes, term_width: int) -> list[bytes]:
 
 
 def compute_diff_viewport(
-    line_rows: list[int],
+    total_lines: int,
     term_height: int,
     scroll_offset: int,
 ) -> DiffViewport:
@@ -657,34 +695,20 @@ def compute_diff_viewport(
     The fixed chrome occupies ``CHROME_ROWS`` rows (top bar + markers + footer).
     Scroll indicators are reserved only when actually needed.
     """
-    total_lines = len(line_rows)
-    total_content_rows = sum(line_rows)
     max_avail = term_height - CHROME_ROWS
 
-    needs_scrolling = total_content_rows > max_avail
-
-    if needs_scrolling:
-        avail_at_bottom = max(max_avail - 1, MIN_VISIBLE_ROWS)
-        max_offset = 0
-        for i in range(total_lines):
-            if sum(line_rows[i:]) <= avail_at_bottom:
-                max_offset = i
-                break
-        else:
-            max_offset = total_lines - 1
-        scroll_offset = min(scroll_offset, max(0, max_offset))
-
-        can_scroll_up = scroll_offset > 0
-        can_scroll_down = scroll_offset < max_offset
-
-        indicator_rows = (1 if can_scroll_up else 0) + (1 if can_scroll_down else 0)
-        avail_rows = max(max_avail - indicator_rows, MIN_VISIBLE_ROWS)
-        visible_count = count_fitting_lines(line_rows, scroll_offset, avail_rows)
-    else:
+    if total_lines <= max_avail:
         scroll_offset = 0
         can_scroll_up = False
         can_scroll_down = False
-        visible_count = count_fitting_lines(line_rows, 0, max_avail)
+        visible_count = total_lines
+    else:
+        scroll_offset = min(scroll_offset, total_lines - 1)
+        visible_count, can_scroll_up, can_scroll_down = compute_visible_count(
+            total_lines,
+            max_avail,
+            scroll_offset,
+        )
 
     lines_above = scroll_offset
     lines_below = total_lines - scroll_offset - visible_count
@@ -708,13 +732,7 @@ def build_top_bar(
     term_width: int = 0,
 ) -> str:
     """Build the top status bar string for the current hunk."""
-    status_map = {
-        "approved": f"{GREEN}✓ approved{RESET}",
-        "flag": f"{RED}✗ change requested{RESET}",
-        "question": f"{YELLOW}? question{RESET}",
-        "": f"{DIM}—{RESET}",
-    }
-    status_str = status_map.get(hunk.status, f"{DIM}—{RESET}")
+    status_str = STATUS_DISPLAY.get(hunk.status, STATUS_DISPLAY[None])
 
     comment_bit = ""
     if hunk.comment:
@@ -744,11 +762,11 @@ def hunk_marker(hunk: Hunk, *, is_current: bool) -> str:
     """Return the ANSI-styled marker for a single hunk (3 visible chars)."""
     icon = "·"
     color = DIM
-    if hunk.status == "approved":
+    if hunk.status == STATUS_APPROVED:
         icon, color = "✓", GREEN
-    elif hunk.status == "flag":
+    elif hunk.status == STATUS_FLAG:
         icon, color = "✗", RED
-    elif hunk.status == "question":
+    elif hunk.status == STATUS_QUESTION:
         icon, color = "?", YELLOW
     if is_current:
         return f"{BOLD}[{color}{icon}{RESET}{BOLD}]{RESET}"
@@ -850,10 +868,10 @@ def build_footer_line(term_width: int) -> str:
 def handle_approve(state: ReviewState) -> None:
     """Toggle approval on the current hunk."""
     hunk = state.hunks[state.current_index]
-    if hunk.status == "approved":
-        hunk.status = ""
+    if hunk.status == STATUS_APPROVED:
+        hunk.status = None
     else:
-        hunk.status = "approved"
+        hunk.status = STATUS_APPROVED
         hunk.comment = ""
         state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
 
@@ -862,8 +880,8 @@ def handle_approve_file(state: ReviewState) -> None:
     """Approve all hunks belonging to the same file as the current hunk."""
     current_file = state.hunks[state.current_index].file_path
     for hunk in state.hunks:
-        if hunk.file_path == current_file and hunk.status != "approved":
-            hunk.status = "approved"
+        if hunk.file_path == current_file and hunk.status != STATUS_APPROVED:
+            hunk.status = STATUS_APPROVED
             hunk.comment = ""
     state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
 
@@ -878,9 +896,6 @@ def handle_navigation(key: str, state: ReviewState) -> bool:
         state.current_index -= 1
         return True
     return False
-
-
-DRAIN_READ_SIZE = 256
 
 
 def drain_fd(fd: int) -> None:
@@ -907,6 +922,8 @@ class Terminal:
 
     DEFAULT_WIDTH = 120
     DEFAULT_HEIGHT = 40
+    HELP_BOX_WIDTH = 57
+    GLOBAL_NOTES_BOX_WIDTH = 60
 
     CLEAR_SCREEN = f"{CSI}2J{CSI}H"
     ALT_SCREEN_ON = f"{CSI}?1049h"
@@ -927,6 +944,14 @@ class Terminal:
         self.fd = os.open("/dev/tty", os.O_RDWR)
         self.refresh_geometry()
         self.old_attrs: list[int | list[bytes | int]] = termios.tcgetattr(self.fd)
+
+    def __enter__(self) -> Self:
+        """Return self for context-managed terminal usage."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Close the terminal when leaving a context manager block."""
+        self.close()
 
     def refresh_geometry(self) -> None:
         """Re-read terminal dimensions, clamping to safe minimums."""
@@ -996,12 +1021,11 @@ class Terminal:
             prefix="review-",
             delete=False,
         ) as tmp:
-            jump_line = write_comment_template(tmp, location, existing)
+            jump_line = write_comment_template(cast("TextIO", tmp), location, existing)
             tmppath = tmp.name
 
         try:
-            dup_fd = os.dup(self.fd)
-            try:
+            with duplicated_fd(self.fd) as dup_fd:
                 subprocess.run(
                     [editor, f"{tmppath}:{jump_line}"],
                     check=True,
@@ -1009,11 +1033,10 @@ class Terminal:
                     stdout=dup_fd,
                     stderr=dup_fd,
                 )
-            finally:
-                os.close(dup_fd)
             return read_comment_file(tmppath)
         finally:
-            os.unlink(tmppath)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmppath)
 
     def prompt_inline_comment(self, existing: str, location: str) -> str:
         """Prompt for a single-line comment directly on the TTY."""
@@ -1056,8 +1079,7 @@ class Terminal:
         """Render the full review screen and return the clamped scroll offset."""
         hunk = hunks[current_index]
         diff_lines = build_display_lines(delta_output, self.width)
-        line_rows = [1] * len(diff_lines)
-        viewport = compute_diff_viewport(line_rows, self.height, scroll_offset)
+        viewport = compute_diff_viewport(len(diff_lines), self.height, scroll_offset)
 
         self.write(self.CLEAR_SCREEN)
 
@@ -1107,94 +1129,118 @@ class Terminal:
     def render_help_screen(self) -> None:
         """Display the keyboard shortcuts help overlay."""
         self.write(self.CLEAR_SCREEN)
-        border = "─" * HELP_BOX_WIDTH
-
-        def row(text: str) -> None:
-            """Write a box row, padding to *HELP_BOX_WIDTH*."""
-            pad = HELP_BOX_WIDTH - visible_len(text)
-            self.write(f"│{text}{' ' * pad}│\r\n")
-
-        def empty() -> None:
-            """Write an empty box row."""
-            self.write(f"│{' ' * HELP_BOX_WIDTH}│\r\n")
+        border = "─" * self.HELP_BOX_WIDTH
+        rows = [
+            f"{BOLD}  neorev — Keyboard Shortcuts{RESET}",
+            "",
+            f"  {BOLD}j / ↓{RESET}         Next hunk",
+            f"  {BOLD}k / ↑{RESET}         Previous hunk",
+            f"  {BOLD}Ctrl-D{RESET}        Scroll diff down (half page)",
+            f"  {BOLD}Ctrl-U{RESET}        Scroll diff up (half page)",
+            f"  {BOLD}a{RESET}             Approve hunk (no comment)",
+            f"  {BOLD}A{RESET}             Approve all hunks in current file",
+            f"  {BOLD}c{RESET}             Question about this hunk ($EDITOR)",
+            f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)",
+            f"  {BOLD}gc{RESET}            Global question ($EDITOR)",
+            f"  {BOLD}gf{RESET}            Global change request ($EDITOR)",
+            f"  {BOLD}G{RESET}             Manage global notes (edit/delete)",
+            f"  {BOLD}q / Ctrl-C{RESET}    Quit → write output to file",
+            f"  {BOLD}?{RESET}             This help",
+            "",
+            f"  {DIM}a  = looks good, no action needed{RESET}",
+            f"  {DIM}c  = ask a question (agent answers, no code change){RESET}",
+            f"  {DIM}f  = request a change (agent modifies code){RESET}",
+            f"  {DIM}gc = global question (not tied to a specific hunk){RESET}",
+            f'  {DIM}gf = global change request (e.g. "add tests for X"){RESET}',
+            "",
+            f"  Set {BOLD}$EDITOR{RESET} (e.g. hx, nvim) for multi-line",
+            "  comments. Without it, single-line prompt is used.",
+            "",
+            f"  {DIM}Press any key to return.{RESET}",
+        ]
 
         self.write(f"┌{border}┐\r\n")
-        row(f"{BOLD}  neorev — Keyboard Shortcuts{RESET}")
         self.write(f"├{border}┤\r\n")
-        empty()
-        row(f"  {BOLD}j / ↓{RESET}         Next hunk")
-        row(f"  {BOLD}k / ↑{RESET}         Previous hunk")
-        row(f"  {BOLD}Ctrl-D{RESET}        Scroll diff down (half page)")
-        row(f"  {BOLD}Ctrl-U{RESET}        Scroll diff up (half page)")
-        row(f"  {BOLD}a{RESET}             Approve hunk (no comment)")
-        row(f"  {BOLD}A{RESET}             Approve all hunks in current file")
-        row(f"  {BOLD}c{RESET}             Question about this hunk ($EDITOR)")
-        row(f"  {BOLD}f{RESET}             Flag / request change ($EDITOR)")
-        row(f"  {BOLD}gc{RESET}            Global question ($EDITOR)")
-        row(f"  {BOLD}gf{RESET}            Global change request ($EDITOR)")
-        row(f"  {BOLD}G{RESET}             Manage global notes (edit/delete)")
-        row(f"  {BOLD}q / Ctrl-C{RESET}    Quit → write output to file")
-        row(f"  {BOLD}?{RESET}             This help")
-        empty()
-        row(f"  {DIM}a  = looks good, no action needed{RESET}")
-        row(f"  {DIM}c  = ask a question (agent answers, no code change){RESET}")
-        row(f"  {DIM}f  = request a change (agent modifies code){RESET}")
-        row(f"  {DIM}gc = global question (not tied to a specific hunk){RESET}")
-        row(f'  {DIM}gf = global change request (e.g. "add tests for X"){RESET}')
-        empty()
-        row(f"  Set {BOLD}$EDITOR{RESET} (e.g. hx, nvim) for multi-line")
-        row("  comments. Without it, single-line prompt is used.")
-        empty()
-        row(f"  {DIM}Press any key to return.{RESET}")
+        self.write_box_rows(self.HELP_BOX_WIDTH, rows)
         self.write(f"└{border}┘\r\n")
 
     def render_global_notes_screen(self, notes: list[GlobalNote]) -> None:
         """Display the global notes management overlay."""
         self.write(self.CLEAR_SCREEN)
-        border = "─" * GLOBAL_NOTES_BOX_WIDTH
-
-        def row(text: str) -> None:
-            """Write a box row, padding to *GLOBAL_NOTES_BOX_WIDTH*."""
-            pad = GLOBAL_NOTES_BOX_WIDTH - visible_len(text)
-            self.write(f"│{text}{' ' * pad}│\r\n")
-
-        def empty() -> None:
-            """Write an empty box row."""
-            self.write(f"│{' ' * GLOBAL_NOTES_BOX_WIDTH}│\r\n")
+        border = "─" * self.GLOBAL_NOTES_BOX_WIDTH
 
         self.write(f"┌{border}┐\r\n")
-        row(f"{BOLD}  Global Notes{RESET}")
+        self.write_box_row(self.GLOBAL_NOTES_BOX_WIDTH, f"{BOLD}  Global Notes{RESET}")
         self.write(f"├{border}┤\r\n")
-        empty()
+        self.write_box_empty_row(self.GLOBAL_NOTES_BOX_WIDTH)
 
         if not notes:
-            row(f"  {DIM}No global notes yet.{RESET}")
+            self.write_box_row(
+                self.GLOBAL_NOTES_BOX_WIDTH,
+                f"  {DIM}No global notes yet.{RESET}",
+            )
         else:
             for i, note in enumerate(notes):
                 num = i + 1
                 kind_str = (
                     f"{RED}flag{RESET}"
-                    if note.kind == "flag"
+                    if note.kind == STATUS_FLAG
                     else f"{YELLOW}question{RESET}"
                 )
                 preview = note.text.replace("\n", " ")
-                max_preview = GLOBAL_NOTES_BOX_WIDTH - visible_len(
+                max_preview = self.GLOBAL_NOTES_BOX_WIDTH - visible_len(
                     f"  {BOLD}{num}{RESET}. [{kind_str}] ",
                 )
                 if len(preview) > max_preview:
                     preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
-                row(f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}")
+                self.write_box_row(
+                    self.GLOBAL_NOTES_BOX_WIDTH,
+                    f"  {BOLD}{num}{RESET}. [{kind_str}] {preview}",
+                )
 
-        empty()
-        row(f"  {BOLD}e{RESET}N edit  {BOLD}d{RESET}N delete  {BOLD}q{RESET} back")
+        self.write_box_empty_row(self.GLOBAL_NOTES_BOX_WIDTH)
+        self.write_box_row(
+            self.GLOBAL_NOTES_BOX_WIDTH,
+            (
+                f"  {BOLD}e{RESET}<num> edit  "
+                f"{BOLD}d{RESET}<num> delete  {BOLD}q{RESET} back"
+            ),
+        )
         self.write(f"└{border}┘\r\n")
+
+    def write_box_rows(self, width: int, rows: list[str]) -> None:
+        """Write a sequence of bordered rows, treating empty strings as blanks."""
+        for row in rows:
+            if row:
+                self.write_box_row(width, row)
+            else:
+                self.write_box_empty_row(width)
+
+    def write_box_row(self, width: int, text: str) -> None:
+        """Write one bordered row padded to *width*."""
+        pad = width - visible_len(text)
+        self.write(f"│{text}{' ' * pad}│\r\n")
+
+    def write_box_empty_row(self, width: int) -> None:
+        """Write one empty bordered row with *width* inner cells."""
+        self.write(f"│{' ' * width}│\r\n")
 
     def parse_note_index(self, notes: list[GlobalNote]) -> int | None:
         """Read digit keys and return a zero-based note index, or None."""
-        digits = self.read_key()
-        if not digits.isdigit():
+        first = self.read_key()
+        if not first.isdigit():
             return None
-        num = int(digits)
+        digits = [first]
+        while True:
+            ready, _, _ = select.select([self.fd], [], [], SELECT_IMMEDIATE)
+            if not ready:
+                break
+            key = self.read_key()
+            if not key.isdigit():
+                break
+            digits.append(key)
+
+        num = int("".join(digits))
         if 1 <= num <= len(notes):
             return num - 1
         return None
@@ -1214,7 +1260,7 @@ class Terminal:
                     note = state.global_notes[idx]
                     kind_label = (
                         "global change request"
-                        if note.kind == "flag"
+                        if note.kind == STATUS_FLAG
                         else "global question (agent answers, no code change)"
                     )
                     new_text = self.edit_text_outside_tui(note.text, kind_label)
@@ -1247,7 +1293,7 @@ class Terminal:
 
         if is_flag:
             if comment:
-                hunk.status = "flag"
+                hunk.status = STATUS_FLAG
                 hunk.comment = comment
                 state.current_index = find_next_unhandled_hunk(
                     state.hunks,
@@ -1255,7 +1301,7 @@ class Terminal:
                 )
         else:
             hunk.comment = comment
-            hunk.status = "question" if comment else ""
+            hunk.status = STATUS_QUESTION if comment else None
             if comment:
                 state.current_index = find_next_unhandled_hunk(
                     state.hunks,
@@ -1272,7 +1318,7 @@ class Terminal:
         )
         text = self.edit_text_outside_tui("", label)
         if text:
-            kind = "flag" if is_flag else "question"
+            kind: ReviewKind = STATUS_FLAG if is_flag else STATUS_QUESTION
             state.global_notes.append(GlobalNote(kind=kind, text=text))
 
     def handle_scroll(
@@ -1332,55 +1378,51 @@ class Terminal:
         delta_cache: dict[int, bytes],
     ) -> None:
         """Run the interactive key-handling loop until the user quits."""
-        wakeup_r, wakeup_w = os.pipe()
-        os.set_blocking(wakeup_r, False)
-        os.set_blocking(wakeup_w, False)
+        with nonblocking_pipe() as (wakeup_r, wakeup_w):
 
-        def get_delta(index: int) -> bytes:
-            """Return cached delta output for hunk at *index*."""
-            if index not in delta_cache:
-                delta_cache[index] = render_through_delta(
-                    state.hunks[index].raw,
-                    width=self.width,
+            def get_delta(index: int) -> bytes:
+                """Return cached delta output for hunk at *index*."""
+                if index not in delta_cache:
+                    delta_cache[index] = render_through_delta(
+                        state.hunks[index].raw,
+                        width=self.width,
+                    )
+                return delta_cache[index]
+
+            def redraw() -> None:
+                """Redraw the review screen."""
+                state.scroll_offset = self.render_review_screen(
+                    state.hunks,
+                    state.current_index,
+                    get_delta(state.current_index),
+                    state.global_notes,
+                    state.scroll_offset,
                 )
-            return delta_cache[index]
 
-        def redraw() -> None:
-            """Redraw the review screen."""
-            state.scroll_offset = self.render_review_screen(
-                state.hunks,
-                state.current_index,
-                get_delta(state.current_index),
-                state.global_notes,
-                state.scroll_offset,
-            )
+            prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
+            prev_handler = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, lambda *_: None)
+            try:
+                tty.setraw(self.fd)
+                redraw()
 
-        prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
-        prev_handler = signal.getsignal(signal.SIGWINCH)
-        signal.signal(signal.SIGWINCH, lambda *_: None)
-        try:
-            tty.setraw(self.fd)
-            redraw()
+                while True:
+                    key = self.read_key(wakeup_read_fd=wakeup_r)
 
-            while True:
-                key = self.read_key(wakeup_read_fd=wakeup_r)
+                    if key == self.KEY_RESIZE:
+                        self.apply_resize(delta_cache)
+                        redraw()
+                        continue
 
-                if key == self.KEY_RESIZE:
-                    self.apply_resize(delta_cache)
-                    redraw()
-                    continue
+                    if key in ("q", self.KEY_CTRL_C):
+                        break
 
-                if key in ("q", self.KEY_CTRL_C):
-                    break
-
-                handled = self.dispatch_key(key, state, redraw)
-                if handled:
-                    redraw()
-        finally:
-            signal.signal(signal.SIGWINCH, prev_handler)
-            signal.set_wakeup_fd(prev_wakeup_fd)
-            os.close(wakeup_r)
-            os.close(wakeup_w)
+                    handled = self.dispatch_key(key, state, redraw)
+                    if handled:
+                        redraw()
+            finally:
+                signal.signal(signal.SIGWINCH, prev_handler)
+                signal.set_wakeup_fd(prev_wakeup_fd)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1448,8 +1490,8 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     if bitmap_encoded:
         approved = decode_approved_bitmap(bitmap_encoded, len(hunks))
         for i, is_approved in enumerate(approved):
-            if is_approved and not hunks[i].status:
-                hunks[i].status = "approved"
+            if is_approved and hunks[i].status is None:
+                hunks[i].status = STATUS_APPROVED
                 approved_from_bitmap += 1
 
     sys.stderr.write(
@@ -1501,7 +1543,6 @@ def main() -> None:
     hunks = parse_diff_or_exit(diff_text)
     global_notes = load_or_resume_review(hunks, args.output)
 
-    term = Terminal()
     delta_cache: dict[int, bytes] = {}
 
     state = ReviewState(
@@ -1510,13 +1551,12 @@ def main() -> None:
         current_index=find_initial_hunk_index(hunks),
     )
 
-    term.write(f"{term.ALT_SCREEN_ON}{term.CURSOR_HIDE}")
-
-    try:
-        term.run_review_loop(state, delta_cache)
-    finally:
-        term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
-        term.close()
+    with Terminal() as term:
+        term.write(f"{term.ALT_SCREEN_ON}{term.CURSOR_HIDE}")
+        try:
+            term.run_review_loop(state, delta_cache)
+        finally:
+            term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
 
     write_review_output(args.output, hunks, global_notes)
     if args.clip:

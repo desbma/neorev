@@ -173,7 +173,7 @@ def make_hunk(
     file_path: str = "test.py",
     start_line: int = 1,
     body: str = "+added line",
-    status: str = "",
+    status: neorev.ReviewStatus | None = None,
     comment: str = "",
 ) -> neorev.Hunk:
     """Create a Hunk with sensible defaults for testing."""
@@ -386,7 +386,16 @@ class TestBitmap(unittest.TestCase):
 
     def test_exactly_8_hunks(self) -> None:
         """8 hunks (exactly 1 byte boundary) round-trip correctly."""
-        statuses = ["approved", "", "approved", "", "", "approved", "approved", ""]
+        statuses = [
+            "approved",
+            None,
+            "approved",
+            None,
+            None,
+            "approved",
+            "approved",
+            None,
+        ]
         hunks = [make_hunk(status=s) for s in statuses]
         encoded = neorev.encode_approved_bitmap(hunks)
         decoded = neorev.decode_approved_bitmap(encoded, BYTE_BOUNDARY_HUNK_COUNT)
@@ -397,13 +406,13 @@ class TestBitmap(unittest.TestCase):
         """9 hunks (2 bytes) with mixed approvals round-trip correctly."""
         statuses = [
             "approved",
-            "",
+            None,
             "approved",
-            "",
-            "",
+            None,
+            None,
             "approved",
             "approved",
-            "",
+            None,
             "approved",
         ]
         hunks = [make_hunk(status=s) for s in statuses]
@@ -575,7 +584,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         annotations = {("other.py", "@@ -1 +1 @@"): ("flag", "n/a")}
         matched = neorev.apply_previous_review(hunks, annotations)
         self.assertEqual(matched, 0)
-        self.assertEqual(hunks[0].status, "")
+        self.assertIsNone(hunks[0].status)
 
     def test_global_notes_round_trip(self) -> None:
         """Global notes survive format_output → load_previous_review."""
@@ -731,7 +740,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(self.hunks[0].status, "approved")
         self.state.current_index = 0
         neorev.handle_approve(self.state)
-        self.assertEqual(self.hunks[0].status, "")
+        self.assertIsNone(self.hunks[0].status)
 
     def test_approve_clears_comment(self) -> None:
         """Approving a hunk clears any existing comment."""
@@ -761,7 +770,7 @@ class TestNavigation(unittest.TestCase):
         self.hunks[2].file_path = "a.py"
         neorev.handle_approve_file(self.state)
         self.assertEqual(self.hunks[0].status, "approved")
-        self.assertEqual(self.hunks[1].status, "")
+        self.assertIsNone(self.hunks[1].status)
         self.assertEqual(self.hunks[2].status, "approved")
 
     def test_find_next_unhandled_wraps(self) -> None:
@@ -834,13 +843,13 @@ class TestRenderingHelpers(unittest.TestCase):
     """Tests for ANSI text measurement, wrapping, and display-line building."""
 
     def test_visible_text_length_plain(self) -> None:
-        """Plain ASCII bytes have length equal to byte count."""
-        self.assertEqual(neorev.visible_text_length(b"hello"), 5)
+        """Plain ASCII text has visible length equal to byte count."""
+        self.assertEqual(neorev.visible_len("hello"), 5)
 
     def test_visible_text_length_ansi(self) -> None:
         """ANSI escape sequences are excluded from visible length."""
-        line = f"{neorev.GREEN}hello{neorev.RESET}".encode()
-        self.assertEqual(neorev.visible_text_length(line), 5)
+        line = f"{neorev.GREEN}hello{neorev.RESET}"
+        self.assertEqual(neorev.visible_len(line), 5)
 
     def test_visible_len_str(self) -> None:
         """visible_len works on str with ANSI codes."""
@@ -848,27 +857,31 @@ class TestRenderingHelpers(unittest.TestCase):
         self.assertEqual(neorev.visible_len(text), 2)
 
     def test_estimate_wrapped_rows_short(self) -> None:
-        """A short line occupies one row."""
-        self.assertEqual(neorev.estimate_wrapped_rows(b"short", TERM_WIDTH), 1)
+        """A short line occupies one wrapped row."""
+        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(b"short", TERM_WIDTH)), 1)
 
     def test_estimate_wrapped_rows_long(self) -> None:
         """A line longer than term_width wraps to multiple rows."""
         long_line = b"x" * (TERM_WIDTH * 2)
-        self.assertEqual(neorev.estimate_wrapped_rows(long_line, TERM_WIDTH), 2)
+        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(long_line, TERM_WIDTH)), 2)
 
     def test_estimate_wrapped_rows_empty(self) -> None:
-        """An empty line occupies one row."""
-        self.assertEqual(neorev.estimate_wrapped_rows(b"", TERM_WIDTH), 1)
+        """An empty line still occupies one display row."""
+        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(b"", TERM_WIDTH)), 1)
 
     def test_count_fitting_lines(self) -> None:
-        """count_fitting_lines stops when the budget is exhausted."""
-        rows = [1, 1, 2, 1]
-        self.assertEqual(neorev.count_fitting_lines(rows, 0, 3), 2)
+        """compute_visible_count reserves rows for scroll indicators."""
+        visible, can_up, can_down = neorev.compute_visible_count(100, 10, 0)
+        self.assertEqual(visible, 9)
+        self.assertFalse(can_up)
+        self.assertTrue(can_down)
 
     def test_count_fitting_lines_from_offset(self) -> None:
-        """count_fitting_lines respects the start position."""
-        rows = [1, 1, 2, 1]
-        self.assertEqual(neorev.count_fitting_lines(rows, 2, 3), 2)
+        """compute_visible_count shows both indicators when mid-scroll."""
+        visible, can_up, can_down = neorev.compute_visible_count(100, 10, 5)
+        self.assertEqual(visible, 8)
+        self.assertTrue(can_up)
+        self.assertTrue(can_down)
 
     def test_build_display_lines_strips_blanks(self) -> None:
         """Leading/trailing blank lines from delta output are stripped."""
@@ -916,7 +929,7 @@ class TestRenderingHelpers(unittest.TestCase):
 
     def test_visible_text_length_unicode(self) -> None:
         """Multi-byte UTF-8 characters count as single visible characters."""
-        self.assertEqual(neorev.visible_text_length("héllo".encode()), 5)
+        self.assertEqual(neorev.visible_len("héllo"), 5)
 
     def test_visible_len_no_ansi(self) -> None:
         """Plain string with no escapes returns len()."""
@@ -925,22 +938,24 @@ class TestRenderingHelpers(unittest.TestCase):
     def test_estimate_wrapped_rows_exactly_width(self) -> None:
         """A line exactly term_width visible chars occupies 1 row."""
         line = b"x" * TERM_WIDTH
-        self.assertEqual(neorev.estimate_wrapped_rows(line, TERM_WIDTH), 1)
+        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)), 1)
 
     def test_estimate_wrapped_rows_one_over(self) -> None:
         """A line of term_width + 1 visible chars occupies 2 rows."""
         line = b"x" * (TERM_WIDTH + 1)
-        self.assertEqual(neorev.estimate_wrapped_rows(line, TERM_WIDTH), 2)
+        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)), 2)
 
     def test_count_fitting_lines_zero_budget(self) -> None:
-        """Zero row budget fits zero lines."""
-        rows = [1, 1, 1]
-        self.assertEqual(neorev.count_fitting_lines(rows, 0, 0), 0)
+        """compute_visible_count enforces MIN_VISIBLE_ROWS."""
+        visible, _, _ = neorev.compute_visible_count(100, 0, 0)
+        self.assertEqual(visible, neorev.MIN_VISIBLE_ROWS)
 
     def test_count_fitting_lines_all_fit(self) -> None:
-        """A large budget fits all lines."""
-        rows = [1, 2, 1]
-        self.assertEqual(neorev.count_fitting_lines(rows, 0, 100), 3)
+        """When at end, compute_visible_count can disable down indicator."""
+        visible, can_up, can_down = neorev.compute_visible_count(20, 10, 15)
+        self.assertEqual(visible, 5)
+        self.assertTrue(can_up)
+        self.assertFalse(can_down)
 
     def test_wrap_ansi_preserves_color_across_rows(self) -> None:
         """A colored line that wraps carries color into the second row."""
@@ -971,7 +986,7 @@ class TestViewport(unittest.TestCase):
     def test_no_scrolling_needed(self) -> None:
         """When content fits, no scroll indicators are shown."""
         line_rows = [1] * 5
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, 0)
+        vp = neorev.compute_diff_viewport(len(line_rows), TERM_HEIGHT, 0)
         self.assertFalse(vp.can_scroll_up)
         self.assertFalse(vp.can_scroll_down)
         self.assertEqual(vp.scroll_offset, 0)
@@ -979,27 +994,35 @@ class TestViewport(unittest.TestCase):
     def test_scrolling_needed(self) -> None:
         """When content exceeds terminal height, scrolling is enabled."""
         line_rows = [1] * OVERFLOWING_LINE_COUNT
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, 0)
+        vp = neorev.compute_diff_viewport(len(line_rows), TERM_HEIGHT, 0)
         self.assertFalse(vp.can_scroll_up)
         self.assertTrue(vp.can_scroll_down)
 
     def test_scroll_offset_clamped(self) -> None:
         """Scroll offset is clamped to valid range."""
         line_rows = [1] * OVERFLOWING_LINE_COUNT
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, OUT_OF_BOUNDS_OFFSET)
+        vp = neorev.compute_diff_viewport(
+            len(line_rows),
+            TERM_HEIGHT,
+            OUT_OF_BOUNDS_OFFSET,
+        )
         self.assertLessEqual(vp.scroll_offset, len(line_rows))
 
     def test_scrolled_to_middle(self) -> None:
         """Scrolling to the middle enables both scroll indicators."""
         line_rows = [1] * OVERFLOWING_LINE_COUNT
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, MIDDLE_SCROLL_OFFSET)
+        vp = neorev.compute_diff_viewport(
+            len(line_rows),
+            TERM_HEIGHT,
+            MIDDLE_SCROLL_OFFSET,
+        )
         self.assertTrue(vp.can_scroll_up)
         self.assertTrue(vp.can_scroll_down)
 
     def test_single_line(self) -> None:
         """A single line with a large terminal needs no scrolling."""
         line_rows = [1]
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, 0)
+        vp = neorev.compute_diff_viewport(len(line_rows), TERM_HEIGHT, 0)
         self.assertFalse(vp.can_scroll_up)
         self.assertFalse(vp.can_scroll_down)
         self.assertEqual(vp.visible_line_count, 1)
@@ -1008,7 +1031,7 @@ class TestViewport(unittest.TestCase):
         """Content rows exactly filling available space needs no scrolling."""
         avail = TERM_HEIGHT - neorev.CHROME_ROWS
         line_rows = [1] * avail
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, 0)
+        vp = neorev.compute_diff_viewport(len(line_rows), TERM_HEIGHT, 0)
         self.assertFalse(vp.can_scroll_up)
         self.assertFalse(vp.can_scroll_down)
         self.assertEqual(vp.visible_line_count, avail)
@@ -1016,7 +1039,11 @@ class TestViewport(unittest.TestCase):
     def test_scroll_to_end(self) -> None:
         """Scrolling to a large offset clamps and disables scroll-down."""
         line_rows = [1] * OVERFLOWING_LINE_COUNT
-        vp = neorev.compute_diff_viewport(line_rows, TERM_HEIGHT, OUT_OF_BOUNDS_OFFSET)
+        vp = neorev.compute_diff_viewport(
+            len(line_rows),
+            TERM_HEIGHT,
+            OUT_OF_BOUNDS_OFFSET,
+        )
         self.assertFalse(vp.can_scroll_down)
         self.assertTrue(vp.can_scroll_up)
 
@@ -1061,7 +1088,7 @@ class TestChrome(unittest.TestCase):
             ("approved", "✓"),
             ("flag", "✗"),
             ("question", "?"),
-            ("", "·"),
+            (None, "·"),
         ]
         for status, icon in cases:
             with self.subTest(status=status):
@@ -1105,7 +1132,8 @@ class TestChrome(unittest.TestCase):
 
     def test_top_bar_unknown_status(self) -> None:
         """A hunk with an unknown status falls back to the dim dash."""
-        hunk = make_hunk(status="bogus")
+        hunk = make_hunk()
+        hunk.__dict__["status"] = "bogus"
         bar = neorev.build_top_bar(hunk, 0, 1, 0)
         self.assertIn("—", bar)
 
@@ -1541,11 +1569,15 @@ class TestViewportClampOnResize(unittest.TestCase):
         line_rows = [1] * OVERFLOWING_LINE_COUNT
         small_height = TERM_HEIGHT
         vp_small = neorev.compute_diff_viewport(
-            line_rows, small_height, OUT_OF_BOUNDS_OFFSET
+            len(line_rows),
+            small_height,
+            OUT_OF_BOUNDS_OFFSET,
         )
         big_height = TERM_HEIGHT * 2
         vp_big = neorev.compute_diff_viewport(
-            line_rows, big_height, vp_small.scroll_offset
+            len(line_rows),
+            big_height,
+            vp_small.scroll_offset,
         )
         self.assertLessEqual(vp_big.scroll_offset, vp_small.scroll_offset)
 
@@ -1553,7 +1585,9 @@ class TestViewportClampOnResize(unittest.TestCase):
         """Decreasing height still produces a valid viewport."""
         line_rows = [1] * OVERFLOWING_LINE_COUNT
         vp = neorev.compute_diff_viewport(
-            line_rows, neorev.MIN_TERMINAL_HEIGHT, MIDDLE_SCROLL_OFFSET
+            len(line_rows),
+            neorev.MIN_TERMINAL_HEIGHT,
+            MIDDLE_SCROLL_OFFSET,
         )
         self.assertGreaterEqual(vp.visible_line_count, 1)
 
