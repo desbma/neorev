@@ -1,0 +1,53 @@
+#!/bin/bash -eu
+# shellcheck disable=SC2155
+
+set -o pipefail
+
+readonly OUTPUT="${1:?}"
+readonly TMP_DIR=$(mktemp -d /tmp/"$(basename -- "$0")".XXXXXXXXXX)
+readonly TMP_SCRIPT="${TMP_DIR}/run"
+readonly TMP_EDITOR="${TMP_DIR}/editor"
+readonly TMP_REVIEW="${TMP_DIR}/review.txt"
+readonly TMUX_SESSION="${RANDOM}"
+readonly WINDOW_CLASS="$(basename -- "${TMP_DIR}")"
+
+at_exit() {
+  tmux kill-session -t "${TMUX_SESSION}" || true
+  rm -R "${TMP_DIR}"
+  systemctl --user start picom.service
+}
+trap at_exit EXIT
+
+send_keys() {
+  for k in "$@"
+  do
+    tmux send-keys -t "${TMUX_SESSION}" "${k}"
+    sleep 0.1
+  done
+}
+
+systemctl --user stop picom.service
+
+cat << EOF > "${TMP_EDITOR}"
+#!/bin/bash
+echo 'Fix foo and bar' > \${1%%:*}
+EOF
+chmod +x "${TMP_EDITOR}"
+export EDITOR="${TMP_EDITOR}"
+
+cat << EOF > "${TMP_SCRIPT}"
+#!/bin/bash
+jj show zr | ./neorev ${TMP_REVIEW}
+EOF
+chmod +x "${TMP_SCRIPT}"
+
+${TERMCMD} --working-directory "${PWD}" --class "${WINDOW_CLASS}" -e tmux new-session -s "${TMUX_SESSION}" "${TMP_SCRIPT}" \; set status off &
+
+sleep 0.5s
+wid="$(xdotool search --class "${WINDOW_CLASS}")"
+
+send_keys g c a a a a a a a a a a f a a a a a f a a a a a a a a a a a f f a a a a f k
+
+maim -u -i "${wid}" "${OUTPUT}"
+
+oxipng -omax -a -z "${OUTPUT}"
