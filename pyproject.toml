@@ -9,6 +9,7 @@ ignore = [
     "PT",      # pytest
     "PTH108",  # os.unlink -> Path.unlink
     "PTH123",  # open() -> Path.open()
+    "S105",    # hardcoded secret
     "S603",    # subprocess call
     "S607",    # partial executable path
 ]

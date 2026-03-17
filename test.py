@@ -6,13 +6,17 @@ import fcntl
 import importlib.machinery
 import io
 import os
+import re
 import select
 import struct
+import sys
 import tempfile
 import termios
 import tty
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from typing import Self
 from unittest.mock import patch
 
 # neorev is a script without .py extension; import it as a module.
@@ -25,6 +29,8 @@ TERM_PIXEL_SIZE = 0  # pixel dimensions unused by tests
 WINSIZE_FORMAT = "HHHH"
 READ_BUFFER_SIZE = 8192
 SELECT_TIMEOUT = 0.1
+READ_DRAIN_TIMEOUT = 0.01
+READ_DRAIN_EMPTY_POLLS = 3
 TINY_WIDTH = 5
 NARROW_FOOTER_WIDTH = 15
 WIDE_FOOTER_WIDTH = 120
@@ -41,6 +47,29 @@ MULTI_FILE_HUNK_COUNT = 6
 MULTI_FILE_COUNT = 3
 HUNKS_PER_FILE = 2
 LONG_COMMENT_LENGTH = 80
+TOP_BAR_INDEX_TOKEN = "Hunk 1/5"
+REVIEW_SCREEN_INDEX_TOKEN = "Hunk 1/1"
+REVIEW_SCREEN_LOCATION_TOKEN = "hello.py:1"
+REVIEW_SCREEN_FOOTER_TOKEN = "j/k"
+ROUND_TRIP_COMMENT_TEXT = "fix this"
+WORKFLOW_FLAG_COMMENT = "Please split this import change."
+WORKFLOW_GLOBAL_NOTE = "Can we add tests for this behavior?"
+WORKFLOW_RESUME_FLAG = "Carry this change request forward"
+WORKFLOW_RESUME_GLOBAL = "Overall: check module boundaries"
+WORKFLOW_PRECEDENCE_QUESTION = "Why is this import needed?"
+WORKFLOW_STALE_MESSAGE = "no longer match any hunk"
+WORKFLOW_OUTPUT_SUMMARY = "# 2 hunks: 1 approved, 0 questions, 1 changes requested"
+WORKFLOW_ALL_CLEAR_SUMMARY = "# 1/2 hunks approved."
+GLOBAL_NOTE_CREATED_TEXT = "needs follow-up"
+GLOBAL_NOTE_EDITED_TEXT = "edited follow-up"
+GLOBAL_NOTE_EDIT_KEY = "e"
+GLOBAL_NOTE_DELETE_KEY = "d"
+GLOBAL_NOTE_EXIT_KEY = "q"
+GLOBAL_NOTE_INDEX_KEY = "1"
+GLOBAL_NOTE_ADD_PREFIX = "g"
+GLOBAL_NOTE_ADD_QUESTION_KEY = "c"
+GLOBAL_NOTE_ADD_FLAG_KEY = "f"
+DISPATCH_REDRAW_FALSE = False
 SCROLL_HALF_PAGE = max(
     1,
     (TERM_HEIGHT - neorev.CHROME_ROWS - neorev.SCROLL_INDICATOR_ROWS) // 2,
@@ -190,6 +219,70 @@ def make_hunk(
     )
 
 
+def remove_ansi_escape_sequences(text: str) -> str:
+    """Return *text* with ANSI escape sequences removed."""
+    return neorev.ANSI_ESCAPE_TEXT_RE.sub("", text)
+
+
+def decode_visible_terminal_output(output: bytes) -> str:
+    """Decode terminal bytes and strip ANSI escape sequences."""
+    text = output.decode("utf-8", errors="replace")
+    return remove_ansi_escape_sequences(text)
+
+
+class MainWorkflowTerminal:
+    """Minimal Terminal stub for driving main() workflow tests."""
+
+    ALT_SCREEN_ON = ""
+    ALT_SCREEN_OFF = ""
+    CURSOR_HIDE = ""
+    CURSOR_SHOW = ""
+
+    def __init__(self, script: Callable[[neorev.ReviewState], None]) -> None:
+        """Store the script callback to mutate review state in run_review_loop."""
+        self.script = script
+
+    def __enter__(self) -> Self:
+        """Return self for context-managed use."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Exit context manager without extra cleanup."""
+
+    def write(self, _data: bytes | str) -> None:
+        """Accept writes performed by main() without rendering anything."""
+
+    def run_review_loop(
+        self,
+        state: neorev.ReviewState,
+        _delta_cache: dict[int, bytes],
+    ) -> None:
+        """Apply the scripted state mutations and return immediately."""
+        self.script(state)
+
+
+def run_main_with_scripted_terminal(
+    diff_text: str,
+    output_path: str,
+    script: Callable[[neorev.ReviewState], None],
+) -> str:
+    """Run neorev.main() with a fake terminal script and return captured stderr."""
+    stderr = io.StringIO()
+    argv = ["neorev", output_path]
+    with (
+        patch.object(
+            neorev,
+            "Terminal",
+            side_effect=lambda: MainWorkflowTerminal(script),
+        ),
+        patch.object(sys, "argv", argv),
+        patch.object(sys, "stdin", io.StringIO(diff_text)),
+        contextlib.redirect_stderr(stderr),
+    ):
+        neorev.main()
+    return stderr.getvalue()
+
+
 class FakeTTY:
     """A pseudo-terminal pair for testing Terminal at the fd level."""
 
@@ -213,11 +306,30 @@ class FakeTTY:
         os.write(self.master_fd, data)
 
     def read_output(self, size: int = READ_BUFFER_SIZE) -> bytes:
-        """Read what the slave side wrote (non-blocking, best-effort)."""
+        """Read and drain currently available output from the pseudo-terminal."""
         ready, _, _ = select.select([self.master_fd], [], [], SELECT_TIMEOUT)
-        if ready:
-            return os.read(self.master_fd, size)
-        return b""
+        if not ready:
+            return b""
+
+        chunks: list[bytes] = [os.read(self.master_fd, size)]
+        empty_polls = 0
+        while empty_polls < READ_DRAIN_EMPTY_POLLS:
+            ready, _, _ = select.select(
+                [self.master_fd],
+                [],
+                [],
+                READ_DRAIN_TIMEOUT,
+            )
+            if not ready:
+                empty_polls += 1
+                continue
+
+            chunk = os.read(self.master_fd, size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            empty_polls = 0
+        return b"".join(chunks)
 
     def make_terminal(self) -> neorev.Terminal:
         """Build a Terminal instance backed by this pty's slave fd."""
@@ -543,7 +655,7 @@ class TestLoadPreviousReview(unittest.TestCase):
     def test_round_trip_through_file(self) -> None:
         """format_output → load_previous_review recovers annotations."""
         hunks = [
-            make_hunk(file_path="a.py", status="flag", comment="fix this"),
+            make_hunk(file_path="a.py", status="flag", comment=ROUND_TRIP_COMMENT_TEXT),
             make_hunk(file_path="b.py", status="approved"),
         ]
         output = neorev.format_output(hunks, [])
@@ -555,7 +667,9 @@ class TestLoadPreviousReview(unittest.TestCase):
         try:
             annotations, _, _ = neorev.load_previous_review(path)
             self.assertIn(("a.py", hunks[0].range_line), annotations)
-            self.assertEqual(annotations[("a.py", hunks[0].range_line)][0], "flag")
+            status, comment = annotations[("a.py", hunks[0].range_line)]
+            self.assertEqual(status, "flag")
+            self.assertEqual(comment, ROUND_TRIP_COMMENT_TEXT)
         finally:
             os.unlink(path)
 
@@ -1006,7 +1120,8 @@ class TestViewport(unittest.TestCase):
             TERM_HEIGHT,
             OUT_OF_BOUNDS_OFFSET,
         )
-        self.assertLessEqual(vp.scroll_offset, len(line_rows))
+        self.assertGreaterEqual(vp.scroll_offset, 0)
+        self.assertLess(vp.scroll_offset, len(line_rows))
 
     def test_scrolled_to_middle(self) -> None:
         """Scrolling to the middle enables both scroll indicators."""
@@ -1055,8 +1170,8 @@ class TestChrome(unittest.TestCase):
         """Top bar shows 'Hunk N/total'."""
         hunk = make_hunk()
         bar = neorev.build_top_bar(hunk, 0, 5, 0)
-        self.assertIn("1", bar)
-        self.assertIn("5", bar)
+        visible_bar = remove_ansi_escape_sequences(bar)
+        self.assertIn(TOP_BAR_INDEX_TOKEN, visible_bar)
 
     def test_top_bar_status_labels(self) -> None:
         """Top bar renders status text for each status type."""
@@ -1324,8 +1439,13 @@ class TestTerminalRender(unittest.TestCase):
         delta_output = hunks[0].raw.encode()
         scroll = self.term.render_review_screen(hunks, 0, delta_output, [])
         output = self.fake.read_output()
+        visible_output = decode_visible_terminal_output(output)
         self.assertIsInstance(scroll, int)
         self.assertGreater(len(output), 0)
+        self.assertEqual(scroll, 0)
+        self.assertIn(REVIEW_SCREEN_INDEX_TOKEN, visible_output)
+        self.assertIn(REVIEW_SCREEN_LOCATION_TOKEN, visible_output)
+        self.assertIn(REVIEW_SCREEN_FOOTER_TOKEN, visible_output)
 
     def test_render_help_screen(self) -> None:
         """render_help_screen writes the help box."""
@@ -1457,6 +1577,222 @@ class TestArgParser(unittest.TestCase):
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             parser.parse_args([])
+
+
+class TestMainWorkflow(unittest.TestCase):
+    """High-level tests for new review and resume workflows through main()."""
+
+    def test_new_review_flow_writes_expected_output(self) -> None:
+        """A scripted review session writes hunk/global annotations and bitmap."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Apply one flag, one approval, and one global note."""
+            state.hunks[0].status = neorev.STATUS_FLAG
+            state.hunks[0].comment = WORKFLOW_FLAG_COMMENT
+            state.hunks[1].status = neorev.STATUS_APPROVED
+            state.global_notes.append(
+                neorev.GlobalNote(
+                    kind=neorev.STATUS_QUESTION,
+                    text=WORKFLOW_GLOBAL_NOTE,
+                )
+            )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        try:
+            run_main_with_scripted_terminal(TWO_HUNK_DIFF, output_path, script)
+            output = Path(output_path).read_text()
+            self.assertIn("[CHANGE REQUESTED] hello.py", output)
+            self.assertIn(WORKFLOW_FLAG_COMMENT, output)
+            self.assertIn("[QUESTION] (global)", output)
+            self.assertIn(WORKFLOW_GLOBAL_NOTE, output)
+            self.assertIn(WORKFLOW_OUTPUT_SUMMARY, output)
+            self.assertIn("# neorev:", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_resume_workflow_applies_annotations_bitmap_and_global_notes(self) -> None:
+        """Resuming from an existing output restores notes and bitmap approvals."""
+        previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        previous_hunks[0].status = neorev.STATUS_FLAG
+        previous_hunks[0].comment = WORKFLOW_RESUME_FLAG
+        previous_hunks[1].status = neorev.STATUS_APPROVED
+        previous_notes = [
+            neorev.GlobalNote(kind=neorev.STATUS_QUESTION, text=WORKFLOW_RESUME_GLOBAL)
+        ]
+        previous_output = neorev.format_output(previous_hunks, previous_notes)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(previous_output)
+            output_path = f.name
+
+        try:
+            stderr = run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                lambda _state: None,
+            )
+            output = Path(output_path).read_text()
+            self.assertIn("Loaded 1 hunk annotation(s), 1 approved hunk(s)", stderr)
+            self.assertIn(WORKFLOW_RESUME_FLAG, output)
+            self.assertIn(WORKFLOW_RESUME_GLOBAL, output)
+            self.assertIn(WORKFLOW_OUTPUT_SUMMARY, output)
+        finally:
+            os.unlink(output_path)
+
+    def test_resume_annotation_precedence_over_bitmap(self) -> None:
+        """Explicit annotation status wins when bitmap marks the same hunk approved."""
+        previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        previous_hunks[0].status = neorev.STATUS_QUESTION
+        previous_hunks[0].comment = WORKFLOW_PRECEDENCE_QUESTION
+        previous_hunks[1].status = None
+        previous_output = neorev.format_output(previous_hunks, [])
+
+        bitmap_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        bitmap_hunks[0].status = neorev.STATUS_APPROVED
+        bitmap_hunks[1].status = None
+        conflicting_bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
+        previous_output = re.sub(
+            r"# neorev:\S+",
+            f"# neorev:{conflicting_bitmap}",
+            previous_output,
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(previous_output)
+            output_path = f.name
+
+        try:
+            run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                lambda _state: None,
+            )
+            output = Path(output_path).read_text()
+            self.assertIn("[QUESTION] hello.py", output)
+            self.assertIn(WORKFLOW_PRECEDENCE_QUESTION, output)
+            self.assertIn("0 approved, 1 questions", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_resume_with_stale_annotation_reports_and_keeps_bitmap(self) -> None:
+        """Stale annotations are reported while bitmap approvals still resume."""
+        bitmap_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        bitmap_hunks[0].status = None
+        bitmap_hunks[1].status = neorev.STATUS_APPROVED
+        bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
+        stale_output = (
+            "## [CHANGE REQUESTED] stale.py\n"
+            "```diff\n"
+            "@@ -99,1 +99,1 @@\n"
+            "+stale\n"
+            "```\n"
+            "> stale note\n\n"
+            f"# neorev:{bitmap}\n"
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(stale_output)
+            output_path = f.name
+
+        try:
+            stderr = run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                lambda _state: None,
+            )
+            output = Path(output_path).read_text()
+            self.assertIn(WORKFLOW_STALE_MESSAGE, stderr)
+            self.assertIn(WORKFLOW_ALL_CLEAR_SUMMARY, output)
+            self.assertNotIn("CHANGE REQUESTED", output)
+        finally:
+            os.unlink(output_path)
+
+
+class TestGlobalNoteLifecycle(unittest.TestCase):
+    """Tests global note creation and management through key-dispatch paths."""
+
+    def setUp(self) -> None:
+        """Create a fake TTY, terminal, and baseline review state."""
+        self.fake = FakeTTY()
+        self.term = self.fake.make_terminal()
+        self.state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
+
+    def tearDown(self) -> None:
+        """Close the terminal and pseudo-terminal fds."""
+        with contextlib.suppress(OSError):
+            self.term.close()
+        self.fake.close()
+
+    def test_dispatch_gc_adds_global_question(self) -> None:
+        """Pressing g then c appends a global question note."""
+        with (
+            patch.object(
+                self.term,
+                "read_key",
+                return_value=GLOBAL_NOTE_ADD_QUESTION_KEY,
+            ),
+            patch.object(
+                self.term,
+                "edit_text_outside_tui",
+                return_value=GLOBAL_NOTE_CREATED_TEXT,
+            ),
+        ):
+            handled = self.term.dispatch_key(
+                GLOBAL_NOTE_ADD_PREFIX,
+                self.state,
+                lambda: DISPATCH_REDRAW_FALSE,
+            )
+        self.assertTrue(handled)
+        self.assertEqual(len(self.state.global_notes), 1)
+        self.assertEqual(self.state.global_notes[0].kind, neorev.STATUS_QUESTION)
+        self.assertEqual(self.state.global_notes[0].text, GLOBAL_NOTE_CREATED_TEXT)
+
+    def test_dispatch_gf_adds_global_flag(self) -> None:
+        """Pressing g then f appends a global change-request note."""
+        with (
+            patch.object(self.term, "read_key", return_value=GLOBAL_NOTE_ADD_FLAG_KEY),
+            patch.object(
+                self.term,
+                "edit_text_outside_tui",
+                return_value=GLOBAL_NOTE_CREATED_TEXT,
+            ),
+        ):
+            handled = self.term.dispatch_key(
+                GLOBAL_NOTE_ADD_PREFIX,
+                self.state,
+                lambda: DISPATCH_REDRAW_FALSE,
+            )
+        self.assertTrue(handled)
+        self.assertEqual(len(self.state.global_notes), 1)
+        self.assertEqual(self.state.global_notes[0].kind, neorev.STATUS_FLAG)
+        self.assertEqual(self.state.global_notes[0].text, GLOBAL_NOTE_CREATED_TEXT)
+
+    def test_manage_global_notes_edit_then_delete(self) -> None:
+        """Global notes manager supports edit and delete in one session."""
+        self.state.global_notes.append(
+            neorev.GlobalNote(kind=neorev.STATUS_FLAG, text=GLOBAL_NOTE_CREATED_TEXT)
+        )
+        key_sequence = [
+            GLOBAL_NOTE_EDIT_KEY,
+            GLOBAL_NOTE_INDEX_KEY,
+            GLOBAL_NOTE_DELETE_KEY,
+            GLOBAL_NOTE_INDEX_KEY,
+            GLOBAL_NOTE_EXIT_KEY,
+        ]
+        with (
+            patch.object(self.term, "read_key", side_effect=key_sequence),
+            patch.object(self.term, "render_global_notes_screen"),
+            patch.object(
+                self.term,
+                "edit_text_outside_tui",
+                return_value=GLOBAL_NOTE_EDITED_TEXT,
+            ),
+            patch("tty.setraw"),
+        ):
+            self.term.handle_manage_global_notes(self.state)
+        self.assertEqual(self.state.global_notes, [])
 
 
 class TestTruncateAnsiText(unittest.TestCase):
