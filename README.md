@@ -14,11 +14,13 @@ claude -p "@review.txt"
 ## Features
 
 - Simple terminal UI optimized for efficiency
+  - compact view to comfortably read diffs
+  - keyboard navigation & control
 - Review annotations can be:
-  - scoped/global
+  - tied to a line, a hunk, or global
   - request for change or question
 - Minimal solution:
-  - single file, no Python dependencies
+  - single file, no external Python dependencies
   - rely on [`delta`](https://github.com/dandavison/delta) for diff formatting and coloring
   - rely on your editor to write annotations
 - Quit and resume review without losing state
@@ -68,11 +70,12 @@ Ctrl-D        Scroll diff down (half page)
 Ctrl-U        Scroll diff up (half page)
 a             Approve hunk (no comment needed)
 A             Approve all hunks in current file
-c             Question about this hunk (opens $EDITOR)
-f             Flag hunk: request a change (opens $EDITOR)
-gc            Global question, not tied to a specific hunk
-gf            Global flag (request a change), not tied to a specific hunk
-G             Manage global notes (edit / delete)
+c             Add question (hunk or line target, opens $EDITOR)
+f             Add flag / request change (hunk or line target, opens $EDITOR)
+gc            Add global question (not tied to a specific hunk, opens $EDITOR)
+gf            Add global flag / request change (not tied to a specific hunk, opens
+              $EDITOR)
+m             Manage notes (edit / delete)
 q / Ctrl-C    Quit and write output to file
 ?             Show help
 ```

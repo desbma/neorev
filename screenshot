@@ -46,7 +46,7 @@ ${TERMCMD} --working-directory "${PWD}" --class "${WINDOW_CLASS}" -e tmux new-se
 sleep 0.5s
 wid="$(xdotool search --class "${WINDOW_CLASS}")"
 
-send_keys g c a a a a a a a a a a f a a a a a f a a a a a a a a a a a f f a a a a f k
+send_keys g c a a a a a a a a a a f Enter j a a a a a f h a a a a a a a a a a a f h f Enter j a a a a C-d f j j j j j j j j j j j j j j j Enter
 
 maim -u -i "${wid}" "${OUTPUT}"
 

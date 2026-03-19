@@ -18,11 +18,21 @@ git diff HEAD~1 | ./neorev --clip review.txt
 - Dataclasses for all structured data.
 - No `_` prefix on methods or functions. All names are plain, even internal helpers.
 - Docstrings mandatory on all functions (imperative mood).
-- Typing annotations mandatory on all function signatures.
+- Typing annotations mandatory on all function signatures. Use `from __future__ import annotations` to avoid string-quoted forward references; always write the real type, never a string.
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
 - **IMPORTANT: Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.**
+- Group all module-level constants together at the top of the file, before class and function definitions.
 - Do not add large section-separator comment blocks (e.g. `# ===...` banners). Use class docstrings and natural whitespace to organize code.
+- At the end of any refactor, remove dead code (unused constants, types, helpers, and imports) before finishing.
+
+## Bug Fixes
+
+Unless stated otherwise, always use a red-green testing approach:
+
+1. Investigate the bug and write a failing test that exercises the code path.
+2. Implement the proper fix.
+3. Check the added tests now pass successfully.
 
 ## Testing
 
