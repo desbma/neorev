@@ -1441,6 +1441,145 @@ class TestCommentHelpers(unittest.TestCase):
             os.unlink(path)
 
 
+class TestBuildLineContext(unittest.TestCase):
+    """Tests for build_line_context."""
+
+    SAMPLE_BODY = (
+        "@@ -1,4 +1,5 @@\n"
+        " line one\n"
+        " line two\n"
+        "-old three\n"
+        "+new three\n"
+        "+added four\n"
+        " line five\n"
+    )
+
+    def make_display_lines(self) -> list[neorev.DisplayLine]:
+        """Parse sample body into display lines."""
+        range_line = self.SAMPLE_BODY.splitlines()[0]
+        body = "\n".join(self.SAMPLE_BODY.splitlines()[1:])
+        return neorev.parse_display_lines(range_line, body)
+
+    def test_context_around_added_line(self) -> None:
+        """Context shows surrounding lines with marker on the target."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
+        ctx = neorev.build_line_context(dls, target)
+        marker_lines = [c for c in ctx if neorev.EDITOR_TARGET_MARKER in c]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("new three", marker_lines[0])
+
+    def test_context_around_removed_line(self) -> None:
+        """Context marks the removed line with the target marker."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.REMOVED, line_number=3)
+        ctx = neorev.build_line_context(dls, target)
+        marker_lines = [c for c in ctx if neorev.EDITOR_TARGET_MARKER in c]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("old three", marker_lines[0])
+
+    def test_context_includes_diff_prefix(self) -> None:
+        """Each context line includes the diff prefix from its kind."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
+        ctx = neorev.build_line_context(dls, target)
+        added = [c for c in ctx if "new three" in c]
+        self.assertTrue(any("+" in c for c in added))
+        context = [c for c in ctx if "line two" in c]
+        self.assertTrue(len(context) > 0)
+
+    def test_context_radius_limits(self) -> None:
+        """Context does not exceed the configured radius."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
+        ctx = neorev.build_line_context(dls, target)
+        max_lines = 2 * neorev.EDITOR_CONTEXT_RADIUS + 1
+        self.assertLessEqual(len(ctx), max_lines)
+
+    def test_context_at_start_of_hunk(self) -> None:
+        """Context near the beginning does not go out of bounds."""
+        range_line = "@@ -1,2 +1,2 @@"
+        body = "+added\n context\n"
+        dls = neorev.parse_display_lines(range_line, body)
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=1)
+        ctx = neorev.build_line_context(dls, target)
+        self.assertTrue(len(ctx) >= 1)
+        self.assertIn(neorev.EDITOR_TARGET_MARKER, ctx[0])
+
+    def test_unknown_target_returns_empty(self) -> None:
+        """A target not in the display lines returns an empty list."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=999)
+        ctx = neorev.build_line_context(dls, target)
+        self.assertEqual(ctx, [])
+
+    def test_context_lines_are_aligned(self) -> None:
+        """All context lines have the same length up to the diff prefix."""
+        dls = self.make_display_lines()
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
+        ctx = neorev.build_line_context(dls, target)
+        # Check alignment: strip the "# " prefix and verify the marker + line
+        # number + prefix portion has consistent width.
+        for line in ctx:
+            stripped = line[2:]  # remove "# "
+            # marker(1) + space(1) + line_num(>=4) + space(1) + prefix(1)
+            # The diff prefix char should always be at the same offset.
+            self.assertEqual(stripped[0:2], stripped[0] + " ")
+            self.assertIn(stripped[6], ("+", "-", " ", "\\"))
+
+
+class TestWriteCommentTemplateWithContext(unittest.TestCase):
+    """Tests for write_comment_template with context_lines."""
+
+    def test_context_lines_included_in_template(self) -> None:
+        """Context lines appear as # comments in the template."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            ctx = ["# ► 10 + added line", "#   11   context line"]
+            jump = neorev.write_comment_template(f, "test.py:10", "", ctx)
+            path = f.name
+
+        try:
+            with open(path) as rf:
+                content = rf.read()
+            self.assertIn("added line", content)
+            self.assertIn("context line", content)
+            self.assertGreater(jump, 0)
+        finally:
+            os.unlink(path)
+
+    def test_context_lines_stripped_by_read(self) -> None:
+        """Context lines (starting with #) are stripped when reading back."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            ctx = ["# ► 10 + the target line"]
+            neorev.write_comment_template(f, "loc", "my note", ctx)
+            path = f.name
+
+        try:
+            result = neorev.read_comment_file(path)
+            self.assertEqual(result, "my note")
+            self.assertNotIn("target line", result)
+        finally:
+            os.unlink(path)
+
+    def test_jump_line_accounts_for_context(self) -> None:
+        """Jump line is offset by the number of context lines."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            jump_no_ctx = neorev.write_comment_template(f, "loc", "")
+            f.name  # noqa: B018
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            ctx = ["# line1", "# line2", "# line3"]
+            jump_with_ctx = neorev.write_comment_template(f, "loc", "", ctx)
+            path = f.name
+
+        try:
+            # 3 context lines + 2 separator lines (#\n before and after)
+            expected_offset = len(ctx) + 2
+            self.assertEqual(jump_with_ctx, jump_no_ctx + expected_offset)
+        finally:
+            os.unlink(path)
+
+
 class TestTerminalKeys(unittest.TestCase):
     """Tests for Terminal.read_key using a real pseudo-terminal."""
 

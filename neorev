@@ -90,6 +90,9 @@ RESIZE_DEBOUNCE_TIMEOUT = 0.05
 SELECT_IMMEDIATE = 0
 GLOBAL_TARGET = "(global)"
 LINE_PICKER_SELECT_KEY = "\r"
+EDITOR_CONTEXT_RADIUS = 3
+EDITOR_TARGET_MARKER = "►"
+EDITOR_CONTEXT_PAD = " "
 
 NOTE_TARGET_HUNK = "hunk"
 MARGIN_NOTE_MARKER = "✎"
@@ -156,23 +159,12 @@ class LineSide(enum.Enum):
 
 
 class DisplayLineKind(enum.Enum):
-    """Enumerate logical diff row types displayed in a hunk."""
+    """Enumerate logical diff row types — each value is the unified-diff prefix."""
 
-    ADDED = enum.auto()
-    REMOVED = enum.auto()
-    CONTEXT = enum.auto()
-    META = enum.auto()
-
-    @classmethod
-    def from_prefix(cls, prefix: str) -> DisplayLineKind:
-        """Map a unified-diff line prefix to a display line kind."""
-        if prefix == "+":
-            return cls.ADDED
-        if prefix == "-":
-            return cls.REMOVED
-        if prefix == "\\":
-            return cls.META
-        return cls.CONTEXT
+    ADDED = "+"
+    REMOVED = "-"
+    CONTEXT = " "
+    META = "\\"
 
 
 class NoteScope(enum.Enum):
@@ -389,7 +381,10 @@ def parse_display_lines(range_line: str, body: str) -> list[DisplayLine]:
             continue
         first_char = line[0] if line else " "
         text = line[1:] if len(line) > 1 else ""
-        line_kind = DisplayLineKind.from_prefix(first_char)
+        try:
+            line_kind = DisplayLineKind(first_char)
+        except ValueError:
+            line_kind = DisplayLineKind.CONTEXT
 
         if line_kind is DisplayLineKind.ADDED:
             target = LineTarget(side=LineSide.ADDED, line_number=new_num)
@@ -806,10 +801,36 @@ def apply_previous_review(
     return matched
 
 
+def build_line_context(
+    display_lines: list[DisplayLine],
+    target: LineTarget,
+) -> list[str]:
+    """Build context lines around *target* for the editor comment template."""
+    target_idx: int | None = None
+    for i, dl in enumerate(display_lines):
+        if dl.target == target:
+            target_idx = i
+            break
+    if target_idx is None:
+        return []
+
+    start = max(0, target_idx - EDITOR_CONTEXT_RADIUS)
+    end = min(len(display_lines), target_idx + EDITOR_CONTEXT_RADIUS + 1)
+    window = display_lines[start:end]
+
+    lines: list[str] = []
+    for dl in window:
+        line_num = dl.new_line_number or dl.old_line_number or 0
+        marker = EDITOR_TARGET_MARKER if dl.target == target else EDITOR_CONTEXT_PAD
+        lines.append(f"# {marker} {line_num:>4} {dl.kind.value} {dl.text}")
+    return lines
+
+
 def write_comment_template(
     file_obj: TextIO,
     location: str,
     existing: str,
+    context_lines: list[str] | None = None,
 ) -> int:
     """
     Write the comment template into *file_obj*.
@@ -817,12 +838,19 @@ def write_comment_template(
     Returns the editor jump-line number (1-indexed).
     """
     file_obj.write(f"# Comment for {location}\n")
-    file_obj.write("# Lines starting with # are stripped.\n\n")
+    file_obj.write("# Lines starting with # are stripped.\n")
+    header_count = 2
+    if context_lines:
+        file_obj.write("#\n")
+        file_obj.writelines(f"{ctx}\n" for ctx in context_lines)
+        file_obj.write("#\n")
+        header_count += len(context_lines) + 2
+    file_obj.write("\n")
     if existing:
         file_obj.write(existing)
     file_obj.write("\n")
     content_lines = existing.count("\n") + 1 if existing else 1
-    return 3 + content_lines  # 2 comment lines + 1 blank + content
+    return header_count + 1 + content_lines  # header + blank + content
 
 
 def read_comment_file(path: str) -> str:
@@ -1464,14 +1492,27 @@ class Terminal:
             return "esc"
         return ch.decode("utf-8", errors="replace")
 
-    def edit_comment(self, existing: str, location: str) -> str:
+    def edit_comment(
+        self,
+        existing: str,
+        location: str,
+        context_lines: list[str] | None = None,
+    ) -> str:
         """Edit a review comment using ``$EDITOR`` or an inline TTY prompt."""
         editor = os.environ.get("EDITOR", "")
         if editor:
-            return self.edit_comment_in_editor(existing, location, editor)
+            return self.edit_comment_in_editor(
+                existing, location, editor, context_lines
+            )
         return self.prompt_inline_comment(existing, location)
 
-    def edit_comment_in_editor(self, existing: str, location: str, editor: str) -> str:
+    def edit_comment_in_editor(
+        self,
+        existing: str,
+        location: str,
+        editor: str,
+        context_lines: list[str] | None = None,
+    ) -> str:
         """Open *editor* with a temporary file pre-filled with *existing*."""
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -1479,7 +1520,9 @@ class Terminal:
             prefix="review-",
             delete=False,
         ) as tmp:
-            jump_line = write_comment_template(cast("TextIO", tmp), location, existing)
+            jump_line = write_comment_template(
+                cast("TextIO", tmp), location, existing, context_lines
+            )
             tmppath = tmp.name
 
         try:
@@ -1516,11 +1559,16 @@ class Terminal:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
         return line or existing
 
-    def edit_text_outside_tui(self, existing_text: str, prompt_label: str) -> str:
+    def edit_text_outside_tui(
+        self,
+        existing_text: str,
+        prompt_label: str,
+        context_lines: list[str] | None = None,
+    ) -> str:
         """Temporarily suspend the TUI, edit text, and restore raw mode."""
         self.write(f"{self.CURSOR_SHOW}{self.ALT_SCREEN_OFF}")
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
-        comment = self.edit_comment(existing_text, prompt_label)
+        comment = self.edit_comment(existing_text, prompt_label, context_lines)
         self.refresh_geometry()
         self.write(f"{self.ALT_SCREEN_ON}{self.CURSOR_HIDE}")
         tty.setraw(self.fd)
@@ -1774,7 +1822,12 @@ class Terminal:
                         if kind is NoteKind.FLAG
                         else "question (agent will answer, not change code)"
                     )
-                    new_text = self.edit_text_outside_tui(note.text, kind_label)
+                    ctx = (
+                        build_line_context(hunk.display_lines, note.target)
+                        if isinstance(note.target, LineTarget)
+                        else None
+                    )
+                    new_text = self.edit_text_outside_tui(note.text, kind_label, ctx)
                     if new_text:
                         note.text = new_text
                     else:
@@ -1846,9 +1899,15 @@ class Terminal:
             else "question (agent will answer, not change code)"
         )
         target_label = format_note_target(target)
+        ctx = (
+            build_line_context(hunk.display_lines, target)
+            if isinstance(target, LineTarget)
+            else None
+        )
         comment = self.edit_text_outside_tui(
             existing_text,
             f"{hunk.short_location} @ {target_label} [{label}]",
+            ctx,
         )
 
         if comment:
