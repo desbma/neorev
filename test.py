@@ -297,10 +297,11 @@ def run_main_with_scripted_terminal(
     diff_text: str,
     output_path: str,
     script: Callable[[neorev.ReviewState], None],
+    extra_args: list[str] | None = None,
 ) -> str:
     """Run neorev.main() with a fake terminal script and return captured stderr."""
     stderr = io.StringIO()
-    argv = ["neorev", output_path]
+    argv = ["neorev", *(extra_args or []), output_path]
     with (
         patch.object(
             neorev,
@@ -1770,12 +1771,23 @@ class TestArgParser(unittest.TestCase):
         args = parser.parse_args(["out.txt"])
         self.assertEqual(args.output, "out.txt")
         self.assertFalse(args.clip)
+        self.assertFalse(args.clear)
 
     def test_clip_flag(self) -> None:
-        """The --clip flag is recognised."""
+        """The -x/--clip flag is recognised."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--clip", "out.txt"])
         self.assertTrue(args.clip)
+        args_short = parser.parse_args(["-x", "out.txt"])
+        self.assertTrue(args_short.clip)
+
+    def test_clear_flag(self) -> None:
+        """The -c/--clear flag is recognised."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["--clear", "out.txt"])
+        self.assertTrue(args.clear)
+        args_short = parser.parse_args(["-c", "out.txt"])
+        self.assertTrue(args_short.clear)
 
     def test_missing_output_fails(self) -> None:
         """Omitting the output file raises SystemExit."""
@@ -1922,6 +1934,42 @@ class TestMainWorkflow(unittest.TestCase):
             self.assertIn(WORKFLOW_STALE_MESSAGE, stderr)
             self.assertIn(WORKFLOW_ALL_CLEAR_SUMMARY, output)
             self.assertNotIn("CHANGE REQUESTED", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_clear_flag_discards_previous_review(self) -> None:
+        """The --clear flag discards a previous review and starts fresh."""
+        previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        previous_hunks[0].notes = [
+            neorev.HunkNote(
+                kind=neorev.NoteKind.FLAG,
+                target=neorev.HunkTarget(),
+                text=WORKFLOW_RESUME_FLAG,
+            )
+        ]
+        previous_hunks[1].approved = True
+        previous_notes = [
+            neorev.GlobalNote(
+                kind=neorev.NoteKind.QUESTION, text=WORKFLOW_RESUME_GLOBAL
+            )
+        ]
+        previous_output = neorev.format_output(previous_hunks, previous_notes)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(previous_output)
+            output_path = f.name
+
+        try:
+            stderr = run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                lambda _state: None,
+                extra_args=["--clear"],
+            )
+            output = Path(output_path).read_text()
+            self.assertNotIn(WORKFLOW_RESUME_FLAG, output)
+            self.assertNotIn(WORKFLOW_RESUME_GLOBAL, output)
+            self.assertNotIn("Loaded", stderr)
         finally:
             os.unlink(output_path)
 

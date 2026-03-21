@@ -84,7 +84,9 @@ q / Ctrl-C    Quit and write output to file
 
 Pasting `@review.txt` in the agent window is all that is required. Since the output is unambiguous any additional message like "please process the attached review" is a pure waste of tokens and your time typing it.
 
-Pass `-c`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to clipboard (requires `xclip`).
+Pass `-x`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to clipboard (requires `xclip`).
+
+Pass `-c`/`--clear` to discard a previous review and start fresh.
 
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 
@@ -92,7 +94,7 @@ Pass `-c`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to 
 2. Create another empty commit on top of it, this will be the code **under review**: `jj new`
 3. Prompt the agent to start work
 4. When the agent is done:
-   - `jj show | neorev -c /tmp/review.txt`
+   - `jj show | neorev -x /tmp/review.txt`
    - if code fully meets expectations: `jj squash`, the end
    - if code partially meets expectations: `jj squash -i` to squash the good parts into the vetted commit
 5. Send `@/tmp/review.txt` to the agent, go to 4

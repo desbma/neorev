@@ -5,6 +5,7 @@ neorev — human review for agent diffs.
 Usage:
     jj show XXX | neorev for_agent.txt
     jj show XXX | neorev --clip for_agent.txt
+    jj show XXX | neorev --clear for_agent.txt
     git diff HEAD~1 | neorev review.txt
 
 Reads a unified diff from stdin, renders each hunk through `delta` for
@@ -13,6 +14,7 @@ writes a compact annotated review to the given output file.
 
 If the output file already exists, previous annotations are loaded and
 applied to matching hunks, so you can resume or refine a review.
+Pass --clear / -c to discard a previous review and start fresh.
 
 Keys:
     j / ↓         Next hunk
@@ -2094,10 +2096,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="output file for the review (created or updated)",
     )
     parser.add_argument(
-        "-c",
+        "-x",
         "--clip",
         action="store_true",
         help="copy @output_file to clipboard (via xclip) on exit",
+    )
+    parser.add_argument(
+        "-c",
+        "--clear",
+        action="store_true",
+        help="discard previous review and start fresh",
     )
     return parser
 
@@ -2199,6 +2207,10 @@ def main() -> None:
 
     diff_text = read_diff_from_stdin_or_exit(parser)
     hunks = parse_diff_or_exit(diff_text)
+
+    if args.clear:
+        Path(args.output).unlink(missing_ok=True)
+
     global_notes = load_or_resume_review(hunks, args.output)
 
     delta_cache: dict[int, bytes] = {}
