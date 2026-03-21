@@ -62,7 +62,6 @@ GLOBAL_NOTE_EDITED_TEXT = "edited follow-up"
 GLOBAL_NOTE_EDIT_KEY = "e"
 GLOBAL_NOTE_DELETE_KEY = "d"
 GLOBAL_NOTE_EXIT_KEY = "q"
-GLOBAL_NOTE_INDEX_KEY = "1"
 GLOBAL_NOTE_ADD_PREFIX = "g"
 GLOBAL_NOTE_ADD_QUESTION_KEY = "c"
 GLOBAL_NOTE_ADD_FLAG_KEY = "f"
@@ -1679,34 +1678,55 @@ class TestTerminalRender(unittest.TestCase):
             if stripped:
                 self.assertLessEqual(len(stripped), TERM_WIDTH, repr(stripped))
 
-    def test_render_manage_notes_screen_empty(self) -> None:
-        """Notes screen with no notes shows 'No notes yet'."""
-        self.term.render_manage_notes_screen([])
+    def test_render_note_panel_empty(self) -> None:
+        """Note panel with no notes shows 'No notes yet'."""
+        state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
+        panel = neorev.NotePanelState()
+        self.term.render_note_panel(state, [], panel, b"")
         output = self.fake.read_output()
         self.assertIn(b"No notes", output)
 
-    def test_render_manage_notes_screen_with_notes(self) -> None:
-        """Notes screen lists existing notes."""
-        refs: list[tuple[str, str, neorev.NoteKind]] = [
-            ("(global)", "fix this", neorev.NoteKind.FLAG),
+    def test_render_note_panel_with_notes(self) -> None:
+        """Note panel lists existing notes."""
+        refs = [
+            neorev.ManagedNoteRef(
+                scope_label="(global)",
+                text="fix this",
+                kind=neorev.NoteKind.FLAG,
+            ),
         ]
-        self.term.render_manage_notes_screen(refs)
+        state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
+        panel = neorev.NotePanelState()
+        self.term.render_note_panel(state, refs, panel, b"")
         output = self.fake.read_output()
         self.assertIn(b"fix this", output)
 
+    def test_note_panel_diff_uses_full_available_height(self) -> None:
+        """Note panel diff fills all rows above the panel without blank gaps."""
+        diff_lines = b"\n".join(b"line%d" % i for i in range(TERM_HEIGHT))
+        refs = [
+            neorev.ManagedNoteRef(
+                scope_label="(global)",
+                text="note",
+                kind=neorev.NoteKind.FLAG,
+            ),
+        ]
+        state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
+        panel = neorev.NotePanelState()
+        self.term.render_note_panel(state, refs, panel, diff_lines)
+        output = self.fake.read_output()
+        lines = output.split(b"\r\n")
+        non_empty = [ln for ln in lines if ln.strip()]
+        panel_height = neorev.compute_note_panel_height(len(refs), TERM_HEIGHT)
+        diff_height = TERM_HEIGHT - panel_height
+        diff_chrome = neorev.NOTE_PANEL_DIFF_CHROME_ROWS
+        expected_diff_content = diff_height - diff_chrome
+        diff_content_lines = [ln for ln in non_empty if ln.startswith(b"line")]
+        self.assertEqual(len(diff_content_lines), expected_diff_content)
+
 
 class TestBuildManagedNoteRefs(unittest.TestCase):
-    """Tests for Terminal.build_managed_note_refs."""
-
-    def setUp(self) -> None:
-        """Create a fake TTY and Terminal."""
-        self.fake = FakeTTY()
-        self.term = self.fake.make_terminal()
-
-    def tearDown(self) -> None:
-        """Restore terminal state and close the pty."""
-        with contextlib.suppress(OSError):
-            self.term.close()
+    """Tests for build_managed_note_refs."""
 
     def test_line_notes_appear_in_refs(self) -> None:
         """Line notes on the current hunk appear in managed note refs."""
@@ -1718,12 +1738,11 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
         )
         hunk = make_hunk(notes=[line_note])
         state = neorev.ReviewState(hunks=[hunk], global_notes=[])
-        refs = self.term.build_managed_note_refs(state)
+        refs = neorev.build_managed_note_refs(state)
         self.assertEqual(len(refs), 1)
-        scope_label, text, kind = refs[0]
-        self.assertEqual(text, "fix this line")
-        self.assertEqual(kind, neorev.NoteKind.FLAG)
-        self.assertIn("+42", scope_label)
+        self.assertEqual(refs[0].text, "fix this line")
+        self.assertEqual(refs[0].kind, neorev.NoteKind.FLAG)
+        self.assertIn("+42", refs[0].scope_label)
 
     def test_line_notes_from_all_hunks_appear(self) -> None:
         """Line notes from non-current hunks also appear in managed note refs."""
@@ -1736,8 +1755,8 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
         hunk_current = make_hunk(file_path="a.py")
         hunk_other = make_hunk(file_path="b.py", notes=[note_other])
         state = neorev.ReviewState(hunks=[hunk_current, hunk_other], global_notes=[])
-        refs = self.term.build_managed_note_refs(state)
-        texts = [text for _, text, _ in refs]
+        refs = neorev.build_managed_note_refs(state)
+        texts = [ref.text for ref in refs]
         self.assertIn("why this?", texts)
 
 
@@ -2179,20 +2198,19 @@ class TestGlobalNoteLifecycle(unittest.TestCase):
         )
         key_sequence = [
             GLOBAL_NOTE_EDIT_KEY,
-            GLOBAL_NOTE_INDEX_KEY,
             GLOBAL_NOTE_DELETE_KEY,
-            GLOBAL_NOTE_INDEX_KEY,
             GLOBAL_NOTE_EXIT_KEY,
         ]
         with (
             patch.object(self.term, "read_key", side_effect=key_sequence),
-            patch.object(self.term, "render_manage_notes_screen"),
+            patch.object(self.term, "render_note_panel"),
             patch.object(
                 self.term,
                 "edit_text_outside_tui",
                 return_value=GLOBAL_NOTE_EDITED_TEXT,
             ),
             patch("tty.setraw"),
+            patch("neorev.render_through_delta", return_value=b""),
         ):
             self.term.handle_manage_notes(self.state)
         self.assertEqual(self.state.global_notes, [])

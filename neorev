@@ -95,6 +95,11 @@ EDITOR_TARGET_MARKER = "►"
 EDITOR_CONTEXT_PAD = " "
 
 NOTE_TARGET_HUNK = "hunk"
+NOTE_PANEL_CURSOR = "▶"
+NOTE_PANEL_CHROME_ROWS = 2  # header + footer
+NOTE_PANEL_MIN_HEIGHT = 3  # chrome + at least 1 note row
+NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
+NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
 MARGIN_NOTE_MARKER = "✎"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = b"  "
@@ -264,6 +269,23 @@ class DiffViewport:
     can_scroll_down: bool
     lines_above: int
     lines_below: int
+
+
+@dataclass(frozen=True)
+class ManagedNoteRef:
+    """A reference to one note for the manage-notes panel."""
+
+    scope_label: str
+    text: str
+    kind: NoteKind
+
+
+@dataclass
+class NotePanelState:
+    """Cursor and scroll state for the manage-notes panel."""
+
+    cursor: int = 0
+    scroll_offset: int = 0
 
 
 def parse_diff(diff_text: str) -> list[Hunk]:
@@ -1351,6 +1373,78 @@ def build_line_picker_footer(term_width: int) -> str:
     return "".join(parts)
 
 
+NOTE_PANEL_FOOTER_SEGMENTS = [
+    ("j/k", "navigate"),
+    ("e/Enter", "edit"),
+    ("d", "delete"),
+    ("Esc", "back"),
+]
+
+
+def build_note_panel_footer(term_width: int) -> str:
+    """Build the key-hints footer for the note management panel."""
+    parts: list[str] = []
+    used = 0
+    for i, (key, label) in enumerate(NOTE_PANEL_FOOTER_SEGMENTS):
+        sep = "  " if i > 0 else ""
+        segment = f"{sep}{DIM}{key}{RESET} {label}"
+        segment_width = visible_len(segment)
+        if used + segment_width > term_width:
+            break
+        parts.append(segment)
+        used += segment_width
+    return "".join(parts)
+
+
+def build_note_panel_header(note_count: int, term_width: int) -> str:
+    """Build the separator header line for the note panel."""
+    label = f" Notes ({note_count}) " if note_count else " Notes "
+    fill_width = max(0, term_width - len(label) - 1)
+    return f"─{label}{'─' * fill_width}"
+
+
+def build_note_panel_row(
+    ref: ManagedNoteRef, *, selected: bool, term_width: int
+) -> str:
+    """Build one rendered row for a note in the panel."""
+    cursor_mark = f"{BOLD}{NOTE_PANEL_CURSOR}{RESET}" if selected else " "
+    kind_str = (
+        f"{RED}flag{RESET}" if ref.kind is NoteKind.FLAG else f"{YELLOW}question{RESET}"
+    )
+    preview = ref.text.replace("\n", " ")
+    prefix = f"{cursor_mark}[{kind_str}] {DIM}{ref.scope_label}{RESET} "
+    max_preview = term_width - visible_len(prefix) - 1
+    if max_preview > 0 and len(preview) > max_preview:
+        preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
+    elif max_preview <= 0:
+        preview = ""
+    return f"{prefix}{preview}"
+
+
+def compute_note_panel_height(note_count: int, term_height: int) -> int:
+    """Compute the number of terminal rows the note panel should occupy."""
+    max_panel = max(NOTE_PANEL_MIN_HEIGHT, term_height // NOTE_PANEL_MAX_FRACTION)
+    content_rows = max(note_count, 1)
+    return min(content_rows + NOTE_PANEL_CHROME_ROWS, max_panel)
+
+
+def build_managed_note_refs(state: ReviewState) -> list[ManagedNoteRef]:
+    """Build a flat list of note references for the manage-notes panel."""
+    refs: list[ManagedNoteRef] = []
+    for hunk in state.hunks:
+        for note in hunk.notes:
+            target_str = format_note_target(note.target)
+            label = f"{hunk.short_location} @ {target_str}"
+            refs.append(
+                ManagedNoteRef(scope_label=label, text=note.text, kind=note.kind)
+            )
+    refs.extend(
+        ManagedNoteRef(scope_label=GLOBAL_TARGET, text=gnote.text, kind=gnote.kind)
+        for gnote in state.global_notes
+    )
+    return refs
+
+
 def handle_approve(state: ReviewState) -> None:
     """Toggle approval on the current hunk, ignoring hunks that have notes."""
     hunk = state.hunks[state.current_index]
@@ -1408,8 +1502,6 @@ class Terminal:
     DEFAULT_HEIGHT = 40
     HELP_KEY_COLUMN_WIDTH = 14
     HELP_BOX_MAX_WIDTH = 78
-    GLOBAL_NOTES_BOX_WIDTH = 60
-
     CLEAR_SCREEN = f"{CSI}2J{CSI}H"
     ALT_SCREEN_ON = f"{CSI}?1049h"
     ALT_SCREEN_OFF = f"{CSI}?1049l"
@@ -1702,124 +1794,144 @@ class Terminal:
         self.write(f"│{' ' * width}│\r\n")
 
     def handle_manage_notes(self, state: ReviewState) -> None:
-        """Interactive screen to manage all notes (global + hunk + line)."""
+        """Interactive panel to manage all notes with cursor navigation."""
+        panel = NotePanelState()
+        hunk = state.hunks[state.current_index]
+        delta_output = render_through_delta(hunk.raw, width=self.width)
         while True:
-            refs = self.build_managed_note_refs(state)
-            self.render_manage_notes_screen(refs)
-            key = self.read_key()
+            refs = build_managed_note_refs(state)
+            if refs:
+                panel.cursor = min(panel.cursor, len(refs) - 1)
+            else:
+                panel.cursor = 0
+            self.render_note_panel(state, refs, panel, delta_output)
+            key = self.read_key(wakeup_read_fd=self.wakeup_read_fd)
+
+            if key == self.KEY_RESIZE:
+                self.refresh_geometry()
+                if delta_output:
+                    hunk = state.hunks[state.current_index]
+                    delta_output = render_through_delta(hunk.raw, width=self.width)
+                continue
 
             if key in ("q", "esc", self.KEY_CTRL_C):
                 break
 
-            if key == "e" and refs:
-                idx = self.parse_managed_note_index(refs)
-                if idx is not None:
-                    self.edit_managed_note(state, refs[idx])
-                    tty.setraw(self.fd)
-                continue
+            if key in ("j", "down") and refs:
+                panel.cursor = min(panel.cursor + 1, len(refs) - 1)
+            elif key in ("k", "up") and refs:
+                panel.cursor = max(panel.cursor - 1, 0)
+            elif key in ("e", "\r") and refs:
+                self.edit_managed_note(state, refs[panel.cursor])
+                tty.setraw(self.fd)
+            elif key == "d" and refs:
+                self.delete_managed_note(state, refs[panel.cursor])
 
-            if key == "d" and refs:
-                idx = self.parse_managed_note_index(refs)
-                if idx is not None:
-                    self.delete_managed_note(state, refs[idx])
-                continue
-
-    def build_managed_note_refs(
-        self, state: ReviewState
-    ) -> list[tuple[str, str, NoteKind]]:
-        """Build a flat list of (scope_label, text, kind) for all notes."""
-        refs: list[tuple[str, str, NoteKind]] = []
-        for hunk in state.hunks:
-            for note in hunk.notes:
-                target_str = format_note_target(note.target)
-                label = f"{hunk.short_location} @ {target_str}"
-                refs.append((label, note.text, note.kind))
-        refs.extend(
-            (GLOBAL_TARGET, gnote.text, gnote.kind) for gnote in state.global_notes
-        )
-        return refs
-
-    def render_manage_notes_screen(
+    def render_note_panel(
         self,
-        refs: list[tuple[str, str, NoteKind]],
+        state: ReviewState,
+        refs: list[ManagedNoteRef],
+        panel: NotePanelState,
+        delta_output: bytes,
     ) -> None:
-        """Display the note management overlay."""
+        """Render the diff with a note management panel at the bottom."""
+        panel_height = compute_note_panel_height(len(refs), self.height)
+        diff_height = self.height - panel_height
+
         self.write(self.CLEAR_SCREEN)
-        width = self.GLOBAL_NOTES_BOX_WIDTH
-        border = "─" * width
 
-        self.write(f"┌{border}┐\r\n")
-        self.write_box_row(width, f"{BOLD}  Notes{RESET}")
-        self.write(f"├{border}┤\r\n")
-        self.write_box_empty_row(width)
+        if delta_output and diff_height > CHROME_ROWS:
+            self.render_note_panel_diff(state, delta_output, diff_height)
 
-        if not refs:
-            self.write_box_row(width, f"  {DIM}No notes yet.{RESET}")
-        else:
-            for i, (scope_label, text, kind) in enumerate(refs):
-                num = i + 1
-                kind_str = (
-                    f"{RED}flag{RESET}"
-                    if kind is NoteKind.FLAG
-                    else f"{YELLOW}question{RESET}"
-                )
-                preview = text.replace("\n", " ")
-                header = (
-                    f"  {BOLD}{num}{RESET}. [{kind_str}] {DIM}{scope_label}{RESET} "
-                )
-                max_preview = width - visible_len(header)
-                if len(preview) > max_preview:
-                    preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
-                self.write_box_row(width, f"{header}{preview}")
+        panel_top = self.height - panel_height + 1
+        self.write(f"{CSI}{panel_top};1H")
+        self.write(build_note_panel_header(len(refs), self.width) + "\r\n")
 
-        self.write_box_empty_row(width)
-        self.write_box_row(
-            width,
-            (
-                f"  {BOLD}e{RESET}<num> edit  "
-                f"{BOLD}d{RESET}<num> delete  {BOLD}q{RESET} back"
-            ),
+        content_rows = panel_height - NOTE_PANEL_CHROME_ROWS
+        self.render_note_panel_rows(refs, panel, content_rows)
+
+        self.write(f"{CSI}{self.height};1H")
+        self.write(build_note_panel_footer(self.width))
+
+    def render_note_panel_diff(
+        self,
+        state: ReviewState,
+        delta_output: bytes,
+        diff_height: int,
+    ) -> None:
+        """Render the reduced-height diff above the note panel."""
+        hunk = state.hunks[state.current_index]
+        margins = build_margin_markers(hunk)
+        diff_lines = build_display_lines(delta_output, self.width, margins)
+        top_bar = build_top_bar(
+            hunk,
+            state.current_index,
+            state.hunks,
+            state.global_notes,
+            self.width,
         )
-        self.write(f"└{border}┘\r\n")
+        self.write(top_bar + "\r\n")
+        self.write(
+            build_progress_markers(state.hunks, state.current_index, self.width)
+            + "\r\n"
+        )
+        max_lines = diff_height - NOTE_PANEL_DIFF_CHROME_ROWS
+        start = min(state.scroll_offset, max(0, len(diff_lines) - max_lines))
+        end = start + max_lines
+        for line in diff_lines[start:end]:
+            self.write(line)
+            self.write(b"\r\n")
 
-    def parse_managed_note_index(
-        self, refs: list[tuple[str, str, NoteKind]]
-    ) -> int | None:
-        """Read digit keys and return a zero-based index into *refs*, or None."""
-        first = self.read_key()
-        if not first.isdigit():
-            return None
-        digits = [first]
-        while True:
-            ready, _, _ = select.select([self.fd], [], [], SELECT_IMMEDIATE)
-            if not ready:
-                break
-            key = self.read_key()
-            if not key.isdigit():
-                break
-            digits.append(key)
+    def render_note_panel_rows(
+        self,
+        refs: list[ManagedNoteRef],
+        panel: NotePanelState,
+        content_rows: int,
+    ) -> None:
+        """Render the scrollable note list inside the panel."""
+        if not refs:
+            self.write(f"  {DIM}No notes yet.{RESET}\r\n")
+            for _ in range(content_rows - 1):
+                self.write("\r\n")
+            return
 
-        num = int("".join(digits))
-        if 1 <= num <= len(refs):
-            return num - 1
-        return None
+        if panel.cursor < panel.scroll_offset:
+            panel.scroll_offset = panel.cursor
+        elif panel.cursor >= panel.scroll_offset + content_rows:
+            panel.scroll_offset = panel.cursor - content_rows + 1
+
+        for i in range(content_rows):
+            idx = panel.scroll_offset + i
+            if idx >= len(refs):
+                self.write("\r\n")
+                continue
+            self.write(
+                build_note_panel_row(
+                    refs[idx],
+                    selected=idx == panel.cursor,
+                    term_width=self.width,
+                )
+                + "\r\n"
+            )
 
     def edit_managed_note(
         self,
         state: ReviewState,
-        ref: tuple[str, str, NoteKind],
+        ref: ManagedNoteRef,
     ) -> None:
         """Edit or delete the note identified by *ref*."""
-        scope_label, text, kind = ref
-
         for hunk in state.hunks:
             for note in hunk.notes:
                 target_str = format_note_target(note.target)
                 label = f"{hunk.short_location} @ {target_str}"
-                if label == scope_label and note.text == text and note.kind == kind:
+                if (
+                    label == ref.scope_label
+                    and note.text == ref.text
+                    and note.kind == ref.kind
+                ):
                     kind_label = (
                         "flag (explain what change is needed)"
-                        if kind is NoteKind.FLAG
+                        if ref.kind is NoteKind.FLAG
                         else "question (agent will answer, not change code)"
                     )
                     ctx = (
@@ -1836,13 +1948,13 @@ class Terminal:
 
         for gnote in state.global_notes:
             if (
-                gnote.text == text
-                and gnote.kind == kind
-                and scope_label == GLOBAL_TARGET
+                gnote.text == ref.text
+                and gnote.kind == ref.kind
+                and ref.scope_label == GLOBAL_TARGET
             ):
                 kind_label = (
                     "global change request"
-                    if kind is NoteKind.FLAG
+                    if ref.kind is NoteKind.FLAG
                     else "global question (agent answers, no code change)"
                 )
                 new_text = self.edit_text_outside_tui(gnote.text, kind_label)
@@ -1855,24 +1967,26 @@ class Terminal:
     def delete_managed_note(
         self,
         state: ReviewState,
-        ref: tuple[str, str, NoteKind],
+        ref: ManagedNoteRef,
     ) -> None:
         """Delete the note identified by *ref*."""
-        scope_label, text, kind = ref
-
         for hunk in state.hunks:
             for note in hunk.notes:
                 target_str = format_note_target(note.target)
                 label = f"{hunk.short_location} @ {target_str}"
-                if label == scope_label and note.text == text and note.kind == kind:
+                if (
+                    label == ref.scope_label
+                    and note.text == ref.text
+                    and note.kind == ref.kind
+                ):
                     hunk.notes.remove(note)
                     return
 
         for gnote in state.global_notes:
             if (
-                gnote.text == text
-                and gnote.kind == kind
-                and scope_label == GLOBAL_TARGET
+                gnote.text == ref.text
+                and gnote.kind == ref.kind
+                and ref.scope_label == GLOBAL_TARGET
             ):
                 state.global_notes.remove(gnote)
                 return
