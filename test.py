@@ -214,9 +214,11 @@ def make_hunk(  # noqa: PLR0913
     *,
     approved: bool = False,
     notes: list[neorev.HunkNote] | None = None,
+    range_line: str = "",
 ) -> neorev.Hunk:
     """Create a Hunk with sensible defaults for testing."""
-    range_line = f"@@ -1,3 +{start_line},4 @@"
+    if not range_line:
+        range_line = f"@@ -1,3 +{start_line},4 @@"
     hunk = neorev.Hunk(
         file_header=f"diff --git a/{file_path} b/{file_path}",
         range_line=range_line,
@@ -224,6 +226,7 @@ def make_hunk(  # noqa: PLR0913
         raw=f"diff --git a/{file_path} b/{file_path}\n{range_line}\n{body}",
         file_path=file_path,
         start_line=start_line,
+        display_lines=neorev.parse_display_lines(range_line, body),
     )
     if status == neorev.Status.APPROVED:
         hunk.approved = True
@@ -866,43 +869,43 @@ class TestNavigation(unittest.TestCase):
 
     def test_navigate_down(self) -> None:
         """'j' moves to the next hunk."""
-        self.assertTrue(neorev.handle_navigation("j", self.state))
+        self.assertTrue(self.state.navigate("j"))
         self.assertEqual(self.state.current_index, 1)
 
     def test_navigate_up(self) -> None:
         """'k' moves to the previous hunk."""
         self.state.current_index = 2
-        self.assertTrue(neorev.handle_navigation("k", self.state))
+        self.assertTrue(self.state.navigate("k"))
         self.assertEqual(self.state.current_index, 1)
 
     def test_navigate_down_at_end(self) -> None:
         """'j' at the last hunk does nothing."""
         self.state.current_index = 2
-        self.assertFalse(neorev.handle_navigation("j", self.state))
+        self.assertFalse(self.state.navigate("j"))
         self.assertEqual(self.state.current_index, 2)
 
     def test_navigate_up_at_start(self) -> None:
         """'k' at the first hunk does nothing."""
-        self.assertFalse(neorev.handle_navigation("k", self.state))
+        self.assertFalse(self.state.navigate("k"))
         self.assertEqual(self.state.current_index, 0)
 
     def test_arrow_keys(self) -> None:
         """Arrow key names work like j/k."""
         with self.subTest(key="down"):
             self.state.current_index = 0
-            neorev.handle_navigation("down", self.state)
+            self.state.navigate("down")
             self.assertEqual(self.state.current_index, 1)
 
         with self.subTest(key="up"):
-            neorev.handle_navigation("up", self.state)
+            self.state.navigate("up")
             self.assertEqual(self.state.current_index, 0)
 
     def test_approve_toggle(self) -> None:
         """Approving then re-approving toggles the approved flag."""
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertTrue(self.hunks[0].approved)
         self.state.current_index = 0
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertFalse(self.hunks[0].approved)
 
     def test_approve_ignores_hunk_with_hunk_note(self) -> None:
@@ -914,7 +917,7 @@ class TestNavigation(unittest.TestCase):
                 text="old comment",
             )
         ]
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertFalse(self.hunks[0].approved)
         self.assertEqual(len(self.hunks[0].notes), 1)
 
@@ -927,21 +930,21 @@ class TestNavigation(unittest.TestCase):
                 text="why this?",
             )
         ]
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertFalse(self.hunks[0].approved)
         self.assertEqual(len(self.hunks[0].notes), 1)
 
     def test_approve_advances_to_next_unhandled(self) -> None:
         """After approval, cursor moves to the next unhandled hunk."""
         self.hunks[1].approved = True
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertEqual(self.state.current_index, 2)
 
     def test_approve_file(self) -> None:
         """Approve-file approves all hunks with the same file_path."""
         for h in self.hunks:
             h.file_path = "same.py"
-        neorev.handle_approve_file(self.state)
+        self.state.approve_file()
         for h in self.hunks:
             self.assertTrue(h.approved)
 
@@ -950,7 +953,7 @@ class TestNavigation(unittest.TestCase):
         self.hunks[0].file_path = "a.py"
         self.hunks[1].file_path = "b.py"
         self.hunks[2].file_path = "a.py"
-        neorev.handle_approve_file(self.state)
+        self.state.approve_file()
         self.assertTrue(self.hunks[0].approved)
         self.assertFalse(self.hunks[1].approved)
         self.assertTrue(self.hunks[2].approved)
@@ -973,7 +976,7 @@ class TestNavigation(unittest.TestCase):
                 text="why?",
             )
         ]
-        neorev.handle_approve_file(self.state)
+        self.state.approve_file()
         self.assertTrue(self.hunks[0].approved)
         self.assertFalse(self.hunks[1].approved)
         self.assertFalse(self.hunks[2].approved)
@@ -981,35 +984,35 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(len(self.hunks[2].notes), 1)
 
     def test_find_next_unhandled_wraps(self) -> None:
-        """find_next_unhandled_hunk wraps around the list."""
+        """find_next_unhandled wraps around the list."""
         self.hunks[1].approved = True
         self.hunks[2].approved = True
-        result = neorev.find_next_unhandled_hunk(self.hunks, 2)
-        self.assertEqual(result, 0)
+        self.state.current_index = 2
+        self.assertEqual(self.state.find_next_unhandled(), 0)
 
     def test_find_next_unhandled_all_handled(self) -> None:
         """When all hunks are handled, returns current index."""
         for h in self.hunks:
             h.approved = True
-        result = neorev.find_next_unhandled_hunk(self.hunks, 1)
-        self.assertEqual(result, 1)
+        self.state.current_index = 1
+        self.assertEqual(self.state.find_next_unhandled(), 1)
 
     def test_find_initial_hunk_index(self) -> None:
-        """find_initial_hunk_index returns the first unhandled hunk."""
+        """initial_index returns the first unhandled hunk."""
         self.hunks[0].approved = True
-        self.assertEqual(neorev.find_initial_hunk_index(self.hunks), 1)
+        self.assertEqual(neorev.ReviewState.initial_index(self.hunks), 1)
 
     def test_find_initial_all_handled(self) -> None:
         """When all hunks are handled, returns 0."""
         for h in self.hunks:
             h.approved = True
-        self.assertEqual(neorev.find_initial_hunk_index(self.hunks), 0)
+        self.assertEqual(neorev.ReviewState.initial_index(self.hunks), 0)
 
     def test_navigate_single_hunk(self) -> None:
         """With a single hunk, both j and k return False."""
         state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
-        self.assertFalse(neorev.handle_navigation("j", state))
-        self.assertFalse(neorev.handle_navigation("k", state))
+        self.assertFalse(state.navigate("j"))
+        self.assertFalse(state.navigate("k"))
         self.assertEqual(state.current_index, 0)
 
     def test_approve_already_flagged_hunk_has_no_effect(self) -> None:
@@ -1019,7 +1022,7 @@ class TestNavigation(unittest.TestCase):
                 kind=neorev.NoteKind.FLAG, target=neorev.HunkTarget(), text="fix this"
             )
         ]
-        neorev.handle_approve(self.state)
+        self.state.approve()
         self.assertFalse(self.hunks[0].approved)
         self.assertEqual(len(self.hunks[0].notes), 1)
 
@@ -1028,7 +1031,7 @@ class TestNavigation(unittest.TestCase):
         for h in self.hunks:
             h.file_path = "same.py"
             h.approved = True
-        neorev.handle_approve_file(self.state)
+        self.state.approve_file()
         for h in self.hunks:
             self.assertTrue(h.approved)
 
@@ -1037,7 +1040,7 @@ class TestNavigation(unittest.TestCase):
         self.hunks[0].file_path = "a.py"
         self.hunks[1].file_path = "a.py"
         self.hunks[2].file_path = "b.py"
-        neorev.handle_approve_file(self.state)
+        self.state.approve_file()
         self.assertEqual(self.state.current_index, 2)
 
     def test_find_next_unhandled_single_unhandled(self) -> None:
@@ -1045,8 +1048,8 @@ class TestNavigation(unittest.TestCase):
         self.hunks[0].approved = True
         self.hunks[1].approved = True
         for start in range(3):
-            result = neorev.find_next_unhandled_hunk(self.hunks, start)
-            self.assertEqual(result, 2)
+            self.state.current_index = start
+            self.assertEqual(self.state.find_next_unhandled(), 2)
 
 
 class TestRenderingHelpers(unittest.TestCase):
@@ -1080,18 +1083,20 @@ class TestRenderingHelpers(unittest.TestCase):
         self.assertEqual(len(neorev.wrap_ansi_line_to_rows(b"", TERM_WIDTH)), 1)
 
     def test_count_fitting_lines(self) -> None:
-        """compute_visible_count reserves rows for scroll indicators."""
-        visible, can_up, can_down = neorev.compute_visible_count(100, 10, 0)
-        self.assertEqual(visible, 9)
-        self.assertFalse(can_up)
-        self.assertTrue(can_down)
+        """compute_diff_viewport reserves rows for scroll indicators."""
+        chrome = neorev.CHROME_ROWS
+        vp = neorev.compute_diff_viewport(100, 10 + chrome, 0)
+        self.assertEqual(vp.visible_line_count, 9)
+        self.assertFalse(vp.can_scroll_up)
+        self.assertTrue(vp.can_scroll_down)
 
     def test_count_fitting_lines_from_offset(self) -> None:
-        """compute_visible_count shows both indicators when mid-scroll."""
-        visible, can_up, can_down = neorev.compute_visible_count(100, 10, 5)
-        self.assertEqual(visible, 8)
-        self.assertTrue(can_up)
-        self.assertTrue(can_down)
+        """compute_diff_viewport shows both indicators when mid-scroll."""
+        chrome = neorev.CHROME_ROWS
+        vp = neorev.compute_diff_viewport(100, 10 + chrome, 5)
+        self.assertEqual(vp.visible_line_count, 8)
+        self.assertTrue(vp.can_scroll_up)
+        self.assertTrue(vp.can_scroll_down)
 
     def test_build_display_lines_strips_blanks(self) -> None:
         """Leading/trailing blank lines from delta output are stripped."""
@@ -1156,16 +1161,17 @@ class TestRenderingHelpers(unittest.TestCase):
         self.assertEqual(len(neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)), 2)
 
     def test_count_fitting_lines_zero_budget(self) -> None:
-        """compute_visible_count enforces MIN_VISIBLE_ROWS."""
-        visible, _, _ = neorev.compute_visible_count(100, 0, 0)
-        self.assertEqual(visible, neorev.MIN_VISIBLE_ROWS)
+        """compute_diff_viewport enforces MIN_VISIBLE_ROWS."""
+        chrome = neorev.CHROME_ROWS
+        vp = neorev.compute_diff_viewport(100, 0 + chrome, 0)
+        self.assertEqual(vp.visible_line_count, neorev.MIN_VISIBLE_ROWS)
 
     def test_count_fitting_lines_all_fit(self) -> None:
-        """When at end, compute_visible_count can disable down indicator."""
-        visible, can_up, can_down = neorev.compute_visible_count(20, 10, 15)
-        self.assertEqual(visible, 5)
-        self.assertTrue(can_up)
-        self.assertFalse(can_down)
+        """When at end, compute_diff_viewport can disable down indicator."""
+        vp = neorev.compute_diff_viewport(20, 10, 15)
+        self.assertEqual(vp.visible_line_count, 5)
+        self.assertTrue(vp.can_scroll_up)
+        self.assertFalse(vp.can_scroll_down)
 
     def test_wrap_ansi_preserves_color_across_rows(self) -> None:
         """A colored line that wraps carries color into the second row."""
@@ -1326,13 +1332,17 @@ class TestChrome(unittest.TestCase):
 
     def test_footer_contains_key_hints(self) -> None:
         """Footer line includes key hints."""
-        footer = neorev.build_footer_line(WIDE_FOOTER_WIDTH)
+        footer = neorev.build_keyhint_footer(
+            neorev.MAIN_FOOTER_SEGMENTS, WIDE_FOOTER_WIDTH, ellipsis=True
+        )
         self.assertIn("j/k", footer)
         self.assertIn("quit", footer)
 
     def test_footer_truncates_narrow(self) -> None:
         """A very narrow terminal truncates the footer."""
-        footer = neorev.build_footer_line(NARROW_FOOTER_WIDTH)
+        footer = neorev.build_keyhint_footer(
+            neorev.MAIN_FOOTER_SEGMENTS, NARROW_FOOTER_WIDTH, ellipsis=True
+        )
         # Should not contain all segments.
         self.assertNotIn("help", footer)
 
@@ -1363,9 +1373,13 @@ class TestChrome(unittest.TestCase):
 
     def test_footer_exact_width(self) -> None:
         """A width that exactly fits all segments does not append ellipsis."""
-        full_footer = neorev.build_footer_line(WIDE_FOOTER_WIDTH)
+        full_footer = neorev.build_keyhint_footer(
+            neorev.MAIN_FOOTER_SEGMENTS, WIDE_FOOTER_WIDTH, ellipsis=True
+        )
         visible = neorev.visible_len(full_footer)
-        exact_footer = neorev.build_footer_line(visible)
+        exact_footer = neorev.build_keyhint_footer(
+            neorev.MAIN_FOOTER_SEGMENTS, visible, ellipsis=True
+        )
         self.assertNotIn("…", exact_footer)
 
 
@@ -1441,47 +1455,43 @@ class TestCommentHelpers(unittest.TestCase):
 
 
 class TestBuildLineContext(unittest.TestCase):
-    """Tests for build_line_context."""
+    """Tests for Hunk.build_line_context."""
 
     SAMPLE_BODY = (
-        "@@ -1,4 +1,5 @@\n"
-        " line one\n"
-        " line two\n"
-        "-old three\n"
-        "+new three\n"
-        "+added four\n"
-        " line five\n"
+        " line one\n line two\n-old three\n+new three\n+added four\n line five\n"
     )
+    SAMPLE_RANGE = "@@ -1,4 +1,5 @@"
 
-    def make_display_lines(self) -> list[neorev.DisplayLine]:
-        """Parse sample body into display lines."""
-        range_line = self.SAMPLE_BODY.splitlines()[0]
-        body = "\n".join(self.SAMPLE_BODY.splitlines()[1:])
-        return neorev.parse_display_lines(range_line, body)
+    def make_hunk_with_context(self) -> neorev.Hunk:
+        """Build a hunk from the sample body."""
+        return make_hunk(
+            range_line=self.SAMPLE_RANGE,
+            body=self.SAMPLE_BODY.rstrip("\n"),
+        )
 
     def test_context_around_added_line(self) -> None:
         """Context shows surrounding lines with marker on the target."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         marker_lines = [c for c in ctx if neorev.EDITOR_TARGET_MARKER in c]
         self.assertEqual(len(marker_lines), 1)
         self.assertIn("new three", marker_lines[0])
 
     def test_context_around_removed_line(self) -> None:
         """Context marks the removed line with the target marker."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.REMOVED, line_number=3)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         marker_lines = [c for c in ctx if neorev.EDITOR_TARGET_MARKER in c]
         self.assertEqual(len(marker_lines), 1)
         self.assertIn("old three", marker_lines[0])
 
     def test_context_includes_diff_prefix(self) -> None:
         """Each context line includes the diff prefix from its kind."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         added = [c for c in ctx if "new three" in c]
         self.assertTrue(any("+" in c for c in added))
         context = [c for c in ctx if "line two" in c]
@@ -1489,34 +1499,35 @@ class TestBuildLineContext(unittest.TestCase):
 
     def test_context_radius_limits(self) -> None:
         """Context does not exceed the configured radius."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         max_lines = 2 * neorev.EDITOR_CONTEXT_RADIUS + 1
         self.assertLessEqual(len(ctx), max_lines)
 
     def test_context_at_start_of_hunk(self) -> None:
         """Context near the beginning does not go out of bounds."""
-        range_line = "@@ -1,2 +1,2 @@"
-        body = "+added\n context\n"
-        dls = neorev.parse_display_lines(range_line, body)
+        hunk = make_hunk(
+            range_line="@@ -1,2 +1,2 @@",
+            body="+added\n context",
+        )
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=1)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         self.assertTrue(len(ctx) >= 1)
         self.assertIn(neorev.EDITOR_TARGET_MARKER, ctx[0])
 
     def test_unknown_target_returns_empty(self) -> None:
         """A target not in the display lines returns an empty list."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=999)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         self.assertEqual(ctx, [])
 
     def test_context_lines_are_aligned(self) -> None:
         """All context lines have the same length up to the diff prefix."""
-        dls = self.make_display_lines()
+        hunk = self.make_hunk_with_context()
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=3)
-        ctx = neorev.build_line_context(dls, target)
+        ctx = hunk.build_line_context(target)
         # Check alignment: strip the "# " prefix and verify the marker + line
         # number + prefix portion has consistent width.
         for line in ctx:
@@ -1738,7 +1749,7 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
         )
         hunk = make_hunk(notes=[line_note])
         state = neorev.ReviewState(hunks=[hunk], global_notes=[])
-        refs = neorev.build_managed_note_refs(state)
+        refs = state.managed_note_refs()
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0].text, "fix this line")
         self.assertEqual(refs[0].kind, neorev.NoteKind.FLAG)
@@ -1755,7 +1766,7 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
         hunk_current = make_hunk(file_path="a.py")
         hunk_other = make_hunk(file_path="b.py", notes=[note_other])
         state = neorev.ReviewState(hunks=[hunk_current, hunk_other], global_notes=[])
-        refs = neorev.build_managed_note_refs(state)
+        refs = state.managed_note_refs()
         texts = [ref.text for ref in refs]
         self.assertIn("why this?", texts)
 
@@ -2305,17 +2316,17 @@ class TestProgressMarkersTinyWidth(unittest.TestCase):
 
 
 class TestFooterTinyWidth(unittest.TestCase):
-    """Tests for build_footer_line with very small widths."""
+    """Tests for build_keyhint_footer with very small widths."""
 
     def test_zero_width(self) -> None:
         """Zero width produces empty footer."""
-        result = neorev.build_footer_line(0)
+        result = neorev.build_keyhint_footer(neorev.MAIN_FOOTER_SEGMENTS, 0)
         self.assertEqual(result, "")
 
     def test_tiny_width_no_crash(self) -> None:
         """Tiny widths produce a footer without crashing."""
         for w in range(1, TINY_WIDTH + 1):
-            result = neorev.build_footer_line(w)
+            result = neorev.build_keyhint_footer(neorev.MAIN_FOOTER_SEGMENTS, w)
             visible = neorev.visible_len(result)
             self.assertLessEqual(visible, w)
 
@@ -2717,20 +2728,20 @@ class TestNoteMutation(unittest.TestCase):
     def test_empty_edit_deletes_note(self) -> None:
         """Upsert then remove on empty text verifies note is gone."""
         target = neorev.HunkTarget()
-        notes: list[neorev.HunkNote] = []
-        neorev.upsert_note(notes, neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
-        self.assertEqual(len(notes), 1)
-        neorev.remove_note_for_target(notes, target)
-        self.assertEqual(len(notes), 0)
+        hunk = make_hunk()
+        hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
+        self.assertEqual(len(hunk.notes), 1)
+        hunk.remove_note(target)
+        self.assertEqual(len(hunk.notes), 0)
 
 
 class TestNoteTargetRoundTrip(unittest.TestCase):
-    """Tests for format_note_target and parse_note_target round-trip."""
+    """Tests for NoteTarget.__str__ and parse_note_target round-trip."""
 
     def test_hunk_target_round_trip(self) -> None:
         """Serialize and parse a HunkTarget back to an equal value."""
         target = neorev.HunkTarget()
-        serialized = neorev.format_note_target(target)
+        serialized = str(target)
         parsed = neorev.parse_note_target(serialized)
         self.assertEqual(parsed, target)
 
@@ -2739,7 +2750,7 @@ class TestNoteTargetRoundTrip(unittest.TestCase):
         target = neorev.LineTarget(
             side=neorev.LineSide.ADDED, line_number=LINE_TARGET_NOTE_LINE
         )
-        serialized = neorev.format_note_target(target)
+        serialized = str(target)
         parsed = neorev.parse_note_target(serialized)
         self.assertEqual(parsed, target)
 
@@ -2748,7 +2759,7 @@ class TestNoteTargetRoundTrip(unittest.TestCase):
         target = neorev.LineTarget(
             side=neorev.LineSide.REMOVED, line_number=REMOVED_LINE_NUMBER
         )
-        serialized = neorev.format_note_target(target)
+        serialized = str(target)
         parsed = neorev.parse_note_target(serialized)
         self.assertEqual(parsed, target)
 
@@ -2762,78 +2773,82 @@ class TestNoteTargetRoundTrip(unittest.TestCase):
 
 
 class TestNoteAccessHelpers(unittest.TestCase):
-    """Tests for get_note_for_target, upsert_note, and remove_note_for_target."""
+    """Tests for Hunk.get_note, Hunk.upsert_note, and Hunk.remove_note."""
 
-    def test_get_note_for_target_found(self) -> None:
+    def test_get_note_found(self) -> None:
         """Find an existing note by its target."""
         target = neorev.HunkTarget()
         note = neorev.HunkNote(kind=neorev.NoteKind.FLAG, target=target, text="hello")
-        result = neorev.get_note_for_target([note], target)
+        hunk = make_hunk(notes=[note])
+        result = hunk.get_note(target)
         self.assertIs(result, note)
 
-    def test_get_note_for_target_not_found(self) -> None:
+    def test_get_note_not_found(self) -> None:
         """Return None when no note matches the target."""
         target = neorev.HunkTarget()
         other = neorev.LineTarget(
             side=neorev.LineSide.ADDED, line_number=ADDED_LINE_NUMBER
         )
         note = neorev.HunkNote(kind=neorev.NoteKind.FLAG, target=target, text="hello")
-        result = neorev.get_note_for_target([note], other)
+        hunk = make_hunk(notes=[note])
+        result = hunk.get_note(other)
         self.assertIsNone(result)
 
     def test_upsert_note_insert(self) -> None:
         """Upsert into an empty list appends a new note."""
-        notes: list[neorev.HunkNote] = []
         target = neorev.HunkTarget()
-        neorev.upsert_note(notes, neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0].text, UPSERT_NOTE_TEXT)
+        hunk = make_hunk()
+        hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
+        self.assertEqual(len(hunk.notes), 1)
+        self.assertEqual(hunk.notes[0].text, UPSERT_NOTE_TEXT)
 
     def test_upsert_note_update(self) -> None:
         """Upsert on an existing target replaces the note."""
-        notes: list[neorev.HunkNote] = []
         target = neorev.HunkTarget()
-        neorev.upsert_note(notes, neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
-        neorev.upsert_note(
-            notes, neorev.NoteKind.QUESTION, target, UPSERT_NOTE_UPDATED_TEXT
-        )
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0].text, UPSERT_NOTE_UPDATED_TEXT)
-        self.assertEqual(notes[0].kind, neorev.NoteKind.QUESTION)
+        hunk = make_hunk()
+        hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
+        hunk.upsert_note(neorev.NoteKind.QUESTION, target, UPSERT_NOTE_UPDATED_TEXT)
+        self.assertEqual(len(hunk.notes), 1)
+        self.assertEqual(hunk.notes[0].text, UPSERT_NOTE_UPDATED_TEXT)
+        self.assertEqual(hunk.notes[0].kind, neorev.NoteKind.QUESTION)
 
-    def test_remove_note_for_target_present(self) -> None:
+    def test_remove_note_present(self) -> None:
         """Remove a note matching the target."""
         target = neorev.HunkTarget()
-        notes = [
-            neorev.HunkNote(
-                kind=neorev.NoteKind.FLAG, target=target, text=UPSERT_NOTE_TEXT
-            )
-        ]
-        neorev.remove_note_for_target(notes, target)
-        self.assertEqual(len(notes), 0)
+        hunk = make_hunk(
+            notes=[
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG, target=target, text=UPSERT_NOTE_TEXT
+                )
+            ]
+        )
+        hunk.remove_note(target)
+        self.assertEqual(len(hunk.notes), 0)
 
-    def test_remove_note_for_target_absent(self) -> None:
+    def test_remove_note_absent(self) -> None:
         """Remove on a missing target leaves the list unchanged."""
         target = neorev.HunkTarget()
         other = neorev.LineTarget(
             side=neorev.LineSide.ADDED, line_number=ADDED_LINE_NUMBER
         )
-        notes = [
-            neorev.HunkNote(
-                kind=neorev.NoteKind.FLAG, target=target, text=UPSERT_NOTE_TEXT
-            )
-        ]
-        neorev.remove_note_for_target(notes, other)
-        self.assertEqual(len(notes), 1)
+        hunk = make_hunk(
+            notes=[
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG, target=target, text=UPSERT_NOTE_TEXT
+                )
+            ]
+        )
+        hunk.remove_note(other)
+        self.assertEqual(len(hunk.notes), 1)
 
 
 class TestHunkStatusHelpers(unittest.TestCase):
-    """Tests for hunk_summary_status and hunk_is_handled."""
+    """Tests for Hunk.summary_status and Hunk.is_handled."""
 
     def test_hunk_summary_status_approved(self) -> None:
         """Return 'approved' for an approved hunk."""
         hunk = make_hunk(approved=True)
-        self.assertEqual(neorev.hunk_summary_status(hunk), neorev.Status.APPROVED)
+        self.assertEqual(hunk.summary_status, neorev.Status.APPROVED)
 
     def test_hunk_summary_status_flag(self) -> None:
         """Return 'flag' when a flag note is present."""
@@ -2846,7 +2861,7 @@ class TestHunkStatusHelpers(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(neorev.hunk_summary_status(hunk), neorev.Status.FLAG)
+        self.assertEqual(hunk.summary_status, neorev.Status.FLAG)
 
     def test_hunk_summary_status_question(self) -> None:
         """Return 'question' when a question note is present."""
@@ -2859,17 +2874,17 @@ class TestHunkStatusHelpers(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(neorev.hunk_summary_status(hunk), neorev.Status.QUESTION)
+        self.assertEqual(hunk.summary_status, neorev.Status.QUESTION)
 
     def test_hunk_summary_status_none(self) -> None:
         """Return None for a hunk with no status, notes, or approval."""
         hunk = make_hunk()
-        self.assertIsNone(neorev.hunk_summary_status(hunk))
+        self.assertIsNone(hunk.summary_status)
 
     def test_hunk_is_handled_approved(self) -> None:
         """An approved hunk is handled."""
         hunk = make_hunk(approved=True)
-        self.assertTrue(neorev.hunk_is_handled(hunk))
+        self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_handled_with_notes(self) -> None:
         """A hunk with notes is handled."""
@@ -2882,17 +2897,17 @@ class TestHunkStatusHelpers(unittest.TestCase):
                 )
             ],
         )
-        self.assertTrue(neorev.hunk_is_handled(hunk))
+        self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_handled_with_status(self) -> None:
         """A hunk with a legacy status is handled."""
         hunk = make_hunk(status=neorev.Status.FLAG)
-        self.assertTrue(neorev.hunk_is_handled(hunk))
+        self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_not_handled(self) -> None:
         """A bare hunk with no status, notes, or approval is not handled."""
         hunk = make_hunk()
-        self.assertFalse(neorev.hunk_is_handled(hunk))
+        self.assertFalse(hunk.is_handled)
 
 
 class TestLinePickerResize(unittest.TestCase):
@@ -3023,8 +3038,9 @@ class TestLinePickerScrollFollowsCursor(unittest.TestCase):
             self.term.height,
             scroll,
         )
-        cursor_idx = neorev.find_display_line_index(
-            hunk.display_lines, selectable[cursor]
+        cursor_idx = next(
+            (i for i, dl in enumerate(hunk.display_lines) if dl is selectable[cursor]),
+            None,
         )
         self.assertIsNotNone(cursor_idx)
         self.assertGreaterEqual(cursor_idx, viewport.scroll_offset)

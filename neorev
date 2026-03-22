@@ -49,6 +49,7 @@ import sys
 import tempfile
 import termios
 import tty
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import StringIO
@@ -155,6 +156,20 @@ class NoteKind(enum.Enum):
     FLAG = "CHANGE REQUESTED"
     QUESTION = "QUESTION"
 
+    @property
+    def editor_label(self) -> str:
+        """Return the prompt label shown when editing a hunk-scoped note."""
+        if self is NoteKind.FLAG:
+            return "flag (explain what change is needed)"
+        return "question (agent will answer, not change code)"
+
+    @property
+    def global_editor_label(self) -> str:
+        """Return the prompt label shown when editing a global note."""
+        if self is NoteKind.FLAG:
+            return "global change request"
+        return "global question (agent answers, no code change)"
+
 
 class LineSide(enum.Enum):
     """Enumerate whether a note targets an added or removed line."""
@@ -203,6 +218,61 @@ class Hunk:
             else self.range_line.strip()
         )
 
+    @property
+    def summary_status(self) -> Status | None:
+        """Return a summary status for chrome/markers."""
+        if self.approved:
+            return Status.APPROVED
+        if self.notes:
+            if any(note.kind is NoteKind.FLAG for note in self.notes):
+                return Status.FLAG
+            if any(note.kind is NoteKind.QUESTION for note in self.notes):
+                return Status.QUESTION
+        return None
+
+    @property
+    def is_handled(self) -> bool:
+        """Return whether the hunk has been reviewed."""
+        return self.approved or bool(self.notes)
+
+    def get_note(self, target: NoteTarget) -> HunkNote | None:
+        """Find a note matching *target*, or None."""
+        return next((n for n in self.notes if n.target == target), None)
+
+    def upsert_note(self, kind: NoteKind, target: NoteTarget, text: str) -> None:
+        """Insert or update a note for *target*."""
+        for i, note in enumerate(self.notes):
+            if note.target == target:
+                self.notes[i] = HunkNote(kind=kind, target=target, text=text)
+                return
+        self.notes.append(HunkNote(kind=kind, target=target, text=text))
+
+    def remove_note(self, target: NoteTarget) -> None:
+        """Remove the note matching *target*, if any."""
+        for i, note in enumerate(self.notes):
+            if note.target == target:
+                del self.notes[i]
+                return
+
+    def build_line_context(self, target: LineTarget) -> list[str]:
+        """Build context lines around *target* for the editor comment template."""
+        target_idx = next(
+            (i for i, dl in enumerate(self.display_lines) if dl.target == target),
+            None,
+        )
+        if target_idx is None:
+            return []
+
+        start = max(0, target_idx - EDITOR_CONTEXT_RADIUS)
+        end = min(len(self.display_lines), target_idx + EDITOR_CONTEXT_RADIUS + 1)
+
+        lines: list[str] = []
+        for dl in self.display_lines[start:end]:
+            line_num = dl.new_line_number or dl.old_line_number or 0
+            marker = EDITOR_TARGET_MARKER if dl.target == target else EDITOR_CONTEXT_PAD
+            lines.append(f"# {marker} {line_num:>4} {dl.kind.value} {dl.text}")
+        return lines
+
 
 @dataclass
 class GlobalNote:
@@ -219,10 +289,18 @@ class LineTarget:
     side: LineSide
     line_number: int
 
+    def __str__(self) -> str:
+        """Return the serialized form for output format."""
+        return f"{self.side.value}{self.line_number}"
+
 
 @dataclass(frozen=True)
 class HunkTarget:
     """A note target tied to a whole diff hunk."""
+
+    def __str__(self) -> str:
+        """Return the serialized form for output format."""
+        return NOTE_TARGET_HUNK
 
 
 NoteTarget = HunkTarget | LineTarget
@@ -256,6 +334,87 @@ class ReviewState:
     global_notes: list[GlobalNote]
     current_index: int = 0
     scroll_offset: int = 0
+
+    def find_next_unhandled(self) -> int:
+        """Find the next hunk with no review, wrapping around."""
+        n = len(self.hunks)
+        for offset in range(1, n + 1):
+            candidate = (self.current_index + offset) % n
+            if not self.hunks[candidate].is_handled:
+                return candidate
+        return self.current_index
+
+    @staticmethod
+    def initial_index(hunks: list[Hunk]) -> int:
+        """Return the index of the first unhandled hunk, or 0."""
+        return next((i for i, h in enumerate(hunks) if not h.is_handled), 0)
+
+    def navigate(self, key: str) -> bool:
+        """Handle navigation keys (j/k/arrows), returning True if index changed."""
+        if key in ("j", "down") and self.current_index < len(self.hunks) - 1:
+            self.current_index += 1
+            return True
+        if key in ("k", "up") and self.current_index > 0:
+            self.current_index -= 1
+            return True
+        return False
+
+    def approve(self) -> None:
+        """Toggle approval on the current hunk, ignoring hunks that have notes."""
+        hunk = self.hunks[self.current_index]
+        if hunk.approved:
+            hunk.approved = False
+        elif not hunk.notes:
+            hunk.approved = True
+            self.current_index = self.find_next_unhandled()
+
+    def approve_file(self) -> None:
+        """Approve all note-free hunks in the same file as the current hunk."""
+        current_file = self.hunks[self.current_index].file_path
+        for hunk in self.hunks:
+            if hunk.file_path == current_file and not hunk.approved and not hunk.notes:
+                hunk.approved = True
+        self.current_index = self.find_next_unhandled()
+
+    def managed_note_refs(self) -> list[ManagedNoteRef]:
+        """Build a flat list of note references for the manage-notes panel."""
+        refs: list[ManagedNoteRef] = []
+        for hunk in self.hunks:
+            for note in hunk.notes:
+                label = f"{hunk.short_location} @ {note.target}"
+                refs.append(
+                    ManagedNoteRef(scope_label=label, text=note.text, kind=note.kind)
+                )
+        refs.extend(
+            ManagedNoteRef(scope_label=GLOBAL_TARGET, text=gnote.text, kind=gnote.kind)
+            for gnote in self.global_notes
+        )
+        return refs
+
+    def find_note_by_ref(
+        self,
+        ref: ManagedNoteRef,
+    ) -> tuple[Hunk, HunkNote] | GlobalNote | None:
+        """Locate the note described by *ref*."""
+        for hunk in self.hunks:
+            for note in hunk.notes:
+                label = f"{hunk.short_location} @ {note.target}"
+                if (
+                    label == ref.scope_label
+                    and note.text == ref.text
+                    and note.kind == ref.kind
+                ):
+                    return hunk, note
+
+        for gnote in self.global_notes:
+            if (
+                gnote.text == ref.text
+                and gnote.kind == ref.kind
+                and ref.scope_label == GLOBAL_TARGET
+            ):
+                return gnote
+
+        return None
 
 
 @dataclass(frozen=True)
@@ -401,67 +560,48 @@ def parse_display_lines(range_line: str, body: str) -> list[DisplayLine]:
     for line in body.splitlines():
         if not line:
             continue
-        first_char = line[0] if line else " "
-        text = line[1:] if len(line) > 1 else ""
         try:
-            line_kind = DisplayLineKind(first_char)
+            line_kind = DisplayLineKind(line[0])
         except ValueError:
             line_kind = DisplayLineKind.CONTEXT
 
-        if line_kind is DisplayLineKind.ADDED:
-            target = LineTarget(side=LineSide.ADDED, line_number=new_num)
+        if line_kind is DisplayLineKind.META:
             result.append(
                 DisplayLine(
-                    kind=DisplayLineKind.ADDED,
-                    text=text,
-                    old_line_number=None,
-                    new_line_number=new_num,
-                    target=target,
-                )
-            )
-            new_num += 1
-        elif line_kind is DisplayLineKind.REMOVED:
-            target = LineTarget(side=LineSide.REMOVED, line_number=old_num)
-            result.append(
-                DisplayLine(
-                    kind=DisplayLineKind.REMOVED,
-                    text=text,
-                    old_line_number=old_num,
-                    new_line_number=None,
-                    target=target,
-                )
-            )
-            old_num += 1
-        elif line_kind is DisplayLineKind.META:
-            result.append(
-                DisplayLine(
-                    kind=DisplayLineKind.META,
+                    kind=line_kind,
                     text=line,
                     old_line_number=None,
                     new_line_number=None,
                     target=None,
                 )
             )
-        else:
-            result.append(
-                DisplayLine(
-                    kind=DisplayLineKind.CONTEXT,
-                    text=text,
-                    old_line_number=old_num,
-                    new_line_number=new_num,
-                    target=None,
-                )
+            continue
+
+        text = line[1:] if len(line) > 1 else ""
+        target: LineTarget | None = None
+        if line_kind is DisplayLineKind.ADDED:
+            target = LineTarget(side=LineSide.ADDED, line_number=new_num)
+        elif line_kind is DisplayLineKind.REMOVED:
+            target = LineTarget(side=LineSide.REMOVED, line_number=old_num)
+
+        result.append(
+            DisplayLine(
+                kind=line_kind,
+                text=text,
+                old_line_number=(
+                    old_num if line_kind is not DisplayLineKind.ADDED else None
+                ),
+                new_line_number=(
+                    new_num if line_kind is not DisplayLineKind.REMOVED else None
+                ),
+                target=target,
             )
+        )
+        if line_kind is not DisplayLineKind.ADDED:
             old_num += 1
+        if line_kind is not DisplayLineKind.REMOVED:
             new_num += 1
     return result
-
-
-def format_note_target(target: NoteTarget) -> str:
-    """Serialize a note target to a string for output format."""
-    if isinstance(target, HunkTarget):
-        return NOTE_TARGET_HUNK
-    return f"{target.side.value}{target.line_number}"
 
 
 def parse_note_target(text: str) -> NoteTarget | None:
@@ -480,50 +620,6 @@ def parse_note_target(text: str) -> NoteTarget | None:
         except ValueError:
             return None
     return None
-
-
-def get_note_for_target(notes: list[HunkNote], target: NoteTarget) -> HunkNote | None:
-    """Find a note matching *target*, or None."""
-    for note in notes:
-        if note.target == target:
-            return note
-    return None
-
-
-def upsert_note(
-    notes: list[HunkNote], kind: NoteKind, target: NoteTarget, text: str
-) -> None:
-    """Insert or update a note for *target*."""
-    for i, note in enumerate(notes):
-        if note.target == target:
-            notes[i] = HunkNote(kind=kind, target=target, text=text)
-            return
-    notes.append(HunkNote(kind=kind, target=target, text=text))
-
-
-def remove_note_for_target(notes: list[HunkNote], target: NoteTarget) -> None:
-    """Remove the note matching *target*, if any."""
-    for i, note in enumerate(notes):
-        if note.target == target:
-            del notes[i]
-            return
-
-
-def hunk_summary_status(hunk: Hunk) -> Status | None:
-    """Return a summary status for chrome/markers."""
-    if hunk.approved:
-        return Status.APPROVED
-    if hunk.notes:
-        if any(note.kind is NoteKind.FLAG for note in hunk.notes):
-            return Status.FLAG
-        if any(note.kind is NoteKind.QUESTION for note in hunk.notes):
-            return Status.QUESTION
-    return None
-
-
-def hunk_is_handled(hunk: Hunk) -> bool:
-    """Return whether the hunk has been reviewed."""
-    return hunk.approved or bool(hunk.notes)
 
 
 def render_through_delta(diff_text: str, width: int = 120) -> bytes:
@@ -560,7 +656,7 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
     explicit target (hunk, +N, -N).  Global notes appear first.
     """
     out = StringIO()
-    all_notes = collect_actionable_notes(hunks)
+    all_notes = [(hunk, note) for hunk in hunks for note in hunk.notes]
 
     if not all_notes and not global_notes:
         approved = sum(1 for h in hunks if h.approved)
@@ -572,38 +668,56 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
     out.write(OUTPUT_PREAMBLE)
 
     for note in global_notes:
-        write_global_note(out, note)
+        write_note_section(out, note.kind, GLOBAL_TARGET, note.text)
 
     for hunk, hnote in all_notes:
-        write_hunk_note_section(out, hunk, hnote)
+        write_note_section(
+            out,
+            hnote.kind,
+            f"{hunk.file_path} @ {hnote.target}",
+            hnote.text,
+            diff_block=format_diff_block(hunk, hnote),
+        )
 
     out.write(f"# neorev:{encode_approved_bitmap(hunks)}\n")
     return out.getvalue()
 
 
-def collect_actionable_notes(hunks: list[Hunk]) -> list[tuple[Hunk, HunkNote]]:
-    """Collect all actionable notes across hunks."""
-    return [(hunk, note) for hunk in hunks for note in hunk.notes]
-
-
-def write_global_note(out: StringIO, note: GlobalNote) -> None:
-    """Write a single global note section to *out*."""
-    label = note.kind.value
-    out.write(f"## [{label}] {GLOBAL_TARGET}\n")
-    out.writelines(f"> {comment_line}\n" for comment_line in note.text.splitlines())
+def write_note_section(
+    out: StringIO,
+    kind: NoteKind,
+    heading: str,
+    text: str,
+    diff_block: str | None = None,
+) -> None:
+    """Write a single note section (global or hunk-scoped) to *out*."""
+    out.write(f"## [{kind.value}] {heading}\n")
+    if diff_block:
+        out.write(diff_block)
+    out.writelines(f"> {line}\n" for line in text.splitlines())
     out.write("\n")
 
 
-def trim_body_lines(
-    body_lines: list[str],
-    note: HunkNote,
-    range_line: str,
-) -> list[str]:
+def format_diff_block(hunk: Hunk, note: HunkNote) -> str:
+    """Format the fenced diff block for a hunk note section."""
+    trimmed = trim_body_lines(hunk, note)
+    return f"```diff\n{hunk.range_line}\n" + "\n".join(trimmed) + "\n```\n"
+
+
+def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
     """Trim long hunk body lines, centering on the target line when applicable."""
+    body_lines = hunk.body.splitlines()
     if len(body_lines) <= HUNK_BODY_MAX_LINES:
         return body_lines
 
-    target_index = find_target_body_index(body_lines, note.target, range_line)
+    target_index: int | None = None
+    if isinstance(note.target, LineTarget):
+        body_indices = [i for i, line in enumerate(body_lines) if line]
+        for j, dl in enumerate(hunk.display_lines):
+            if dl.target == note.target and j < len(body_indices):
+                target_index = body_indices[j]
+                break
+
     if target_index is None:
         return [
             *body_lines[:HUNK_BODY_CONTEXT_LINES],
@@ -612,9 +726,8 @@ def trim_body_lines(
         ]
 
     half = HUNK_BODY_MAX_LINES // 2
-    start = max(0, target_index - half)
+    start = max(0, min(target_index - half, len(body_lines) - HUNK_BODY_MAX_LINES))
     end = min(len(body_lines), start + HUNK_BODY_MAX_LINES)
-    start = max(0, end - HUNK_BODY_MAX_LINES)
 
     trimmed: list[str] = []
     if start > 0:
@@ -625,75 +738,16 @@ def trim_body_lines(
     return trimmed
 
 
-def find_target_body_index(
-    body_lines: list[str],
-    target: NoteTarget,
-    range_line: str,
-) -> int | None:
-    """Find the body line index matching a LineTarget, or None for hunk targets."""
-    if not isinstance(target, LineTarget):
-        return None
-
-    match = HUNK_RANGE_LINE_RE.match(range_line)
-    if not match:
-        return None
-
-    old_num = int(match.group("old_start"))
-    new_num = int(match.group("new_start"))
-
-    for i, line in enumerate(body_lines):
-        if not line:
-            continue
-        prefix = line[0]
-        if prefix == "+":
-            if target.side is LineSide.ADDED and new_num == target.line_number:
-                return i
-            new_num += 1
-        elif prefix == "-":
-            if target.side is LineSide.REMOVED and old_num == target.line_number:
-                return i
-            old_num += 1
-        elif prefix != "\\":
-            old_num += 1
-            new_num += 1
-
-    return None
-
-
-def write_hunk_note_section(out: StringIO, hunk: Hunk, note: HunkNote) -> None:
-    """Write a single hunk note section to *out*."""
-    action = note.kind.value
-    target_str = format_note_target(note.target)
-    out.write(f"## [{action}] {hunk.file_path} @ {target_str}\n")
-
-    body_lines = hunk.body.splitlines()
-    trimmed = trim_body_lines(body_lines, note, hunk.range_line)
-
-    out.write("```diff\n")
-    out.write(f"{hunk.range_line}\n")
-    out.write("\n".join(trimmed))
-    out.write("\n```\n")
-
-    out.writelines(f"> {comment_line}\n" for comment_line in note.text.splitlines())
-    out.write("\n")
+def bitmap_byte_length(num_hunks: int) -> int:
+    """Return the number of bytes needed to store *num_hunks* approval bits."""
+    return (num_hunks + BITS_PER_BYTE - 1) // BITS_PER_BYTE
 
 
 def encode_approved_bitmap(hunks: list[Hunk]) -> str:
     """Encode the approved/pending state of *hunks* as a base64 string."""
-    bits = bytearray()
-    current_byte = 0
-    bit_index = 0
-    for hunk in hunks:
-        if hunk.approved:
-            current_byte |= 1 << bit_index
-        bit_index += 1
-        if bit_index == BITS_PER_BYTE:
-            bits.append(current_byte)
-            current_byte = 0
-            bit_index = 0
-    if bit_index:
-        bits.append(current_byte)
-    return base64.b64encode(bytes(bits)).decode("ascii")
+    n = bitmap_byte_length(len(hunks))
+    bits = sum(1 << i for i, h in enumerate(hunks) if h.approved)
+    return base64.b64encode(bits.to_bytes(n, "little")).decode("ascii")
 
 
 def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
@@ -704,17 +758,13 @@ def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
     match *num_hunks*.
     """
     try:
-        bits = base64.b64decode(encoded)
+        raw = base64.b64decode(encoded)
     except (ValueError, binascii.Error):
         return []
-    expected_bytes = (num_hunks + BITS_PER_BYTE - 1) // BITS_PER_BYTE
-    if len(bits) != expected_bytes:
+    if len(raw) != bitmap_byte_length(num_hunks):
         return []
-    result: list[bool] = []
-    for i in range(num_hunks):
-        byte_idx, bit_idx = divmod(i, BITS_PER_BYTE)
-        result.append(bool(bits[byte_idx] & (1 << bit_idx)))
-    return result
+    bits = int.from_bytes(raw, "little")
+    return [bool(bits & (1 << i)) for i in range(num_hunks)]
 
 
 def load_previous_review(
@@ -818,34 +868,9 @@ def apply_previous_review(
         hunk = lookup.get((file_path, range_line))
         if hunk is None:
             continue
-        upsert_note(hunk.notes, kind, target, text)
+        hunk.upsert_note(kind, target, text)
         matched += 1
     return matched
-
-
-def build_line_context(
-    display_lines: list[DisplayLine],
-    target: LineTarget,
-) -> list[str]:
-    """Build context lines around *target* for the editor comment template."""
-    target_idx: int | None = None
-    for i, dl in enumerate(display_lines):
-        if dl.target == target:
-            target_idx = i
-            break
-    if target_idx is None:
-        return []
-
-    start = max(0, target_idx - EDITOR_CONTEXT_RADIUS)
-    end = min(len(display_lines), target_idx + EDITOR_CONTEXT_RADIUS + 1)
-    window = display_lines[start:end]
-
-    lines: list[str] = []
-    for dl in window:
-        line_num = dl.new_line_number or dl.old_line_number or 0
-        marker = EDITOR_TARGET_MARKER if dl.target == target else EDITOR_CONTEXT_PAD
-        lines.append(f"# {marker} {line_num:>4} {dl.kind.value} {dl.text}")
-    return lines
 
 
 def write_comment_template(
@@ -905,28 +930,6 @@ def nonblocking_pipe() -> Iterator[tuple[int, int]]:
         os.close(write_fd)
 
 
-def find_next_unhandled_hunk(hunks: list[Hunk], current: int) -> int:
-    """
-    Find the next hunk with no review, wrapping around.
-
-    Returns *current* if every hunk has been handled.
-    """
-    n = len(hunks)
-    for offset in range(1, n + 1):
-        candidate = (current + offset) % n
-        if not hunk_is_handled(hunks[candidate]):
-            return candidate
-    return current
-
-
-def find_initial_hunk_index(hunks: list[Hunk]) -> int:
-    """Return the index of the first unhandled hunk, or 0."""
-    for i, hunk in enumerate(hunks):
-        if not hunk_is_handled(hunk):
-            return i
-    return 0
-
-
 def visible_len(text: str) -> int:
     """Return the visible character count of *text* (ignoring ANSI escapes)."""
     return len(ANSI_ESCAPE_TEXT_RE.sub("", text))
@@ -975,24 +978,6 @@ def wrap_plain_text(text: str, max_width: int) -> list[str]:
     if current:
         lines.append(current)
     return lines
-
-
-def compute_visible_count(
-    total_lines: int,
-    max_available_rows: int,
-    scroll_offset: int,
-) -> tuple[int, bool, bool]:
-    """Compute visible diff lines and scroll indicators for *scroll_offset*."""
-    can_scroll_up = scroll_offset > 0
-    rows_with_both_indicators = max_available_rows - (1 if can_scroll_up else 0) - 1
-    available_rows = max(rows_with_both_indicators, MIN_VISIBLE_ROWS)
-    visible_count = min(available_rows, total_lines - scroll_offset)
-    can_scroll_down = scroll_offset + visible_count < total_lines
-    if not can_scroll_down:
-        rows_without_down_indicator = max_available_rows - (1 if can_scroll_up else 0)
-        available_rows = max(rows_without_down_indicator, MIN_VISIBLE_ROWS)
-        visible_count = min(available_rows, total_lines - scroll_offset)
-    return visible_count, can_scroll_up, can_scroll_down
 
 
 def update_active_sgr(esc: str, active_sgr: list[str]) -> None:
@@ -1046,52 +1031,32 @@ def wrap_ansi_line_to_rows(line: bytes, term_width: int) -> list[bytes]:
     return [chunk.encode("utf-8", errors="replace") for chunk in chunks]
 
 
-def build_margin_markers(hunk: Hunk) -> list[bytes] | None:
-    """Build margin marker bytes, or None if the hunk has no line notes."""
-    has_line_notes = any(isinstance(note.target, LineTarget) for note in hunk.notes)
-    if not has_line_notes:
-        return None
-    markers: list[bytes] = []
-    for dl in hunk.display_lines:
-        if dl.target and get_note_for_target(hunk.notes, dl.target):
-            markers.append(f"{MARGIN_NOTE_MARKER} ".encode())
-        else:
-            markers.append(MARGIN_EMPTY)
-    return markers
-
-
-def has_any_line_notes(hunk: Hunk) -> bool:
-    """Return whether the hunk has any line-level notes."""
-    return any(isinstance(n.target, LineTarget) for n in hunk.notes)
-
-
-def build_line_picker_margins(
+def build_margin_markers(
     hunk: Hunk,
-    selected_target: LineTarget | None,
-) -> tuple[list[bytes], int | None]:
-    """Build margin markers and highlight index for the line picker."""
+    selected_target: LineTarget | None = None,
+) -> tuple[list[bytes] | None, int | None]:
+    """
+    Build margin marker bytes and optional highlight index.
+
+    Returns ``(None, None)`` when the hunk has no line notes and no
+    *selected_target*.  When *selected_target* is given the markers are
+    always built so the line picker can display them.
+    """
+    has_line_notes = any(isinstance(n.target, LineTarget) for n in hunk.notes)
+    if not has_line_notes and selected_target is None:
+        return None, None
+
     markers: list[bytes] = []
     highlight_index: int | None = None
     for i, dl in enumerate(hunk.display_lines):
-        if dl.target is not None and dl.target == selected_target:
+        if selected_target is not None and dl.target == selected_target:
             highlight_index = i
             markers.append(MARGIN_EMPTY)
-        elif dl.target and get_note_for_target(hunk.notes, dl.target):
+        elif dl.target and hunk.get_note(dl.target):
             markers.append(f"{MARGIN_NOTE_MARKER} ".encode())
         else:
             markers.append(MARGIN_EMPTY)
     return markers, highlight_index
-
-
-def find_display_line_index(
-    all_display_lines: list[DisplayLine],
-    target_line: DisplayLine,
-) -> int | None:
-    """Find the source display line index corresponding to *target_line*."""
-    for i, dl in enumerate(all_display_lines):
-        if dl is target_line:
-            return i
-    return None
 
 
 def initial_line_picker_cursor(
@@ -1101,7 +1066,7 @@ def initial_line_picker_cursor(
 ) -> int:
     """Return the selectable index of the first line at or after *scroll_offset*."""
     for cursor, dl in enumerate(selectable):
-        idx = find_display_line_index(hunk.display_lines, dl)
+        idx = next((i for i, d in enumerate(hunk.display_lines) if d is dl), None)
         if idx is not None and idx >= scroll_offset:
             return cursor
     return 0
@@ -1170,11 +1135,16 @@ def compute_diff_viewport(
     else:
         max_offset = max(0, total_lines - (max_avail - SCROLL_INDICATOR_ROWS))
         scroll_offset = min(scroll_offset, max_offset)
-        visible_count, can_scroll_up, can_scroll_down = compute_visible_count(
-            total_lines,
-            max_avail,
-            scroll_offset,
-        )
+
+        can_scroll_up = scroll_offset > 0
+        rows_with_both = max_avail - (1 if can_scroll_up else 0) - 1
+        available_rows = max(rows_with_both, MIN_VISIBLE_ROWS)
+        visible_count = min(available_rows, total_lines - scroll_offset)
+        can_scroll_down = scroll_offset + visible_count < total_lines
+        if not can_scroll_down:
+            rows_without_down = max_avail - (1 if can_scroll_up else 0)
+            available_rows = max(rows_without_down, MIN_VISIBLE_ROWS)
+            visible_count = min(available_rows, total_lines - scroll_offset)
 
     lines_above = scroll_offset
     lines_below = total_lines - scroll_offset - visible_count
@@ -1216,36 +1186,19 @@ def build_top_bar_counters(
     global_notes: list[GlobalNote],
 ) -> str:
     """Build the compact note-count segment for the top bar."""
-    all_notes = collect_actionable_notes(hunks)
-    hunk_flags = sum(
-        1
-        for _, n in all_notes
-        if isinstance(n.target, HunkTarget) and n.kind is NoteKind.FLAG
+    counts: Counter[tuple[type, NoteKind]] = Counter(
+        (type(note.target), note.kind) for hunk in hunks for note in hunk.notes
     )
-    hunk_questions = sum(
-        1
-        for _, n in all_notes
-        if isinstance(n.target, HunkTarget) and n.kind is NoteKind.QUESTION
-    )
-    line_flags = sum(
-        1
-        for _, n in all_notes
-        if isinstance(n.target, LineTarget) and n.kind is NoteKind.FLAG
-    )
-    line_questions = sum(
-        1
-        for _, n in all_notes
-        if isinstance(n.target, LineTarget) and n.kind is NoteKind.QUESTION
-    )
-    global_flags = sum(1 for n in global_notes if n.kind is NoteKind.FLAG)
-    global_questions = sum(1 for n in global_notes if n.kind is NoteKind.QUESTION)
-
+    global_counts: Counter[NoteKind] = Counter(n.kind for n in global_notes)
     hunk_approved = sum(1 for h in hunks if h.approved)
 
     parts = [
-        f"global ✗ {global_flags} ? {global_questions}",
-        f"hunk ✓ {hunk_approved} ✗ {hunk_flags} ? {hunk_questions}",
-        f"line ✗ {line_flags} ? {line_questions}",
+        f"global ✗ {global_counts[NoteKind.FLAG]} ? {global_counts[NoteKind.QUESTION]}",
+        f"hunk ✓ {hunk_approved}"
+        f" ✗ {counts[(HunkTarget, NoteKind.FLAG)]}"
+        f" ? {counts[(HunkTarget, NoteKind.QUESTION)]}",
+        f"line ✗ {counts[(LineTarget, NoteKind.FLAG)]}"
+        f" ? {counts[(LineTarget, NoteKind.QUESTION)]}",
     ]
     return "  │ " + " │ ".join(parts)
 
@@ -1254,7 +1207,7 @@ def hunk_marker(hunk: Hunk, *, is_current: bool) -> str:
     """Return the ANSI-styled marker for a single hunk (3 visible chars)."""
     icon = "·"
     color = DIM
-    status = hunk_summary_status(hunk)
+    status = hunk.summary_status
     if status == Status.APPROVED:
         icon, color = "✓", GREEN
     elif status == Status.FLAG:
@@ -1328,17 +1281,10 @@ def build_progress_markers(
     return prefix + left + "".join(markers) + right
 
 
-def build_footer_line(term_width: int) -> str:
-    """Build a key-hints footer line truncated to *term_width* visible chars."""
-    segments = [
-        ("j/k", "navigate"),
-        ("a/A", "approve hunk/file"),
-        ("c/f", "question/flag"),
-        ("gc/gf", "global"),
-        ("m", "manage notes"),
-        ("q", "quit & save"),
-        ("?", "help"),
-    ]
+def build_keyhint_footer(
+    segments: list[tuple[str, str]], term_width: int, *, ellipsis: bool = False
+) -> str:
+    """Build a key-hints footer from *segments*, truncated to *term_width*."""
     parts: list[str] = []
     used = 0
     truncated = False
@@ -1351,25 +1297,10 @@ def build_footer_line(term_width: int) -> str:
             break
         parts.append(segment)
         used += segment_width
-    if truncated and used < term_width:
+    if ellipsis and truncated and used < term_width:
         padding = term_width - used - len(TRUNCATION_ELLIPSIS)
         if padding >= 0:
             parts.append(f"{' ' * padding}{DIM}{TRUNCATION_ELLIPSIS}{RESET}")
-    return "".join(parts)
-
-
-def build_line_picker_footer(term_width: int) -> str:
-    """Build the footer line for the line picker mode."""
-    parts: list[str] = []
-    used = 0
-    for i, (key, label) in enumerate(LINE_PICKER_FOOTER_SEGMENTS):
-        sep = "  " if i > 0 else ""
-        segment = f"{sep}{DIM}{key}{RESET} {label}"
-        segment_width = visible_len(segment)
-        if used + segment_width > term_width:
-            break
-        parts.append(segment)
-        used += segment_width
     return "".join(parts)
 
 
@@ -1380,20 +1311,15 @@ NOTE_PANEL_FOOTER_SEGMENTS = [
     ("Esc", "back"),
 ]
 
-
-def build_note_panel_footer(term_width: int) -> str:
-    """Build the key-hints footer for the note management panel."""
-    parts: list[str] = []
-    used = 0
-    for i, (key, label) in enumerate(NOTE_PANEL_FOOTER_SEGMENTS):
-        sep = "  " if i > 0 else ""
-        segment = f"{sep}{DIM}{key}{RESET} {label}"
-        segment_width = visible_len(segment)
-        if used + segment_width > term_width:
-            break
-        parts.append(segment)
-        used += segment_width
-    return "".join(parts)
+MAIN_FOOTER_SEGMENTS = [
+    ("j/k", "navigate"),
+    ("a/A", "approve hunk/file"),
+    ("c/f", "question/flag"),
+    ("gc/gf", "global"),
+    ("m", "manage notes"),
+    ("q", "quit & save"),
+    ("?", "help"),
+]
 
 
 def build_note_panel_header(note_count: int, term_width: int) -> str:
@@ -1426,54 +1352,6 @@ def compute_note_panel_height(note_count: int, term_height: int) -> int:
     max_panel = max(NOTE_PANEL_MIN_HEIGHT, term_height // NOTE_PANEL_MAX_FRACTION)
     content_rows = max(note_count, 1)
     return min(content_rows + NOTE_PANEL_CHROME_ROWS, max_panel)
-
-
-def build_managed_note_refs(state: ReviewState) -> list[ManagedNoteRef]:
-    """Build a flat list of note references for the manage-notes panel."""
-    refs: list[ManagedNoteRef] = []
-    for hunk in state.hunks:
-        for note in hunk.notes:
-            target_str = format_note_target(note.target)
-            label = f"{hunk.short_location} @ {target_str}"
-            refs.append(
-                ManagedNoteRef(scope_label=label, text=note.text, kind=note.kind)
-            )
-    refs.extend(
-        ManagedNoteRef(scope_label=GLOBAL_TARGET, text=gnote.text, kind=gnote.kind)
-        for gnote in state.global_notes
-    )
-    return refs
-
-
-def handle_approve(state: ReviewState) -> None:
-    """Toggle approval on the current hunk, ignoring hunks that have notes."""
-    hunk = state.hunks[state.current_index]
-    if hunk.approved:
-        hunk.approved = False
-    elif not hunk.notes:
-        hunk.approved = True
-        state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
-
-
-def handle_approve_file(state: ReviewState) -> None:
-    """Approve all note-free hunks belonging to the same file as the current hunk."""
-    current_file = state.hunks[state.current_index].file_path
-    for hunk in state.hunks:
-        if hunk.file_path == current_file and not hunk.approved and not hunk.notes:
-            hunk.approved = True
-    state.current_index = find_next_unhandled_hunk(state.hunks, state.current_index)
-
-
-def handle_navigation(key: str, state: ReviewState) -> bool:
-    """Handle navigation keys (j/k/arrows), returning True if index changed."""
-    if key in ("j", "down"):
-        if state.current_index < len(state.hunks) - 1:
-            state.current_index += 1
-            return True
-    elif key in ("k", "up") and state.current_index > 0:
-        state.current_index -= 1
-        return True
-    return False
 
 
 def drain_fd(fd: int) -> None:
@@ -1676,7 +1554,7 @@ class Terminal:
     ) -> int:
         """Render the full review screen and return the clamped scroll offset."""
         hunk = hunks[current_index]
-        margins = build_margin_markers(hunk)
+        margins, _ = build_margin_markers(hunk)
         diff_lines = build_display_lines(delta_output, self.width, margins)
         viewport = compute_diff_viewport(len(diff_lines), self.height, scroll_offset)
 
@@ -1710,7 +1588,9 @@ class Terminal:
             self.write(line)
             self.write(b"\r\n")
 
-    def render_footer(self, viewport: DiffViewport) -> None:
+    def render_footer(
+        self, viewport: DiffViewport, footer_text: str | None = None
+    ) -> None:
         """Render the scroll-down indicator and bottom key hints."""
         if viewport.can_scroll_down:
             self.write(f"{CSI}{self.height - 1};1H")
@@ -1720,8 +1600,11 @@ class Terminal:
             )
 
         self.write(f"{CSI}{self.height};1H")
-        footer = build_footer_line(self.width)
-        self.write(footer)
+        if footer_text is None:
+            footer_text = build_keyhint_footer(
+                MAIN_FOOTER_SEGMENTS, self.width, ellipsis=True
+            )
+        self.write(footer_text)
 
     def render_help_screen(self) -> None:
         """Display the keyboard shortcuts help overlay."""
@@ -1779,19 +1662,12 @@ class Terminal:
     def write_box_rows(self, width: int, rows: list[str]) -> None:
         """Write a sequence of bordered rows, treating empty strings as blanks."""
         for row in rows:
-            if row:
-                self.write_box_row(width, row)
-            else:
-                self.write_box_empty_row(width)
+            self.write_box_row(width, row)
 
-    def write_box_row(self, width: int, text: str) -> None:
+    def write_box_row(self, width: int, text: str = "") -> None:
         """Write one bordered row padded to *width*."""
         pad = width - visible_len(text)
         self.write(f"│{text}{' ' * pad}│\r\n")
-
-    def write_box_empty_row(self, width: int) -> None:
-        """Write one empty bordered row with *width* inner cells."""
-        self.write(f"│{' ' * width}│\r\n")
 
     def handle_manage_notes(self, state: ReviewState) -> None:
         """Interactive panel to manage all notes with cursor navigation."""
@@ -1799,7 +1675,7 @@ class Terminal:
         hunk = state.hunks[state.current_index]
         delta_output = render_through_delta(hunk.raw, width=self.width)
         while True:
-            refs = build_managed_note_refs(state)
+            refs = state.managed_note_refs()
             if refs:
                 panel.cursor = min(panel.cursor, len(refs) - 1)
             else:
@@ -1822,10 +1698,10 @@ class Terminal:
             elif key in ("k", "up") and refs:
                 panel.cursor = max(panel.cursor - 1, 0)
             elif key in ("e", "\r") and refs:
-                self.edit_managed_note(state, refs[panel.cursor])
+                self.modify_managed_note(state, refs[panel.cursor], edit=True)
                 tty.setraw(self.fd)
             elif key == "d" and refs:
-                self.delete_managed_note(state, refs[panel.cursor])
+                self.modify_managed_note(state, refs[panel.cursor], edit=False)
 
     def render_note_panel(
         self,
@@ -1851,7 +1727,7 @@ class Terminal:
         self.render_note_panel_rows(refs, panel, content_rows)
 
         self.write(f"{CSI}{self.height};1H")
-        self.write(build_note_panel_footer(self.width))
+        self.write(build_keyhint_footer(NOTE_PANEL_FOOTER_SEGMENTS, self.width))
 
     def render_note_panel_diff(
         self,
@@ -1861,7 +1737,7 @@ class Terminal:
     ) -> None:
         """Render the reduced-height diff above the note panel."""
         hunk = state.hunks[state.current_index]
-        margins = build_margin_markers(hunk)
+        margins, _ = build_margin_markers(hunk)
         diff_lines = build_display_lines(delta_output, self.width, margins)
         top_bar = build_top_bar(
             hunk,
@@ -1914,126 +1790,75 @@ class Terminal:
                 + "\r\n"
             )
 
-    def edit_managed_note(
+    def modify_managed_note(
         self,
         state: ReviewState,
         ref: ManagedNoteRef,
+        *,
+        edit: bool,
     ) -> None:
         """Edit or delete the note identified by *ref*."""
-        for hunk in state.hunks:
-            for note in hunk.notes:
-                target_str = format_note_target(note.target)
-                label = f"{hunk.short_location} @ {target_str}"
-                if (
-                    label == ref.scope_label
-                    and note.text == ref.text
-                    and note.kind == ref.kind
-                ):
-                    kind_label = (
-                        "flag (explain what change is needed)"
-                        if ref.kind is NoteKind.FLAG
-                        else "question (agent will answer, not change code)"
-                    )
-                    ctx = (
-                        build_line_context(hunk.display_lines, note.target)
-                        if isinstance(note.target, LineTarget)
-                        else None
-                    )
-                    new_text = self.edit_text_outside_tui(note.text, kind_label, ctx)
-                    if new_text:
-                        note.text = new_text
-                    else:
-                        hunk.notes.remove(note)
-                    return
+        found = state.find_note_by_ref(ref)
+        if found is None:
+            return
 
-        for gnote in state.global_notes:
-            if (
-                gnote.text == ref.text
-                and gnote.kind == ref.kind
-                and ref.scope_label == GLOBAL_TARGET
-            ):
-                kind_label = (
-                    "global change request"
-                    if ref.kind is NoteKind.FLAG
-                    else "global question (agent answers, no code change)"
+        if isinstance(found, GlobalNote):
+            if edit:
+                new_text = self.edit_text_outside_tui(
+                    found.text, ref.kind.global_editor_label
                 )
-                new_text = self.edit_text_outside_tui(gnote.text, kind_label)
                 if new_text:
-                    gnote.text = new_text
-                else:
-                    state.global_notes.remove(gnote)
-                return
-
-    def delete_managed_note(
-        self,
-        state: ReviewState,
-        ref: ManagedNoteRef,
-    ) -> None:
-        """Delete the note identified by *ref*."""
-        for hunk in state.hunks:
-            for note in hunk.notes:
-                target_str = format_note_target(note.target)
-                label = f"{hunk.short_location} @ {target_str}"
-                if (
-                    label == ref.scope_label
-                    and note.text == ref.text
-                    and note.kind == ref.kind
-                ):
-                    hunk.notes.remove(note)
+                    found.text = new_text
                     return
+            state.global_notes.remove(found)
+            return
 
-        for gnote in state.global_notes:
-            if (
-                gnote.text == ref.text
-                and gnote.kind == ref.kind
-                and ref.scope_label == GLOBAL_TARGET
-            ):
-                state.global_notes.remove(gnote)
+        hunk, note = found
+        if edit:
+            ctx = (
+                hunk.build_line_context(note.target)
+                if isinstance(note.target, LineTarget)
+                else None
+            )
+            new_text = self.edit_text_outside_tui(note.text, ref.kind.editor_label, ctx)
+            if new_text:
+                note.text = new_text
                 return
+        hunk.notes.remove(note)
 
     def handle_hunk_comment(self, state: ReviewState, key: str) -> None:
         """Handle ``c`` (question) or ``f`` (flag) with target selection."""
         hunk = state.hunks[state.current_index]
         kind = NoteKind.FLAG if key == "f" else NoteKind.QUESTION
-        selectable = [dl for dl in hunk.display_lines if dl.target is not None]
 
         target: NoteTarget | None = (
-            self.pick_line_target(state) if selectable else HunkTarget()
+            self.pick_line_target(state)
+            if any(dl.target is not None for dl in hunk.display_lines)
+            else HunkTarget()
         )
 
         if target is None:
             return
 
-        existing = get_note_for_target(hunk.notes, target)
+        existing = hunk.get_note(target)
         existing_text = existing.text if existing else ""
 
-        label = (
-            "flag (explain what change is needed)"
-            if kind is NoteKind.FLAG
-            else "question (agent will answer, not change code)"
-        )
-        target_label = format_note_target(target)
         ctx = (
-            build_line_context(hunk.display_lines, target)
-            if isinstance(target, LineTarget)
-            else None
+            hunk.build_line_context(target) if isinstance(target, LineTarget) else None
         )
         comment = self.edit_text_outside_tui(
             existing_text,
-            f"{hunk.short_location} @ {target_label} [{label}]",
+            f"{hunk.short_location} @ {target} [{kind.editor_label}]",
             ctx,
         )
 
         if comment:
-            upsert_note(hunk.notes, kind, target, comment)
+            hunk.upsert_note(kind, target, comment)
             hunk.approved = False
             if isinstance(target, HunkTarget):
-                state.current_index = find_next_unhandled_hunk(
-                    state.hunks,
-                    state.current_index,
-                )
+                state.current_index = state.find_next_unhandled()
         elif existing:
-            remove_note_for_target(hunk.notes, target)
+            hunk.remove_note(target)
 
     def pick_line_target(self, state: ReviewState) -> NoteTarget | None:
         """Display a full-screen delta line picker and return the chosen target."""
@@ -2086,16 +1911,15 @@ class Terminal:
         """Render full-screen line picker with delta formatting."""
         hunk = state.hunks[state.current_index]
         selected_target = selectable[cursor].target
-        margins, highlight_idx = build_line_picker_margins(hunk, selected_target)
-        margin_markers = margins if has_any_line_notes(hunk) else None
+        margin_markers, highlight_idx = build_margin_markers(hunk, selected_target)
         diff_lines = build_display_lines(
             delta_output, self.width, margin_markers, highlight_index=highlight_idx
         )
 
         # Ensure cursor line is visible
-        cursor_idx = find_display_line_index(
-            hunk.display_lines,
-            selectable[cursor],
+        cursor_idx = next(
+            (i for i, dl in enumerate(hunk.display_lines) if dl is selectable[cursor]),
+            None,
         )
         if cursor_idx is not None:
             visible = self.height - CHROME_ROWS - SCROLL_INDICATOR_ROWS
@@ -2124,32 +1948,15 @@ class Terminal:
             + "\r\n"
         )
         self.render_diff_body(diff_lines, viewport)
-        self.render_line_picker_footer(viewport)
+        picker_footer = build_keyhint_footer(LINE_PICKER_FOOTER_SEGMENTS, self.width)
+        self.render_footer(viewport, picker_footer)
         return viewport.scroll_offset
-
-    def render_line_picker_footer(self, viewport: DiffViewport) -> None:
-        """Render the footer for line picker mode."""
-        if viewport.can_scroll_down:
-            self.write(f"{CSI}{self.height - 1};1H")
-            self.write(
-                f"  {BOLD}{WHITE}▼ Ctrl-D to scroll down "
-                f"({viewport.lines_below} lines below){RESET}",
-            )
-
-        self.write(f"{CSI}{self.height};1H")
-        self.write(build_line_picker_footer(self.width))
 
     def handle_global_note(self, state: ReviewState, key: str) -> None:
         """Handle ``gc`` (global question) or ``gf`` (global flag)."""
-        is_flag = key == "f"
-        label = (
-            "global change request"
-            if is_flag
-            else "global question (agent answers, no code change)"
-        )
-        text = self.edit_text_outside_tui("", label)
+        kind = NoteKind.FLAG if key == "f" else NoteKind.QUESTION
+        text = self.edit_text_outside_tui("", kind.global_editor_label)
         if text:
-            kind = NoteKind.FLAG if is_flag else NoteKind.QUESTION
             state.global_notes.append(GlobalNote(kind=kind, text=text))
 
     def handle_scroll(
@@ -2179,14 +1986,14 @@ class Terminal:
         if self.handle_scroll(key, state, redraw):
             return False
 
-        if handle_navigation(key, state):
+        if state.navigate(key):
             state.scroll_offset = 0
             return True
 
         if key == "a":
-            handle_approve(state)
+            state.approve()
         elif key == "A":
-            handle_approve_file(state)
+            state.approve_file()
         elif key in ("c", "f"):
             self.handle_hunk_comment(state, key)
         elif key == "g":
@@ -2391,7 +2198,7 @@ def main() -> None:
     state = ReviewState(
         hunks=hunks,
         global_notes=global_notes,
-        current_index=find_initial_hunk_index(hunks),
+        current_index=ReviewState.initial_index(hunks),
     )
 
     with Terminal() as term:
