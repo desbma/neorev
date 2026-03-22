@@ -69,6 +69,7 @@ RED = f"{CSI}31m"
 YELLOW = f"{CSI}33m"
 CYAN = f"{CSI}36m"
 BG_BLUE = f"{CSI}44m"
+BG_CHROME = f"{CSI}40m"
 WHITE = f"{CSI}37m"
 REVERSE = f"{CSI}7m"
 
@@ -1160,6 +1161,13 @@ def compute_diff_viewport(
     )
 
 
+def chrome_line(text: str, term_width: int) -> str:
+    """Wrap *text* with the chrome background, padded to *term_width*."""
+    bg_text = BG_CHROME + text.replace(RESET, RESET + BG_CHROME)
+    pad = max(0, term_width - visible_len(text))
+    return bg_text + " " * pad + RESET
+
+
 def build_top_bar(
     hunk: Hunk,
     current_index: int,
@@ -1561,9 +1569,10 @@ class Terminal:
         self.write(self.CLEAR_SCREEN)
 
         top_bar = build_top_bar(hunk, current_index, hunks, global_notes, self.width)
-        self.write(top_bar + "\r\n")
+        self.write(chrome_line(top_bar, self.width) + "\r\n")
 
-        self.write(build_progress_markers(hunks, current_index, self.width) + "\r\n")
+        markers = build_progress_markers(hunks, current_index, self.width)
+        self.write(chrome_line(markers, self.width) + "\r\n")
 
         self.render_diff_body(diff_lines, viewport)
         self.render_footer(viewport)
@@ -1604,7 +1613,7 @@ class Terminal:
             footer_text = build_keyhint_footer(
                 MAIN_FOOTER_SEGMENTS, self.width, ellipsis=True
             )
-        self.write(footer_text)
+        self.write(chrome_line(footer_text, self.width))
 
     def render_help_screen(self) -> None:
         """Display the keyboard shortcuts help overlay."""
@@ -1654,10 +1663,10 @@ class Terminal:
         ]
         width = max(visible_len(row) for row in rows) + right_margin
         border = "─" * width
-        self.write(f"┌{border}┐\r\n")
-        self.write(f"├{border}┤\r\n")
+        self.write(chrome_line(f"┌{border}┐", self.width) + "\r\n")
+        self.write(chrome_line(f"├{border}┤", self.width) + "\r\n")
         self.write_box_rows(width, rows)
-        self.write(f"└{border}┘\r\n")
+        self.write(chrome_line(f"└{border}┘", self.width) + "\r\n")
 
     def write_box_rows(self, width: int, rows: list[str]) -> None:
         """Write a sequence of bordered rows, treating empty strings as blanks."""
@@ -1667,7 +1676,7 @@ class Terminal:
     def write_box_row(self, width: int, text: str = "") -> None:
         """Write one bordered row padded to *width*."""
         pad = width - visible_len(text)
-        self.write(f"│{text}{' ' * pad}│\r\n")
+        self.write(chrome_line(f"│{text}{' ' * pad}│", self.width) + "\r\n")
 
     def handle_manage_notes(self, state: ReviewState) -> None:
         """Interactive panel to manage all notes with cursor navigation."""
@@ -1721,13 +1730,15 @@ class Terminal:
 
         panel_top = self.height - panel_height + 1
         self.write(f"{CSI}{panel_top};1H")
-        self.write(build_note_panel_header(len(refs), self.width) + "\r\n")
+        header = build_note_panel_header(len(refs), self.width)
+        self.write(chrome_line(header, self.width) + "\r\n")
 
         content_rows = panel_height - NOTE_PANEL_CHROME_ROWS
         self.render_note_panel_rows(refs, panel, content_rows)
 
         self.write(f"{CSI}{self.height};1H")
-        self.write(build_keyhint_footer(NOTE_PANEL_FOOTER_SEGMENTS, self.width))
+        footer = build_keyhint_footer(NOTE_PANEL_FOOTER_SEGMENTS, self.width)
+        self.write(chrome_line(footer, self.width))
 
     def render_note_panel_diff(
         self,
@@ -1746,11 +1757,9 @@ class Terminal:
             state.global_notes,
             self.width,
         )
-        self.write(top_bar + "\r\n")
-        self.write(
-            build_progress_markers(state.hunks, state.current_index, self.width)
-            + "\r\n"
-        )
+        self.write(chrome_line(top_bar, self.width) + "\r\n")
+        markers = build_progress_markers(state.hunks, state.current_index, self.width)
+        self.write(chrome_line(markers, self.width) + "\r\n")
         max_lines = diff_height - NOTE_PANEL_DIFF_CHROME_ROWS
         start = min(state.scroll_offset, max(0, len(diff_lines) - max_lines))
         end = start + max_lines
@@ -1765,10 +1774,11 @@ class Terminal:
         content_rows: int,
     ) -> None:
         """Render the scrollable note list inside the panel."""
+        empty_chrome = chrome_line("", self.width)
         if not refs:
-            self.write(f"  {DIM}No notes yet.{RESET}\r\n")
+            self.write(chrome_line(f"  {DIM}No notes yet.{RESET}", self.width) + "\r\n")
             for _ in range(content_rows - 1):
-                self.write("\r\n")
+                self.write(empty_chrome + "\r\n")
             return
 
         if panel.cursor < panel.scroll_offset:
@@ -1779,16 +1789,14 @@ class Terminal:
         for i in range(content_rows):
             idx = panel.scroll_offset + i
             if idx >= len(refs):
-                self.write("\r\n")
+                self.write(empty_chrome + "\r\n")
                 continue
-            self.write(
-                build_note_panel_row(
-                    refs[idx],
-                    selected=idx == panel.cursor,
-                    term_width=self.width,
-                )
-                + "\r\n"
+            row = build_note_panel_row(
+                refs[idx],
+                selected=idx == panel.cursor,
+                term_width=self.width,
             )
+            self.write(chrome_line(row, self.width) + "\r\n")
 
     def modify_managed_note(
         self,
@@ -1942,11 +1950,9 @@ class Terminal:
             state.global_notes,
             self.width,
         )
-        self.write(top_bar + "\r\n")
-        self.write(
-            build_progress_markers(state.hunks, state.current_index, self.width)
-            + "\r\n"
-        )
+        self.write(chrome_line(top_bar, self.width) + "\r\n")
+        markers = build_progress_markers(state.hunks, state.current_index, self.width)
+        self.write(chrome_line(markers, self.width) + "\r\n")
         self.render_diff_body(diff_lines, viewport)
         picker_footer = build_keyhint_footer(LINE_PICKER_FOOTER_SEGMENTS, self.width)
         self.render_footer(viewport, picker_footer)
