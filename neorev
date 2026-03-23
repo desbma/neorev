@@ -71,6 +71,7 @@ CYAN = f"{CSI}36m"
 BG_BLUE = f"{CSI}44m"
 BG_CHROME = f"{CSI}40m"
 WHITE = f"{CSI}37m"
+BG_YELLOW_BLACK = f"{CSI}43;30m"
 REVERSE = f"{CSI}7m"
 
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -102,11 +103,10 @@ NOTE_PANEL_CHROME_ROWS = 2  # header + footer
 NOTE_PANEL_MIN_HEIGHT = 3  # chrome + at least 1 note row
 NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
 NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
-MARGIN_NOTE_MARKER = "✎"
+QUESTION_ICON = "󰠗"
+FLAG_ICON = "󰅽"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = b"  "
-REVERSE_BYTES = REVERSE.encode()
-RESET_BYTES = RESET.encode()
 ANSI_ESCAPE_BYTES_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 HUNK_RANGE_LINE_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@"
@@ -156,6 +156,13 @@ class NoteKind(enum.Enum):
 
     FLAG = "CHANGE REQUESTED"
     QUESTION = "QUESTION"
+
+    @property
+    def icon(self) -> str:
+        """Return the Nerd Font icon for this note kind."""
+        if self is NoteKind.FLAG:
+            return FLAG_ICON
+        return QUESTION_ICON
 
     @property
     def editor_label(self) -> str:
@@ -1053,8 +1060,8 @@ def build_margin_markers(
         if selected_target is not None and dl.target == selected_target:
             highlight_index = i
             markers.append(MARGIN_EMPTY)
-        elif dl.target and hunk.get_note(dl.target):
-            markers.append(f"{MARGIN_NOTE_MARKER} ".encode())
+        elif dl.target and (note := hunk.get_note(dl.target)):
+            markers.append(f"{note.kind.icon} ".encode())
         else:
             markers.append(MARGIN_EMPTY)
     return markers, highlight_index
@@ -1078,6 +1085,7 @@ def build_display_lines(
     term_width: int,
     margin_markers: list[bytes] | None = None,
     highlight_index: int | None = None,
+    highlight_escape: bytes = REVERSE.encode(),
 ) -> list[bytes]:
     """Return physical terminal rows for rendered diff output."""
     raw_lines = delta_output.split(b"\n")
@@ -1105,10 +1113,12 @@ def build_display_lines(
                 prefix = margin if j == 0 else MARGIN_EMPTY
                 row = prefix + segment
                 if highlighted:
-                    row = REVERSE_BYTES + row + RESET_BYTES
+                    row = highlight_escape + row + RESET.encode()
                 display_lines.append(row)
         elif highlighted:
-            display_lines.extend(REVERSE_BYTES + seg + RESET_BYTES for seg in wrapped)
+            display_lines.extend(
+                highlight_escape + seg + RESET.encode() for seg in wrapped
+            )
         else:
             display_lines.extend(wrapped)
 
@@ -1198,15 +1208,13 @@ def build_top_bar_counters(
         (type(note.target), note.kind) for hunk in hunks for note in hunk.notes
     )
     global_counts: Counter[NoteKind] = Counter(n.kind for n in global_notes)
-    hunk_approved = sum(1 for h in hunks if h.approved)
-
     parts = [
-        f"global ✗ {global_counts[NoteKind.FLAG]} ? {global_counts[NoteKind.QUESTION]}",
-        f"hunk ✓ {hunk_approved}"
-        f" ✗ {counts[(HunkTarget, NoteKind.FLAG)]}"
-        f" ? {counts[(HunkTarget, NoteKind.QUESTION)]}",
-        f"line ✗ {counts[(LineTarget, NoteKind.FLAG)]}"
-        f" ? {counts[(LineTarget, NoteKind.QUESTION)]}",
+        f"global {NoteKind.FLAG.icon} {global_counts[NoteKind.FLAG]}"
+        f" {NoteKind.QUESTION.icon} {global_counts[NoteKind.QUESTION]}",
+        f"hunk {NoteKind.FLAG.icon} {counts[(HunkTarget, NoteKind.FLAG)]}"
+        f" {NoteKind.QUESTION.icon} {counts[(HunkTarget, NoteKind.QUESTION)]}",
+        f"line {NoteKind.FLAG.icon} {counts[(LineTarget, NoteKind.FLAG)]}"
+        f" {NoteKind.QUESTION.icon} {counts[(LineTarget, NoteKind.QUESTION)]}",
     ]
     return "  │ " + " │ ".join(parts)
 
@@ -1840,7 +1848,7 @@ class Terminal:
         kind = NoteKind.FLAG if key == "f" else NoteKind.QUESTION
 
         target: NoteTarget | None = (
-            self.pick_line_target(state)
+            self.pick_line_target(state, kind)
             if any(dl.target is not None for dl in hunk.display_lines)
             else HunkTarget()
         )
@@ -1868,7 +1876,7 @@ class Terminal:
         elif existing:
             hunk.remove_note(target)
 
-    def pick_line_target(self, state: ReviewState) -> NoteTarget | None:
+    def pick_line_target(self, state: ReviewState, kind: NoteKind) -> NoteTarget | None:
         """Display a full-screen delta line picker and return the chosen target."""
         hunk = state.hunks[state.current_index]
         selectable = [dl for dl in hunk.display_lines if dl.target is not None]
@@ -1877,6 +1885,9 @@ class Terminal:
 
         cursor = initial_line_picker_cursor(selectable, hunk, state.scroll_offset)
         scroll = state.scroll_offset
+        highlight = (
+            BG_YELLOW_BLACK.encode() if kind is NoteKind.FLAG else REVERSE.encode()
+        )
         delta_output = render_through_delta(
             hunk.raw,
             width=self.width,
@@ -1888,6 +1899,7 @@ class Terminal:
                 cursor,
                 delta_output,
                 scroll,
+                highlight_escape=highlight,
             )
             key = self.read_key(wakeup_read_fd=self.wakeup_read_fd)
             if key == self.KEY_RESIZE:
@@ -1908,20 +1920,26 @@ class Terminal:
             elif key == LINE_PICKER_SELECT_KEY:
                 return selectable[cursor].target
 
-    def render_line_picker(
+    def render_line_picker(  # noqa: PLR0913
         self,
         state: ReviewState,
         selectable: list[DisplayLine],
         cursor: int,
         delta_output: bytes,
         scroll_offset: int,
+        *,
+        highlight_escape: bytes = REVERSE.encode(),
     ) -> int:
         """Render full-screen line picker with delta formatting."""
         hunk = state.hunks[state.current_index]
         selected_target = selectable[cursor].target
         margin_markers, highlight_idx = build_margin_markers(hunk, selected_target)
         diff_lines = build_display_lines(
-            delta_output, self.width, margin_markers, highlight_index=highlight_idx
+            delta_output,
+            self.width,
+            margin_markers,
+            highlight_index=highlight_idx,
+            highlight_escape=highlight_escape,
         )
 
         # Ensure cursor line is visible

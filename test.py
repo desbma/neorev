@@ -2952,7 +2952,7 @@ class TestLinePickerResize(unittest.TestCase):
         self.fake.inject_keys(b"\r")
 
         with patch.object(self.term, "write"):
-            self.term.pick_line_target(state)
+            self.term.pick_line_target(state, neorev.NoteKind.QUESTION)
 
         self.assertEqual(self.term.width, new_width)
 
@@ -2988,7 +2988,7 @@ class TestLinePickerResize(unittest.TestCase):
             patch.object(self.term, "write"),
             patch("neorev.render_through_delta", side_effect=tracking_render),
         ):
-            self.term.pick_line_target(state)
+            self.term.pick_line_target(state, neorev.NoteKind.QUESTION)
 
         self.assertIn(new_width, render_widths)
 
