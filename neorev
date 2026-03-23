@@ -2284,13 +2284,11 @@ def main() -> None:
     if args.git is not None:
         cmd = ["git", "show"] + ([args.git] if args.git else [])
         diff_text = fetch_diff_from_vcs(cmd)
-        if args.git:
-            diff_source = f"git show {args.git}"
+        diff_source = f"git show {args.git}".strip()
     elif args.jj is not None:
         cmd = ["jj", "show"] + ([args.jj] if args.jj else [])
         diff_text = fetch_diff_from_vcs(cmd)
-        if args.jj:
-            diff_source = f"jj show {args.jj}"
+        diff_source = f"jj show {args.jj}".strip()
     else:
         diff_text = read_diff_from_stdin_or_exit(parser)
     hunks = parse_diff_or_exit(diff_text)

@@ -2272,6 +2272,52 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
+    def test_git_without_revision_includes_diff_source(self) -> None:
+        """Using -g without a revision still includes 'git show' as diff source."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        try:
+            with patch.object(
+                neorev,
+                "fetch_diff_from_vcs",
+                return_value=TWO_HUNK_DIFF,
+            ):
+                run_main_with_scripted_terminal(
+                    TWO_HUNK_DIFF,
+                    output_path,
+                    lambda state: state.hunks[0].__setattr__("approved", True),
+                    extra_args=["-g", "--"],
+                )
+            output = Path(output_path).read_text()
+            self.assertIn("Reviewed diff:", output)
+            self.assertIn("git show", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_jj_without_revision_includes_diff_source(self) -> None:
+        """Using -j without a revision still includes 'jj show' as diff source."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        try:
+            with patch.object(
+                neorev,
+                "fetch_diff_from_vcs",
+                return_value=TWO_HUNK_DIFF,
+            ):
+                run_main_with_scripted_terminal(
+                    TWO_HUNK_DIFF,
+                    output_path,
+                    lambda state: state.hunks[0].__setattr__("approved", True),
+                    extra_args=["-j", "--"],
+                )
+            output = Path(output_path).read_text()
+            self.assertIn("Reviewed diff:", output)
+            self.assertIn("jj show", output)
+        finally:
+            os.unlink(output_path)
+
     def test_clear_flag_discards_previous_review(self) -> None:
         """The --clear flag discards a previous review and starts fresh."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
