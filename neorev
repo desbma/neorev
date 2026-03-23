@@ -1126,11 +1126,21 @@ def build_display_lines(
                 prefix = margin if j == 0 else MARGIN_EMPTY
                 row = prefix + segment
                 if highlighted:
-                    row = highlight_escape + row + RESET.encode()
+                    row_text = row.decode("utf-8", errors="replace")
+                    pad = max(0, term_width - visible_len(row_text))
+                    row = highlight_escape + row + b" " * pad + RESET.encode()
                 display_lines.append(row)
         elif highlighted:
             display_lines.extend(
-                highlight_escape + seg + RESET.encode() for seg in wrapped
+                highlight_escape
+                + seg
+                + b" "
+                * max(
+                    0,
+                    term_width - visible_len(seg.decode("utf-8", errors="replace")),
+                )
+                + RESET.encode()
+                for seg in wrapped
             )
         else:
             display_lines.extend(wrapped)

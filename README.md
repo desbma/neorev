@@ -11,6 +11,9 @@ git diff | neorev review.txt
 claude -p "@review.txt"
 ```
 
+Main screen, selecting a line in hunk:
+![TUI](./ui.png)
+
 ## Features
 
 - Simple terminal UI optimized for efficiency
@@ -28,9 +31,6 @@ claude -p "@review.txt"
   - can be pasted directly in agent terminal
   - is unambiguous to reduce back and forth
   - is concise to reduce context window usage
-
-Main screen:
-![TUI](./ui.png)
 
 ## Why
 
