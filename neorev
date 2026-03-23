@@ -1515,7 +1515,7 @@ class Terminal:
         """Open *editor* with a temporary file pre-filled with *existing*."""
         with tempfile.NamedTemporaryFile(
             mode="w",
-            suffix=".md",
+            suffix=".cfg",
             prefix="review-",
             delete=False,
         ) as tmp:

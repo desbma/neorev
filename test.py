@@ -1388,7 +1388,7 @@ class TestCommentHelpers(unittest.TestCase):
 
     def test_write_comment_template(self) -> None:
         """Template contains the location and existing comment."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             jump = neorev.write_comment_template(f, "test.py:10", "existing")
             path = f.name
 
@@ -1404,7 +1404,7 @@ class TestCommentHelpers(unittest.TestCase):
 
     def test_read_comment_file_strips_hashes(self) -> None:
         """read_comment_file strips lines starting with #."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             f.write("# header\nactual comment\n# footer\n")
             path = f.name
 
@@ -1416,7 +1416,7 @@ class TestCommentHelpers(unittest.TestCase):
 
     def test_write_comment_template_no_existing(self) -> None:
         """Template with no existing comment still has location and blank line."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             jump = neorev.write_comment_template(f, "foo.py:5", "")
             path = f.name
 
@@ -1430,7 +1430,7 @@ class TestCommentHelpers(unittest.TestCase):
 
     def test_read_comment_file_all_comments(self) -> None:
         """A file with only # lines returns empty string."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             f.write("# line one\n# line two\n")
             path = f.name
 
@@ -1442,7 +1442,7 @@ class TestCommentHelpers(unittest.TestCase):
 
     def test_read_comment_file_preserves_inner_hashes(self) -> None:
         """Lines not starting with # are preserved even if they contain #."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             f.write("# header\n  # indented hash\nplain\n")
             path = f.name
 
@@ -1609,7 +1609,7 @@ class TestWriteCommentTemplateWithContext(unittest.TestCase):
 
     def test_context_lines_included_in_template(self) -> None:
         """Context lines appear as # comments in the template."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             ctx = ["# ► 10 + added line", "#   11   context line"]
             jump = neorev.write_comment_template(f, "test.py:10", "", ctx)
             path = f.name
@@ -1625,7 +1625,7 @@ class TestWriteCommentTemplateWithContext(unittest.TestCase):
 
     def test_context_lines_stripped_by_read(self) -> None:
         """Context lines (starting with #) are stripped when reading back."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             ctx = ["# ► 10 + the target line"]
             neorev.write_comment_template(f, "loc", "my note", ctx)
             path = f.name
@@ -1639,11 +1639,11 @@ class TestWriteCommentTemplateWithContext(unittest.TestCase):
 
     def test_jump_line_accounts_for_context(self) -> None:
         """Jump line is offset by the number of context lines."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             jump_no_ctx = neorev.write_comment_template(f, "loc", "")
             f.name  # noqa: B018
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
             ctx = ["# line1", "# line2", "# line3"]
             jump_with_ctx = neorev.write_comment_template(f, "loc", "", ctx)
             path = f.name
