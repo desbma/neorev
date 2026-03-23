@@ -669,12 +669,18 @@ def render_through_delta(diff_text: str, width: int = 120) -> bytes:
     return diff_text.encode()
 
 
-def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
+def format_output(
+    hunks: list[Hunk],
+    global_notes: list[GlobalNote],
+    diff_source: str = "",
+) -> str:
     """
     Produce compact, unambiguous review output for an LLM agent.
 
     Approved hunks are omitted.  Each note gets its own section with an
     explicit target (hunk, +N, -N).  Global notes appear first.
+    When *diff_source* is non-empty it is included in the header so the
+    agent knows how to retrieve the reviewed diff.
     """
     out = StringIO()
     all_notes = [(hunk, note) for hunk in hunks for note in hunk.notes]
@@ -682,11 +688,15 @@ def format_output(hunks: list[Hunk], global_notes: list[GlobalNote]) -> str:
     if not all_notes and not global_notes:
         approved = sum(1 for h in hunks if h.approved)
         out.write("# Review: all clear, no action needed.\n")
+        if diff_source:
+            out.write(f"# Reviewed diff: `{diff_source}`\n")
         out.write(f"# {approved}/{len(hunks)} hunks approved.\n")
         out.write(f"# neorev:{encode_approved_bitmap(hunks)}\n")
         return out.getvalue()
 
     out.write(OUTPUT_PREAMBLE)
+    if diff_source:
+        out.write(f"# Reviewed diff: `{diff_source}`\n#\n")
 
     for note in global_notes:
         write_note_section(out, note.kind, GLOBAL_TARGET, note.text)
@@ -2134,7 +2144,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discard previous review and start fresh",
     )
+    rev_group = parser.add_mutually_exclusive_group()
+    rev_group.add_argument(
+        "-g",
+        "--git",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="REV",
+        help="run 'git show [REV]' and use its output as the diff",
+    )
+    rev_group.add_argument(
+        "-j",
+        "--jj",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="REV",
+        help="run 'jj show [REV]' and use its output as the diff",
+    )
     return parser
+
+
+def fetch_diff_from_vcs(command: list[str]) -> str:
+    """Run a VCS command and return its stdout, exiting on failure."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        sys.stderr.write(f"Error: '{command[0]}' not found.\n")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        sys.stderr.write(exc.stderr or f"Error: {command} failed.\n")
+        sys.exit(1)
+
+    if not result.stdout.strip():
+        sys.stderr.write("Empty diff.\n")
+        sys.exit(1)
+
+    return result.stdout
 
 
 def read_diff_from_stdin_or_exit(
@@ -2203,9 +2250,10 @@ def write_review_output(
     output_path: str,
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
+    diff_source: str = "",
 ) -> None:
     """Write the final review output to *output_path*."""
-    review_output = format_output(hunks, global_notes)
+    review_output = format_output(hunks, global_notes, diff_source)
     Path(output_path).write_text(review_output)
     sys.stderr.write(f"Review written to {output_path}\n")
 
@@ -2232,7 +2280,19 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    diff_text = read_diff_from_stdin_or_exit(parser)
+    diff_source = ""
+    if args.git is not None:
+        cmd = ["git", "show"] + ([args.git] if args.git else [])
+        diff_text = fetch_diff_from_vcs(cmd)
+        if args.git:
+            diff_source = f"git show {args.git}"
+    elif args.jj is not None:
+        cmd = ["jj", "show"] + ([args.jj] if args.jj else [])
+        diff_text = fetch_diff_from_vcs(cmd)
+        if args.jj:
+            diff_source = f"jj show {args.jj}"
+    else:
+        diff_text = read_diff_from_stdin_or_exit(parser)
     hunks = parse_diff_or_exit(diff_text)
 
     if args.clear:
@@ -2255,7 +2315,7 @@ def main() -> None:
         finally:
             term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
 
-    write_review_output(args.output, hunks, global_notes)
+    write_review_output(args.output, hunks, global_notes, diff_source)
     if args.clip:
         copy_output_reference_to_clipboard(args.output)
 

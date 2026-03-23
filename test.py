@@ -674,6 +674,30 @@ class TestFormatOutput(unittest.TestCase):
         output = neorev.format_output(hunks, [])
         self.assertIn("# ...", output)
 
+    def test_diff_source_in_preamble(self) -> None:
+        """The diff source appears in the header when provided."""
+        hunks = [make_hunk(status=neorev.Status.FLAG, comment="fix")]
+        output = neorev.format_output(hunks, [], diff_source="jj show abc")
+        self.assertIn("# Reviewed diff: `jj show abc`\n", output)
+
+    def test_diff_source_in_all_clear(self) -> None:
+        """The diff source appears in the all-clear output."""
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
+        output = neorev.format_output(hunks, [], diff_source="git show HEAD~1")
+        self.assertIn("# Reviewed diff: `git show HEAD~1`\n", output)
+
+    def test_no_diff_source_by_default(self) -> None:
+        """No diff source line when the parameter is empty."""
+        hunks = [make_hunk(status=neorev.Status.FLAG, comment="fix")]
+        output = neorev.format_output(hunks, [])
+        self.assertNotIn("# Reviewed diff:", output)
+
+    def test_no_diff_source_in_all_clear_by_default(self) -> None:
+        """No diff source line in all-clear output when not provided."""
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
+        output = neorev.format_output(hunks, [])
+        self.assertNotIn("# Reviewed diff:", output)
+
 
 class TestLoadPreviousReview(unittest.TestCase):
     """Tests for load_previous_review, extract_comment_lines, apply_previous_review."""
@@ -2029,6 +2053,82 @@ class TestArgParser(unittest.TestCase):
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             parser.parse_args([])
+
+    def test_git_with_revision(self) -> None:
+        """The -g flag accepts a revision argument."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-g", "HEAD~1", "out.txt"])
+        self.assertEqual(args.git, "HEAD~1")
+        self.assertIsNone(args.jj)
+        self.assertEqual(args.output, "out.txt")
+
+    def test_jj_with_revision(self) -> None:
+        """The -j flag accepts a revision argument."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-j", "abc123", "out.txt"])
+        self.assertEqual(args.jj, "abc123")
+        self.assertIsNone(args.git)
+        self.assertEqual(args.output, "out.txt")
+
+    def test_git_without_revision_after_positional(self) -> None:
+        """The -g flag without a revision works when placed after the output."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["out.txt", "-g"])
+        self.assertEqual(args.git, "")
+        self.assertEqual(args.output, "out.txt")
+
+    def test_jj_without_revision_after_positional(self) -> None:
+        """The -j flag without a revision works when placed after the output."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["out.txt", "-j"])
+        self.assertEqual(args.jj, "")
+        self.assertEqual(args.output, "out.txt")
+
+    def test_git_without_revision_before_positional_consumes_it(self) -> None:
+        """Placing -g before the positional without a rev consumes the output."""
+        parser = neorev.build_arg_parser()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["-g", "out.txt"])
+
+    def test_jj_without_revision_before_positional_consumes_it(self) -> None:
+        """Placing -j before the positional without a rev consumes the output."""
+        parser = neorev.build_arg_parser()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["-j", "out.txt"])
+
+    def test_git_and_jj_mutually_exclusive(self) -> None:
+        """Using both -g and -j is rejected."""
+        parser = neorev.build_arg_parser()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["-g", "HEAD", "-j", "abc", "out.txt"])
+
+    def test_git_without_revision_uses_separator(self) -> None:
+        """Using -- separator lets -g without a rev precede the positional."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-g", "--", "out.txt"])
+        self.assertEqual(args.git, "")
+        self.assertEqual(args.output, "out.txt")
+
+    def test_jj_without_revision_uses_separator(self) -> None:
+        """Using -- separator lets -j without a rev precede the positional."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-j", "--", "out.txt"])
+        self.assertEqual(args.jj, "")
+        self.assertEqual(args.output, "out.txt")
+
+    def test_long_form_git_with_revision(self) -> None:
+        """The --git long form works with a revision."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["--git", "v1.0", "out.txt"])
+        self.assertEqual(args.git, "v1.0")
+        self.assertEqual(args.output, "out.txt")
+
+    def test_long_form_jj_without_revision(self) -> None:
+        """The --jj long form works without a revision after the positional."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["out.txt", "--jj"])
+        self.assertEqual(args.jj, "")
+        self.assertEqual(args.output, "out.txt")
 
 
 class TestMainWorkflow(unittest.TestCase):
