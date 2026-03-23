@@ -94,6 +94,7 @@ SELECT_IMMEDIATE = 0
 GLOBAL_TARGET = "(global)"
 LINE_PICKER_SELECT_KEY = "\r"
 EDITOR_CONTEXT_RADIUS = 3
+EDITOR_HUNK_CONTEXT_MAX = 15
 EDITOR_TARGET_MARKER = "►"
 EDITOR_CONTEXT_PAD = " "
 
@@ -261,6 +262,18 @@ class Hunk:
             if note.target == target:
                 del self.notes[i]
                 return
+
+    def build_hunk_context(self, scroll_offset: int) -> list[str]:
+        """Build a diff snippet for the editor starting from *scroll_offset*."""
+        start = max(0, scroll_offset)
+        end = min(len(self.display_lines), start + EDITOR_HUNK_CONTEXT_MAX)
+        lines: list[str] = []
+        for dl in self.display_lines[start:end]:
+            line_num = dl.new_line_number or dl.old_line_number or 0
+            lines.append(
+                f"# {EDITOR_CONTEXT_PAD} {line_num:>4} {dl.kind.value} {dl.text}"
+            )
+        return lines
 
     def build_line_context(self, target: LineTarget) -> list[str]:
         """Build context lines around *target* for the editor comment template."""
@@ -1831,11 +1844,10 @@ class Terminal:
 
         hunk, note = found
         if edit:
-            ctx = (
-                hunk.build_line_context(note.target)
-                if isinstance(note.target, LineTarget)
-                else None
-            )
+            if isinstance(note.target, LineTarget):
+                ctx = hunk.build_line_context(note.target)
+            else:
+                ctx = hunk.build_hunk_context(state.scroll_offset)
             new_text = self.edit_text_outside_tui(note.text, ref.kind.editor_label, ctx)
             if new_text:
                 note.text = new_text
@@ -1859,9 +1871,10 @@ class Terminal:
         existing = hunk.get_note(target)
         existing_text = existing.text if existing else ""
 
-        ctx = (
-            hunk.build_line_context(target) if isinstance(target, LineTarget) else None
-        )
+        if isinstance(target, LineTarget):
+            ctx = hunk.build_line_context(target)
+        else:
+            ctx = hunk.build_hunk_context(state.scroll_offset)
         comment = self.edit_text_outside_tui(
             existing_text,
             f"{hunk.short_location} @ {target} [{kind.editor_label}]",

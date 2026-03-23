@@ -1538,6 +1538,72 @@ class TestBuildLineContext(unittest.TestCase):
             self.assertIn(stripped[6], ("+", "-", " ", "\\"))
 
 
+class TestBuildHunkContext(unittest.TestCase):
+    """Tests for Hunk.build_hunk_context."""
+
+    SAMPLE_BODY = (
+        " line one\n line two\n-old three\n+new three\n+added four\n line five\n"
+    )
+    SAMPLE_RANGE = "@@ -1,4 +1,5 @@"
+
+    def make_hunk(self) -> neorev.Hunk:
+        """Build a hunk from the sample body."""
+        return make_hunk(
+            range_line=self.SAMPLE_RANGE,
+            body=self.SAMPLE_BODY.rstrip("\n"),
+        )
+
+    def test_starts_from_scroll_offset(self) -> None:
+        """Context lines begin at the given scroll offset."""
+        hunk = self.make_hunk()
+        ctx = hunk.build_hunk_context(scroll_offset=2)
+        self.assertIn("old three", ctx[0])
+
+    def test_respects_max_lines(self) -> None:
+        """Context never exceeds EDITOR_HUNK_CONTEXT_MAX lines."""
+        body = "\n".join(f"+line {i}" for i in range(30))
+        hunk = make_hunk(range_line="@@ -1,0 +1,30 @@", body=body)
+        ctx = hunk.build_hunk_context(scroll_offset=0)
+        self.assertEqual(len(ctx), neorev.EDITOR_HUNK_CONTEXT_MAX)
+
+    def test_offset_zero_starts_at_beginning(self) -> None:
+        """Offset zero returns lines from the start of the hunk."""
+        hunk = self.make_hunk()
+        ctx = hunk.build_hunk_context(scroll_offset=0)
+        self.assertIn("line one", ctx[0])
+
+    def test_offset_past_end_returns_empty(self) -> None:
+        """An offset beyond the display lines returns an empty list."""
+        hunk = self.make_hunk()
+        ctx = hunk.build_hunk_context(scroll_offset=999)
+        self.assertEqual(ctx, [])
+
+    def test_negative_offset_clamps_to_zero(self) -> None:
+        """A negative offset is clamped to zero."""
+        hunk = self.make_hunk()
+        ctx_neg = hunk.build_hunk_context(scroll_offset=-5)
+        ctx_zero = hunk.build_hunk_context(scroll_offset=0)
+        self.assertEqual(ctx_neg, ctx_zero)
+
+    def test_lines_use_context_pad(self) -> None:
+        """All hunk context lines use the context pad marker, not the target marker."""
+        hunk = self.make_hunk()
+        ctx = hunk.build_hunk_context(scroll_offset=0)
+        for line in ctx:
+            self.assertNotIn(neorev.EDITOR_TARGET_MARKER, line)
+            self.assertIn(neorev.EDITOR_CONTEXT_PAD, line)
+
+    def test_includes_diff_prefix(self) -> None:
+        """Context lines include the diff prefix character."""
+        hunk = self.make_hunk()
+        ctx = hunk.build_hunk_context(scroll_offset=0)
+        prefixes = set()
+        for line in ctx:
+            stripped = line[2:]  # remove "# "
+            prefixes.add(stripped[6])
+        self.assertTrue(prefixes & {"+", "-", " "})
+
+
 class TestWriteCommentTemplateWithContext(unittest.TestCase):
     """Tests for write_comment_template with context_lines."""
 
