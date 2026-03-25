@@ -104,6 +104,8 @@ NOTE_PANEL_CHROME_ROWS = 2  # header + footer
 NOTE_PANEL_MIN_HEIGHT = 3  # chrome + at least 1 note row
 NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
 NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
+PREVIEW_INTERPUNCT = " · "
+
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
@@ -1378,6 +1380,25 @@ def build_note_panel_header(note_count: int, term_width: int) -> str:
     return f"─{label}{'─' * fill_width}"
 
 
+def ends_with_separator(s: str) -> bool:
+    """Return whether *s* ends with a non-alphanumeric, non-whitespace character."""
+    return bool(s) and not s[-1].isalnum() and not s[-1].isspace()
+
+
+def note_preview_text(text: str) -> str:
+    """Build a single-line preview from a possibly multi-line note."""
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    parts: list[str] = []
+    for i, line in enumerate(lines):
+        if parts and not ends_with_separator(lines[i - 1]):
+            parts.append(PREVIEW_INTERPUNCT)
+        elif parts:
+            parts.append(" ")
+        parts.append(line)
+    return " ".join("".join(parts).split())
+
+
 def build_note_panel_row(
     ref: ManagedNoteRef, *, selected: bool, term_width: int
 ) -> str:
@@ -1386,7 +1407,7 @@ def build_note_panel_row(
     kind_str = (
         f"{RED}flag{RESET}" if ref.kind is NoteKind.FLAG else f"{YELLOW}question{RESET}"
     )
-    preview = ref.text.replace("\n", " ")
+    preview = note_preview_text(ref.text)
     prefix = f"{cursor_mark}[{kind_str}] {DIM}{ref.scope_label}{RESET} "
     max_preview = term_width - visible_len(prefix) - 1
     if max_preview > 0 and len(preview) > max_preview:

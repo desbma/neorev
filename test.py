@@ -3336,5 +3336,168 @@ class TestSnippetCenteredOnTargetLine(unittest.TestCase):
         self.assertIn(f"+line {CENTERED_SNIPPET_LINE_COUNT - 2}", output)
 
 
+class TestNotePreviewText(unittest.TestCase):
+    """Tests for note_preview_text."""
+
+    def test_single_line(self) -> None:
+        """A single line is returned as-is."""
+        self.assertEqual(neorev.note_preview_text("hello world"), "hello world")
+
+    def test_empty_string(self) -> None:
+        """An empty string returns empty."""
+        self.assertEqual(neorev.note_preview_text(""), "")
+
+    def test_only_whitespace(self) -> None:
+        """Whitespace-only input returns empty."""
+        self.assertEqual(neorev.note_preview_text("   \n\n  "), "")
+
+    def test_newline_adds_interpunct(self) -> None:
+        """Lines without trailing punctuation are joined with interpunct."""
+        self.assertEqual(
+            neorev.note_preview_text("fix the bug\nalso rename it"),
+            "fix the bug · also rename it",
+        )
+
+    def test_newline_after_period(self) -> None:
+        """A line ending with a period is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("fix the bug.\nalso rename it"),
+            "fix the bug. also rename it",
+        )
+
+    def test_newline_after_exclamation(self) -> None:
+        """A line ending with an exclamation mark is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("done!\nnext step"),
+            "done! next step",
+        )
+
+    def test_newline_after_question_mark(self) -> None:
+        """A line ending with a question mark is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("why?\nbecause"),
+            "why? because",
+        )
+
+    def test_newline_after_comma(self) -> None:
+        """A line ending with a comma is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("first,\nsecond"),
+            "first, second",
+        )
+
+    def test_newline_after_semicolon(self) -> None:
+        """A line ending with a semicolon is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("a;\nb"),
+            "a; b",
+        )
+
+    def test_newline_after_colon(self) -> None:
+        """A line ending with a colon is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("note:\ndetails"),
+            "note: details",
+        )
+
+    def test_newline_after_ellipsis(self) -> None:
+        """A line ending with an ellipsis is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("wait…\nmore"),
+            "wait… more",
+        )
+
+    def test_newline_after_closing_paren(self) -> None:
+        """A line ending with a closing parenthesis is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("(done)\nnext"),
+            "(done) next",
+        )
+
+    def test_newline_after_closing_bracket(self) -> None:
+        """A line ending with a closing bracket is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("[ref]\nsee"),
+            "[ref] see",
+        )
+
+    def test_newline_after_quote(self) -> None:
+        """A line ending with a quote mark is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text('said "hi"\nthen left'),
+            'said "hi" then left',
+        )
+
+    def test_newline_after_em_dash(self) -> None:
+        """A line ending with an em dash is joined with a plain space."""
+        self.assertEqual(
+            neorev.note_preview_text("wait—\nmore"),
+            "wait— more",
+        )
+
+    def test_consecutive_newlines(self) -> None:
+        """Multiple consecutive newlines produce a single interpunct."""
+        self.assertEqual(
+            neorev.note_preview_text("a\n\n\nb"),
+            "a · b",
+        )
+
+    def test_consecutive_newlines_after_punctuation(self) -> None:
+        """Multiple consecutive newlines after punctuation produce a single space."""
+        self.assertEqual(
+            neorev.note_preview_text("end.\n\n\nstart"),
+            "end. start",
+        )
+
+    def test_no_double_spaces(self) -> None:
+        """Internal double spaces are collapsed to one."""
+        self.assertEqual(
+            neorev.note_preview_text("a  b"),
+            "a b",
+        )
+
+    def test_tabs_collapsed(self) -> None:
+        """Tab characters are collapsed to a single space."""
+        self.assertEqual(
+            neorev.note_preview_text("a\t\tb"),
+            "a b",
+        )
+
+    def test_unicode_spaces_collapsed(self) -> None:
+        """Various unicode whitespace chars are collapsed to a single space."""
+        self.assertEqual(
+            neorev.note_preview_text("a\u00a0\u2000\u3000b"),
+            "a b",
+        )
+
+    def test_mixed_punctuated_and_unpunctuated_lines(self) -> None:
+        """Mixed lines get interpunct only where needed."""
+        self.assertEqual(
+            neorev.note_preview_text("done.\nnext\nalso this"),
+            "done. next · also this",
+        )
+
+    def test_leading_trailing_whitespace_stripped(self) -> None:
+        """Leading and trailing whitespace is stripped from the result."""
+        self.assertEqual(
+            neorev.note_preview_text("  hello  \n  world  "),
+            "hello · world",
+        )
+
+    def test_trailing_newline(self) -> None:
+        """A trailing newline does not produce a trailing interpunct."""
+        self.assertEqual(
+            neorev.note_preview_text("hello\n"),
+            "hello",
+        )
+
+    def test_leading_newline(self) -> None:
+        """A leading newline does not produce a leading interpunct."""
+        self.assertEqual(
+            neorev.note_preview_text("\nhello"),
+            "hello",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
