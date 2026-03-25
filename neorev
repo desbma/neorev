@@ -70,7 +70,9 @@ YELLOW = f"{CSI}33m"
 CYAN = f"{CSI}36m"
 BG_BLUE = f"{CSI}44m"
 BG_CHROME = f"{CSI}40m"
+BLACK = f"{CSI}30m"
 WHITE = f"{CSI}37m"
+BG_CYAN = f"{CSI}46m"
 BG_YELLOW_BLACK = f"{CSI}43;30m"
 REVERSE = f"{CSI}7m"
 
@@ -1213,6 +1215,20 @@ def chrome_line(text: str, term_width: int) -> str:
     return bg_text + " " * pad + RESET
 
 
+def build_progress_hunk_segment(
+    current_index: int,
+    hunks: list[Hunk],
+) -> str:
+    """Build the 'Hunk N/M' segment with a progress fill."""
+    total = len(hunks)
+    handled = sum(1 for h in hunks if h.is_handled)
+    label = f" Hunk {current_index + 1}/{total} "
+    filled = len(label) * handled // total
+    filled_part = label[:filled]
+    unfilled_part = label[filled:]
+    return f"│{BLACK}{BG_CYAN}{filled_part}{RESET}{unfilled_part}│"
+
+
 def build_top_bar(
     hunk: Hunk,
     current_index: int,
@@ -1222,11 +1238,12 @@ def build_top_bar(
 ) -> str:
     """Build the top status bar string for the current hunk."""
     counters = build_top_bar_counters(hunks, global_notes)
+    progress_segment = build_progress_hunk_segment(current_index, hunks)
 
     bar = (
-        f"{BOLD}{WHITE}{BG_BLUE} neorev {RESET}  "
-        f"Hunk {BOLD}{current_index + 1}{RESET}/{len(hunks)}  "
-        f"{DIM}│{RESET} {BOLD}{hunk.short_location}{RESET}"
+        f"{BOLD}{WHITE}{BG_BLUE} neorev {RESET}"
+        f"{progress_segment}"
+        f" {BOLD}{hunk.short_location}{RESET}"
         f"{counters}"
     )
     if term_width > 0:
