@@ -106,6 +106,7 @@ NOTE_PANEL_CHROME_ROWS = 2  # header + footer
 NOTE_PANEL_MIN_HEIGHT = 3  # chrome + at least 1 note row
 NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
 NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
+ALL_CLEAR_MESSAGE = "All chunks approved, nothing to report.\n"
 PREVIEW_INTERPUNCT = " · "
 
 QUESTION_ICON = "󰠗"
@@ -2284,6 +2285,11 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     return previous_global_notes
 
 
+def review_is_all_clear(hunks: list[Hunk], global_notes: list[GlobalNote]) -> bool:
+    """Return True when every hunk is approved and there are no global notes."""
+    return all(h.approved for h in hunks) and not global_notes
+
+
 def write_review_output(
     output_path: str,
     hunks: list[Hunk],
@@ -2351,9 +2357,12 @@ def main() -> None:
         finally:
             term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
 
-    write_review_output(args.output, hunks, global_notes, diff_source)
-    if args.clip:
-        copy_output_reference_to_clipboard(args.output)
+    if review_is_all_clear(hunks, global_notes):
+        sys.stderr.write(ALL_CLEAR_MESSAGE)
+    else:
+        write_review_output(args.output, hunks, global_notes, diff_source)
+        if args.clip:
+            copy_output_reference_to_clipboard(args.output)
 
 
 if __name__ == "__main__":

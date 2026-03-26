@@ -3499,5 +3499,115 @@ class TestNotePreviewText(unittest.TestCase):
         )
 
 
+class TestReviewIsAllClear(unittest.TestCase):
+    """Tests for review_is_all_clear."""
+
+    def test_all_approved_no_globals(self) -> None:
+        """Return True when every hunk is approved and no global notes exist."""
+        hunks = [
+            make_hunk(approved=True),
+            make_hunk(approved=True),
+        ]
+        self.assertTrue(neorev.review_is_all_clear(hunks, []))
+
+    def test_unapproved_hunk(self) -> None:
+        """Return False when at least one hunk is not approved."""
+        hunks = [
+            make_hunk(approved=True),
+            make_hunk(),
+        ]
+        self.assertFalse(neorev.review_is_all_clear(hunks, []))
+
+    def test_all_approved_with_global_notes(self) -> None:
+        """Return False when there are global notes even if all hunks are approved."""
+        hunks = [make_hunk(approved=True)]
+        notes = [neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text="concern")]
+        self.assertFalse(neorev.review_is_all_clear(hunks, notes))
+
+    def test_hunk_with_notes(self) -> None:
+        """Return False when a hunk has notes instead of approval."""
+        hunks = [make_hunk(status=neorev.Status.FLAG, comment="fix")]
+        self.assertFalse(neorev.review_is_all_clear(hunks, []))
+
+
+class TestAllClearSkipsFile(unittest.TestCase):
+    """Workflow tests: all-clear review skips output file creation."""
+
+    def test_all_approved_skips_file_and_prints_message(self) -> None:
+        """When all hunks are approved with no global notes, no file is written."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Approve all hunks."""
+            for hunk in state.hunks:
+                hunk.approved = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        os.unlink(output_path)
+        try:
+            stderr = run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                script,
+            )
+            self.assertFalse(
+                Path(output_path).exists(),
+                "Output file should not be created when review is all clear",
+            )
+            self.assertIn(neorev.ALL_CLEAR_MESSAGE.strip(), stderr)
+        finally:
+            if Path(output_path).exists():
+                os.unlink(output_path)
+
+    def test_all_approved_with_global_note_writes_file(self) -> None:
+        """When all hunks are approved but a global note exists, file is written."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Approve all hunks and add a global note."""
+            for hunk in state.hunks:
+                hunk.approved = True
+            state.global_notes.append(
+                neorev.GlobalNote(kind=neorev.NoteKind.QUESTION, text="why?")
+            )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        try:
+            stderr = run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                script,
+            )
+            self.assertTrue(
+                Path(output_path).exists(),
+                "Output file should be written when global notes exist",
+            )
+            self.assertIn("Review written to", stderr)
+        finally:
+            os.unlink(output_path)
+
+    def test_partial_approval_writes_file(self) -> None:
+        """When not all hunks are approved, file is written."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Approve only the first hunk."""
+            state.hunks[0].approved = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            output_path = f.name
+
+        try:
+            run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                script,
+            )
+            self.assertTrue(Path(output_path).exists())
+        finally:
+            os.unlink(output_path)
+
+
 if __name__ == "__main__":
     unittest.main()
