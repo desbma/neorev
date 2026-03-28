@@ -90,6 +90,8 @@ Pass `-c`/`--clear` to discard a previous review and start fresh.
 
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 
+This basically applies the [squash workflow](https://steveklabnik.github.io/jujutsu-tutorial/real-world-workflows/the-squash-workflow.html) to the agentic development process.
+
 1. Create an empty commit, this will be your **vetted** code: `jj new -m "feat: add feature foo"`
 2. Create another empty commit on top of it, this will be the code **under review**: `jj new`
 3. Prompt the agent to start work
