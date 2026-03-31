@@ -706,6 +706,18 @@ class TestFormatOutput(unittest.TestCase):
 class TestLoadPreviousReview(unittest.TestCase):
     """Tests for load_previous_review, extract_comment_lines, apply_previous_review."""
 
+    def setUp(self) -> None:
+        """Create a temporary directory for review files."""
+        self.tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        """Remove the temporary directory."""
+        self.tmpdir.cleanup()
+
+    def tmp_path(self, name: str = "review.md") -> str:
+        """Return a path inside the temporary directory."""
+        return str(Path(self.tmpdir.name) / name)
+
     def test_nonexistent_file(self) -> None:
         """Loading a missing file returns empty results."""
         annotations, notes, bitmap = neorev.load_previous_review("/no/such/file")
@@ -725,19 +737,16 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, [])
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write(output)
-            path = f.name
 
-        try:
-            annotations, _, _ = neorev.load_previous_review(path)
-            key = ("a.py", hunks[0].range_line, neorev.HunkTarget())
-            self.assertIn(key, annotations)
-            kind, comment = annotations[key]
-            self.assertEqual(kind, neorev.NoteKind.FLAG)
-            self.assertEqual(comment, ROUND_TRIP_COMMENT_TEXT)
-        finally:
-            os.unlink(path)
+        annotations, _, _ = neorev.load_previous_review(path)
+        key = ("a.py", hunks[0].range_line, neorev.HunkTarget())
+        self.assertIn(key, annotations)
+        kind, comment = annotations[key]
+        self.assertEqual(kind, neorev.NoteKind.FLAG)
+        self.assertEqual(comment, ROUND_TRIP_COMMENT_TEXT)
 
     def test_extract_comment_lines(self) -> None:
         """extract_comment_lines pulls plain text after the heading."""
@@ -819,31 +828,25 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write(output)
-            path = f.name
 
-        try:
-            _, loaded_notes, _ = neorev.load_previous_review(path)
-            self.assertEqual(len(loaded_notes), 1)
-            self.assertEqual(loaded_notes[0].kind, neorev.NoteKind.QUESTION)
-            self.assertIn("overall design", loaded_notes[0].text)
-        finally:
-            os.unlink(path)
+        _, loaded_notes, _ = neorev.load_previous_review(path)
+        self.assertEqual(len(loaded_notes), 1)
+        self.assertEqual(loaded_notes[0].kind, neorev.NoteKind.QUESTION)
+        self.assertIn("overall design", loaded_notes[0].text)
 
     def test_load_empty_file(self) -> None:
         """An existing but empty file returns empty results."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write("   \n\n")
-            path = f.name
 
-        try:
-            annotations, notes, bitmap = neorev.load_previous_review(path)
-            self.assertEqual(annotations, {})
-            self.assertEqual(notes, [])
-            self.assertEqual(bitmap, "")
-        finally:
-            os.unlink(path)
+        annotations, notes, bitmap = neorev.load_previous_review(path)
+        self.assertEqual(annotations, {})
+        self.assertEqual(notes, [])
+        self.assertEqual(bitmap, "")
 
     def test_multiline_comment_round_trip(self) -> None:
         """A multi-line comment survives format_output → load_previous_review."""
@@ -856,19 +859,16 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, [])
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write(output)
-            path = f.name
 
-        try:
-            annotations, _, _ = neorev.load_previous_review(path)
-            key = ("m.py", hunks[0].range_line, neorev.HunkTarget())
-            _, comment = annotations[key]
-            self.assertIn("first line", comment)
-            self.assertIn("second line", comment)
-            self.assertIn("third line", comment)
-        finally:
-            os.unlink(path)
+        annotations, _, _ = neorev.load_previous_review(path)
+        key = ("m.py", hunks[0].range_line, neorev.HunkTarget())
+        _, comment = annotations[key]
+        self.assertIn("first line", comment)
+        self.assertIn("second line", comment)
+        self.assertIn("third line", comment)
 
     def test_multiple_global_notes_round_trip(self) -> None:
         """Multiple global notes of different kinds survive round-trip."""
@@ -879,17 +879,14 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write(output)
-            path = f.name
 
-        try:
-            _, loaded_notes, _ = neorev.load_previous_review(path)
-            self.assertEqual(len(loaded_notes), 2)
-            self.assertEqual(loaded_notes[0].kind, neorev.NoteKind.FLAG)
-            self.assertEqual(loaded_notes[1].kind, neorev.NoteKind.QUESTION)
-        finally:
-            os.unlink(path)
+        _, loaded_notes, _ = neorev.load_previous_review(path)
+        self.assertEqual(len(loaded_notes), 2)
+        self.assertEqual(loaded_notes[0].kind, neorev.NoteKind.FLAG)
+        self.assertEqual(loaded_notes[1].kind, neorev.NoteKind.QUESTION)
 
     def test_section_without_range_line_skipped(self) -> None:
         """A section header with no ```diff block is skipped gracefully."""
@@ -898,16 +895,13 @@ class TestLoadPreviousReview(unittest.TestCase):
             "some comment\n\n"
             "<!-- neorev: approved-bitmap=AQ== -->\n"
         )
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write(content)
-            path = f.name
 
-        try:
-            annotations, _, bitmap = neorev.load_previous_review(path)
-            self.assertEqual(annotations, {})
-            self.assertNotEqual(bitmap, "")
-        finally:
-            os.unlink(path)
+        annotations, _, bitmap = neorev.load_previous_review(path)
+        self.assertEqual(annotations, {})
+        self.assertNotEqual(bitmap, "")
 
     def test_apply_previous_review_multiple_matches(self) -> None:
         """Multiple hunks matching annotations all get annotated."""
@@ -1456,72 +1450,69 @@ class TestChrome(unittest.TestCase):
 class TestCommentHelpers(unittest.TestCase):
     """Tests for write_comment_template and read_comment_file."""
 
+    def setUp(self) -> None:
+        """Create a temporary directory for comment files."""
+        self.tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        """Remove the temporary directory."""
+        self.tmpdir.cleanup()
+
+    def tmp_path(self, name: str = "comment.cfg") -> str:
+        """Return a path inside the temporary directory."""
+        return str(Path(self.tmpdir.name) / name)
+
     def test_write_comment_template(self) -> None:
         """Template contains the location and existing comment."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             jump = neorev.write_comment_template(f, "test.py:10", "existing")
-            path = f.name
 
-        try:
-            with open(path) as f:
-                content = f.read()
-            self.assertIn("test.py:10", content)
-            self.assertIn("existing", content)
-            self.assertIsInstance(jump, int)
-            self.assertGreater(jump, 0)
-        finally:
-            os.unlink(path)
+        with open(path) as f:
+            content = f.read()
+        self.assertIn("test.py:10", content)
+        self.assertIn("existing", content)
+        self.assertIsInstance(jump, int)
+        self.assertGreater(jump, 0)
 
     def test_read_comment_file_strips_hashes(self) -> None:
         """read_comment_file strips lines starting with #."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write("# header\nactual comment\n# footer\n")
-            path = f.name
 
-        try:
-            comment = neorev.read_comment_file(path)
-            self.assertEqual(comment, "actual comment")
-        finally:
-            os.unlink(path)
+        comment = neorev.read_comment_file(path)
+        self.assertEqual(comment, "actual comment")
 
     def test_write_comment_template_no_existing(self) -> None:
         """Template with no existing comment still has location and blank line."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             jump = neorev.write_comment_template(f, "foo.py:5", "")
-            path = f.name
 
-        try:
-            with open(path) as f:
-                content = f.read()
-            self.assertIn("foo.py:5", content)
-            self.assertGreater(jump, 0)
-        finally:
-            os.unlink(path)
+        with open(path) as f:
+            content = f.read()
+        self.assertIn("foo.py:5", content)
+        self.assertGreater(jump, 0)
 
     def test_read_comment_file_all_comments(self) -> None:
         """A file with only # lines returns empty string."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write("# line one\n# line two\n")
-            path = f.name
 
-        try:
-            comment = neorev.read_comment_file(path)
-            self.assertEqual(comment, "")
-        finally:
-            os.unlink(path)
+        comment = neorev.read_comment_file(path)
+        self.assertEqual(comment, "")
 
     def test_read_comment_file_preserves_inner_hashes(self) -> None:
         """Lines not starting with # are preserved even if they contain #."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        path = self.tmp_path()
+        with open(path, "w") as f:
             f.write("# header\n  # indented hash\nplain\n")
-            path = f.name
 
-        try:
-            comment = neorev.read_comment_file(path)
-            self.assertIn("# indented hash", comment)
-            self.assertIn("plain", comment)
-        finally:
-            os.unlink(path)
+        comment = neorev.read_comment_file(path)
+        self.assertIn("# indented hash", comment)
+        self.assertIn("plain", comment)
 
 
 class TestBuildLineContext(unittest.TestCase):

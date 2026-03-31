@@ -38,7 +38,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import contextlib
 import enum
 import os
 import re
@@ -1580,16 +1579,12 @@ class Terminal:
         context_lines: list[str] | None = None,
     ) -> str:
         """Open *editor* with a temporary file pre-filled with *existing*."""
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".cfg",
-            prefix="review-",
-            delete=False,
-        ) as tmp:
-            jump_line = write_comment_template(tmp, location, existing, context_lines)
-            tmppath = tmp.name
-
-        try:
+        with tempfile.TemporaryDirectory(prefix="review-") as tmpdir:
+            tmppath = str(Path(tmpdir) / "comment.cfg")
+            with open(tmppath, "w") as tmp:
+                jump_line = write_comment_template(
+                    tmp, location, existing, context_lines
+                )
             with duplicated_fd(self.fd) as dup_fd:
                 subprocess.run(
                     [editor, f"{tmppath}:{jump_line}"],
@@ -1599,9 +1594,6 @@ class Terminal:
                     stderr=dup_fd,
                 )
             return read_comment_file(tmppath)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmppath)
 
     def prompt_inline_comment(self, existing: str, location: str) -> str:
         """Prompt for a single-line comment directly on the TTY."""

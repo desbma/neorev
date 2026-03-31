@@ -16,7 +16,7 @@ git diff HEAD~1 | ./neorev --clip review.txt
 
 - Python 3.13+. No third-party imports.
 - Dataclasses for all structured data.
-- No `_` prefix on methods or functions. All names are plain, even internal helpers.
+- No `_` prefix on any name (methods, functions, variables, attributes) unless it is genuinely unused (e.g. `for _ in range(n)`). All names are plain, even internal helpers.
 - Docstrings mandatory on all functions (imperative mood).
 - Typing:
   - Annotations mandatory on all function signatures. Always write the real type, never a string-quoted annotation.
