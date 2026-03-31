@@ -612,7 +612,7 @@ class TestFormatOutput(unittest.TestCase):
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
         notes = [neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text="add tests")]
         output = neorev.format_output(hunks, notes)
-        self.assertIn("(global)", output)
+        self.assertIn("`global`", output)
         self.assertIn("add tests", output)
 
     def test_long_hunk_body_trimmed(self) -> None:
@@ -625,10 +625,10 @@ class TestFormatOutput(unittest.TestCase):
         self.assertIn("# ...", output)
 
     def test_bitmap_present_in_output(self) -> None:
-        """Output always contains a neorev: bitmap line."""
+        """Output always contains a neorev footer comment."""
         hunks = [make_hunk(status=neorev.Status.FLAG, comment="x")]
         output = neorev.format_output(hunks, [])
-        self.assertIn("# neorev:", output)
+        self.assertIn("<!-- neorev: approved-bitmap=", output)
 
     def test_no_status_hunks(self) -> None:
         """Hunks with no status and no actionable items get 'all clear'."""
@@ -636,7 +636,7 @@ class TestFormatOutput(unittest.TestCase):
         output = neorev.format_output(hunks, [])
         self.assertIn("all clear", output)
         self.assertIn("0/2 hunks approved", output)
-        self.assertIn("# neorev:", output)
+        self.assertIn("<!-- neorev: approved-bitmap=", output)
 
     def test_global_note_question_label(self) -> None:
         """A global question note section header uses QUESTION label."""
@@ -645,40 +645,44 @@ class TestFormatOutput(unittest.TestCase):
             neorev.GlobalNote(kind=neorev.NoteKind.QUESTION, text="why this approach?")
         ]
         output = neorev.format_output(hunks, notes)
-        self.assertIn("[QUESTION] (global)", output)
-        self.assertNotIn("[CHANGE REQUESTED] (global)", output)
+        self.assertIn("[QUESTION] `global`", output)
+        self.assertNotIn("[CHANGE REQUESTED] `global`", output)
 
-    def test_multiline_comment_quoted(self) -> None:
-        """Each line of a multi-line comment gets a > prefix."""
+    def test_multiline_comment_preserved(self) -> None:
+        """Each line of a multi-line comment appears as plain text."""
         hunks = [
             make_hunk(
                 status=neorev.Status.FLAG, comment="line one\nline two\nline three"
             )
         ]
         output = neorev.format_output(hunks, [])
-        self.assertIn("> line one\n", output)
-        self.assertIn("> line two\n", output)
-        self.assertIn("> line three\n", output)
+        self.assertIn("line one\nline two\nline three", output)
 
     def test_body_exactly_max_lines_not_trimmed(self) -> None:
         """A body with exactly HUNK_BODY_MAX_LINES lines is not trimmed."""
         body = "\n".join(f"+line {i}" for i in range(neorev.HUNK_BODY_MAX_LINES))
         hunks = [make_hunk(body=body, status=neorev.Status.FLAG, comment="ok")]
         output = neorev.format_output(hunks, [])
-        self.assertNotIn("# ...", output)
+        match = re.search(r"```diff\n(.*?)```", output, re.DOTALL)
+        self.assertIsNotNone(match)
+        if match:
+            self.assertNotIn("# ...", match.group(1))
 
     def test_body_one_over_max_lines_trimmed(self) -> None:
         """A body with HUNK_BODY_MAX_LINES + 1 lines is trimmed."""
         body = "\n".join(f"+line {i}" for i in range(neorev.HUNK_BODY_MAX_LINES + 1))
         hunks = [make_hunk(body=body, status=neorev.Status.FLAG, comment="too long")]
         output = neorev.format_output(hunks, [])
-        self.assertIn("# ...", output)
+        match = re.search(r"```diff\n(.*?)```", output, re.DOTALL)
+        self.assertIsNotNone(match)
+        if match:
+            self.assertIn("# ...", match.group(1))
 
     def test_diff_source_in_preamble(self) -> None:
         """The diff source appears in the header when provided."""
         hunks = [make_hunk(status=neorev.Status.FLAG, comment="fix")]
         output = neorev.format_output(hunks, [], diff_source="jj show abc")
-        self.assertIn("# Reviewed diff: `jj show abc`\n", output)
+        self.assertIn("- Reviewed diff: `jj show abc`\n", output)
 
     def test_diff_source_in_all_clear(self) -> None:
         """The diff source appears in the all-clear output."""
@@ -721,7 +725,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, [])
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -736,14 +740,52 @@ class TestLoadPreviousReview(unittest.TestCase):
             os.unlink(path)
 
     def test_extract_comment_lines(self) -> None:
-        """extract_comment_lines pulls > -prefixed lines."""
-        section = "header\n> line one\n> line two\nother"
+        """extract_comment_lines pulls plain text after the heading."""
+        section = "[CHANGE REQUESTED] `foo.py @ hunk`\n\nline one\nline two\n"
         self.assertEqual(neorev.extract_comment_lines(section), "line one\nline two")
 
-    def test_extract_empty_quote_lines(self) -> None:
-        """Bare > lines become empty lines in the comment."""
-        section = "> first\n>\n> third"
-        self.assertEqual(neorev.extract_comment_lines(section), "first\n\nthird")
+    def test_extract_comment_with_diff_block(self) -> None:
+        """Text after a diff block is extracted, diff block is excluded."""
+        section = (
+            "[CHANGE REQUESTED] `foo.py @ hunk`\n\n"
+            "```diff\n@@ -1,2 +1,3 @@\n+added\n```\n\n"
+            "fix this\n"
+        )
+        self.assertEqual(neorev.extract_comment_lines(section), "fix this")
+
+    def test_extract_comment_with_markdown_headings(self) -> None:
+        """Review text containing ### headings is preserved."""
+        section = (
+            "[QUESTION] `foo.py @ hunk`\n\n"
+            "```diff\n@@ -1,2 +1,3 @@\n+added\n```\n\n"
+            "### Why this?\n\nBecause reasons.\n"
+        )
+        result = neorev.extract_comment_lines(section)
+        self.assertIn("### Why this?", result)
+        self.assertIn("Because reasons.", result)
+
+    def test_extract_comment_with_special_characters(self) -> None:
+        """Review text with backticks, brackets, and unicode is preserved."""
+        section = (
+            "[CHANGE REQUESTED] `bar.py @ hunk`\n\n"
+            "Use `foo()` instead of `bar()` — see [docs](url).\n"
+            "Also: émojis 🎉 and <angle> brackets.\n"
+        )
+        result = neorev.extract_comment_lines(section)
+        self.assertIn("`foo()`", result)
+        self.assertIn("— see [docs](url)", result)
+        self.assertIn("🎉", result)
+        self.assertIn("<angle>", result)
+
+    def test_extract_comment_with_html_comment(self) -> None:
+        """The neorev footer HTML comment is stripped from the body."""
+        section = (
+            "[CHANGE REQUESTED] `baz.py @ hunk`\n\n"
+            "fix the bug\n\n"
+            "<!-- neorev: approved-bitmap=AQ== -->\n"
+        )
+        result = neorev.extract_comment_lines(section)
+        self.assertEqual(result, "fix the bug")
 
     def test_apply_previous_review(self) -> None:
         """apply_previous_review sets notes on matching hunks."""
@@ -777,7 +819,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -791,7 +833,7 @@ class TestLoadPreviousReview(unittest.TestCase):
 
     def test_load_empty_file(self) -> None:
         """An existing but empty file returns empty results."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write("   \n\n")
             path = f.name
 
@@ -814,7 +856,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, [])
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -837,7 +879,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -851,8 +893,12 @@ class TestLoadPreviousReview(unittest.TestCase):
 
     def test_section_without_range_line_skipped(self) -> None:
         """A section header with no ```diff block is skipped gracefully."""
-        content = "## [CHANGE REQUESTED] broken.py\n> some comment\n# neorev:AQ==\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        content = (
+            "### [CHANGE REQUESTED] `broken.py`\n\n"
+            "some comment\n\n"
+            "<!-- neorev: approved-bitmap=AQ== -->\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(content)
             path = f.name
 
@@ -1791,7 +1837,7 @@ class TestTerminalRender(unittest.TestCase):
         """Note panel lists existing notes."""
         refs = [
             neorev.ManagedNoteRef(
-                scope_label="(global)",
+                scope_label="global",
                 text="fix this",
                 kind=neorev.NoteKind.FLAG,
             ),
@@ -1807,7 +1853,7 @@ class TestTerminalRender(unittest.TestCase):
         diff_lines = b"\n".join(b"line%d" % i for i in range(TERM_HEIGHT))
         refs = [
             neorev.ManagedNoteRef(
-                scope_label="(global)",
+                scope_label="global",
                 text="note",
                 kind=neorev.NoteKind.FLAG,
             ),
@@ -2027,25 +2073,25 @@ class TestArgParser(unittest.TestCase):
     def test_output_required(self) -> None:
         """Parser requires an output positional argument."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.txt"])
-        self.assertEqual(args.output, "out.txt")
+        args = parser.parse_args(["out.md"])
+        self.assertEqual(args.output, "out.md")
         self.assertFalse(args.clip)
         self.assertFalse(args.clear)
 
     def test_clip_flag(self) -> None:
         """The -x/--clip flag is recognised."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--clip", "out.txt"])
+        args = parser.parse_args(["--clip", "out.md"])
         self.assertTrue(args.clip)
-        args_short = parser.parse_args(["-x", "out.txt"])
+        args_short = parser.parse_args(["-x", "out.md"])
         self.assertTrue(args_short.clip)
 
     def test_clear_flag(self) -> None:
         """The -c/--clear flag is recognised."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--clear", "out.txt"])
+        args = parser.parse_args(["--clear", "out.md"])
         self.assertTrue(args.clear)
-        args_short = parser.parse_args(["-c", "out.txt"])
+        args_short = parser.parse_args(["-c", "out.md"])
         self.assertTrue(args_short.clear)
 
     def test_missing_output_fails(self) -> None:
@@ -2057,78 +2103,78 @@ class TestArgParser(unittest.TestCase):
     def test_git_with_revision(self) -> None:
         """The -g flag accepts a revision argument."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-g", "HEAD~1", "out.txt"])
+        args = parser.parse_args(["-g", "HEAD~1", "out.md"])
         self.assertEqual(args.git, "HEAD~1")
         self.assertIsNone(args.jj)
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_jj_with_revision(self) -> None:
         """The -j flag accepts a revision argument."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "abc123", "out.txt"])
+        args = parser.parse_args(["-j", "abc123", "out.md"])
         self.assertEqual(args.jj, "abc123")
         self.assertIsNone(args.git)
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_git_without_revision_after_positional(self) -> None:
         """The -g flag without a revision works when placed after the output."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.txt", "-g"])
+        args = parser.parse_args(["out.md", "-g"])
         self.assertEqual(args.git, "")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_jj_without_revision_after_positional(self) -> None:
         """The -j flag without a revision works when placed after the output."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.txt", "-j"])
+        args = parser.parse_args(["out.md", "-j"])
         self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_git_without_revision_before_positional_consumes_it(self) -> None:
         """Placing -g before the positional without a rev consumes the output."""
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-g", "out.txt"])
+            parser.parse_args(["-g", "out.md"])
 
     def test_jj_without_revision_before_positional_consumes_it(self) -> None:
         """Placing -j before the positional without a rev consumes the output."""
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-j", "out.txt"])
+            parser.parse_args(["-j", "out.md"])
 
     def test_git_and_jj_mutually_exclusive(self) -> None:
         """Using both -g and -j is rejected."""
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-g", "HEAD", "-j", "abc", "out.txt"])
+            parser.parse_args(["-g", "HEAD", "-j", "abc", "out.md"])
 
     def test_git_without_revision_uses_separator(self) -> None:
         """Using -- separator lets -g without a rev precede the positional."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-g", "--", "out.txt"])
+        args = parser.parse_args(["-g", "--", "out.md"])
         self.assertEqual(args.git, "")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_jj_without_revision_uses_separator(self) -> None:
         """Using -- separator lets -j without a rev precede the positional."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "--", "out.txt"])
+        args = parser.parse_args(["-j", "--", "out.md"])
         self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_long_form_git_with_revision(self) -> None:
         """The --git long form works with a revision."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--git", "v1.0", "out.txt"])
+        args = parser.parse_args(["--git", "v1.0", "out.md"])
         self.assertEqual(args.git, "v1.0")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
     def test_long_form_jj_without_revision(self) -> None:
         """The --jj long form works without a revision after the positional."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.txt", "--jj"])
+        args = parser.parse_args(["out.md", "--jj"])
         self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.txt")
+        self.assertEqual(args.output, "out.md")
 
 
 class TestMainWorkflow(unittest.TestCase):
@@ -2154,17 +2200,17 @@ class TestMainWorkflow(unittest.TestCase):
                 )
             )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:
             run_main_with_scripted_terminal(TWO_HUNK_DIFF, output_path, script)
             output = Path(output_path).read_text()
-            self.assertIn("[CHANGE REQUESTED] hello.py", output)
+            self.assertIn("[CHANGE REQUESTED] `hello.py", output)
             self.assertIn(WORKFLOW_FLAG_COMMENT, output)
-            self.assertIn("[QUESTION] (global)", output)
+            self.assertIn("[QUESTION] `global`", output)
             self.assertIn(WORKFLOW_GLOBAL_NOTE, output)
-            self.assertIn("# neorev:", output)
+            self.assertIn("<!-- neorev: approved-bitmap=", output)
         finally:
             os.unlink(output_path)
 
@@ -2186,7 +2232,7 @@ class TestMainWorkflow(unittest.TestCase):
         ]
         previous_output = neorev.format_output(previous_hunks, previous_notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(previous_output)
             output_path = f.name
 
@@ -2219,12 +2265,12 @@ class TestMainWorkflow(unittest.TestCase):
         bitmap_hunks[0].approved = True
         conflicting_bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
         previous_output = re.sub(
-            r"# neorev:\S+",
-            f"# neorev:{conflicting_bitmap}",
+            r"<!-- neorev: approved-bitmap=\S+ -->",
+            f"<!-- neorev: approved-bitmap={conflicting_bitmap} -->",
             previous_output,
         )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(previous_output)
             output_path = f.name
 
@@ -2235,7 +2281,7 @@ class TestMainWorkflow(unittest.TestCase):
                 lambda _state: None,
             )
             output = Path(output_path).read_text()
-            self.assertIn("[QUESTION] hello.py", output)
+            self.assertIn("[QUESTION] `hello.py", output)
             self.assertIn(WORKFLOW_PRECEDENCE_QUESTION, output)
         finally:
             os.unlink(output_path)
@@ -2246,16 +2292,16 @@ class TestMainWorkflow(unittest.TestCase):
         bitmap_hunks[1].approved = True
         bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
         stale_output = (
-            "## [CHANGE REQUESTED] stale.py @ hunk\n"
+            "### [CHANGE REQUESTED] `stale.py @ hunk`\n\n"
             "```diff\n"
             "@@ -99,1 +99,1 @@\n"
             "+stale\n"
-            "```\n"
-            "> stale note\n\n"
-            f"# neorev:{bitmap}\n"
+            "```\n\n"
+            "stale note\n\n"
+            f"<!-- neorev: approved-bitmap={bitmap} -->\n"
         )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(stale_output)
             output_path = f.name
 
@@ -2274,7 +2320,7 @@ class TestMainWorkflow(unittest.TestCase):
 
     def test_git_without_revision_includes_diff_source(self) -> None:
         """Using -g without a revision still includes 'git show' as diff source."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:
@@ -2297,7 +2343,7 @@ class TestMainWorkflow(unittest.TestCase):
 
     def test_jj_without_revision_includes_diff_source(self) -> None:
         """Using -j without a revision still includes 'jj show' as diff source."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:
@@ -2336,7 +2382,7 @@ class TestMainWorkflow(unittest.TestCase):
         ]
         previous_output = neorev.format_output(previous_hunks, previous_notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(previous_output)
             output_path = f.name
 
@@ -2840,7 +2886,7 @@ class TestParsePreviousReview(unittest.TestCase):
         )
         output = neorev.format_output([hunk], [])
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -2864,7 +2910,7 @@ class TestParsePreviousReview(unittest.TestCase):
         ]
         output = neorev.format_output(hunks, notes)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(output)
             path = f.name
 
@@ -3541,7 +3587,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             for hunk in state.hunks:
                 hunk.approved = True
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         os.unlink(output_path)
@@ -3571,7 +3617,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
                 neorev.GlobalNote(kind=neorev.NoteKind.QUESTION, text="why?")
             )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:
@@ -3595,7 +3641,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             """Approve only the first hunk."""
             state.hunks[0].approved = True
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:

@@ -7,8 +7,8 @@ TUI tool optimized for efficient review of code produced by coding agents.
 Pipe diff from `git` or `jj` to `neorev`, view and annotate hunks, then send the output text directly to the agent:
 
 ```bash
-git diff | neorev review.txt
-claude -p "@review.txt"
+git diff | neorev review.md
+claude -p "@review.md"
 ```
 
 Main screen, selecting a line in hunk:
@@ -57,8 +57,8 @@ chmod +x ./neorev
 1. Pipe any unified diff into `neorev` with an output file:
 
 ```bash
-git diff HEAD~1 | neorev review.txt
-jj show XXX | neorev review.txt
+git diff HEAD~1 | neorev review.md
+jj show XXX | neorev review.md
 ```
 
 2. Navigate and annotate hunks in the TUI:
@@ -82,7 +82,7 @@ q / Ctrl-C    Quit and write output to file
 
 3. Send the output to the agent
 
-Pasting `@review.txt` in the agent window is all that is required. Since the output is unambiguous any additional message like "please process the attached review" is a pure waste of tokens and your time typing it.
+Pasting `@review.md` in the agent window is all that is required. Since the output is unambiguous any additional message like "please process the attached review" is a pure waste of tokens and your time typing it.
 
 Pass `-x`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to clipboard (requires `xclip`).
 
@@ -96,10 +96,10 @@ This basically applies the [squash workflow](https://steveklabnik.github.io/juju
 2. Create another empty commit on top of it, this will be the code **under review**: `jj new`
 3. Prompt the agent to start work
 4. When the agent is done:
-   - `jj show | neorev -x /tmp/review.txt`
+   - `jj show | neorev -x /tmp/review.md`
    - if code fully meets expectations: `jj squash`, the end
    - if code partially meets expectations: `jj squash -i` to squash the good parts into the vetted commit
-5. Send `@/tmp/review.txt` to the agent, go to 4
+5. Send `@/tmp/review.md` to the agent, go to 4
 
 Notes :
 

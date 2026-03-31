@@ -18,7 +18,11 @@ git diff HEAD~1 | ./neorev --clip review.txt
 - Dataclasses for all structured data.
 - No `_` prefix on methods or functions. All names are plain, even internal helpers.
 - Docstrings mandatory on all functions (imperative mood).
-- Typing annotations mandatory on all function signatures. Use `from __future__ import annotations` to avoid string-quoted forward references; always write the real type, never a string.
+- Typing:
+  - Annotations mandatory on all function signatures. Always write the real type, never a string-quoted annotation.
+  - Use `from __future__ import annotations` only when genuinely required for unresolved forward references.
+  - Avoid `typing.Any`; use precise types, protocols, or generics instead. `Any` is acceptable only as a last resort when no precise type is feasible, never as a shortcut to skip proper typing.
+  - Avoid `typing.cast`; prefer precise annotations, runtime narrowing (`isinstance` / assertions), or API shapes that type-check without casts.
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
 - **IMPORTANT: Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.**

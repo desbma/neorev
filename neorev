@@ -3,10 +3,10 @@
 neorev — human review for agent diffs.
 
 Usage:
-    jj show XXX | neorev for_agent.txt
-    jj show XXX | neorev --clip for_agent.txt
-    jj show XXX | neorev --clear for_agent.txt
-    git diff HEAD~1 | neorev review.txt
+    jj show XXX | neorev for_agent.md
+    jj show XXX | neorev --clip for_agent.md
+    jj show XXX | neorev --clear for_agent.md
+    git diff HEAD~1 | neorev review.md
 
 Reads a unified diff from stdin, renders each hunk through `delta` for
 pretty display, and lets you annotate hunks interactively. On quit,
@@ -54,11 +54,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from typing import Self, TextIO
+    from typing import IO, Self
 
 CSI = "\033["
 BOLD = f"{CSI}1m"
@@ -93,7 +93,7 @@ MIN_TERMINAL_HEIGHT = CHROME_ROWS + MIN_VISIBLE_ROWS
 TRUNCATION_ELLIPSIS = "…"
 RESIZE_DEBOUNCE_TIMEOUT = 0.05
 SELECT_IMMEDIATE = 0
-GLOBAL_TARGET = "(global)"
+GLOBAL_TARGET = "global"
 LINE_PICKER_SELECT_KEY = "\r"
 EDITOR_CONTEXT_RADIUS = 3
 EDITOR_HUNK_CONTEXT_MAX = 15
@@ -118,7 +118,11 @@ HUNK_RANGE_LINE_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@"
 )
 SECTION_HEADER_RE = re.compile(
-    r"\[(CHANGE REQUESTED|QUESTION)\]\s+(.+?)(?:\s+@\s+(.+))?$",
+    r"\[(CHANGE REQUESTED|QUESTION)\]\s+`(.+?)(?:\s+@\s+(.+?))?`$",
+    re.MULTILINE,
+)
+FOOTER_RE = re.compile(
+    r"^<!-- neorev: approved-bitmap=(\S+) -->$",
     re.MULTILINE,
 )
 LINE_PICKER_FOOTER_SEGMENTS = [
@@ -128,17 +132,19 @@ LINE_PICKER_FOOTER_SEGMENTS = [
     ("Esc", "cancel"),
 ]
 
-OUTPUT_PREAMBLE = """\
-# Code Review
-#
-# Instructions for the agent:
-# - CHANGE REQUESTED → apply the requested change.
-# - QUESTION → answer the question; do NOT change code unless your answer
-#   warrants it.
-# - Global notes do not apply to a specific part of the diff. They may
-#   refer to the change as a whole, or to something outside of it.
-#
-"""
+OUTPUT_PREAMBLE = (
+    "# Code Review\n\n"
+    "## Instructions\n\n"
+    "- `CHANGE REQUESTED` → apply the requested change.\n"
+    "- `QUESTION` → answer the question; do NOT change code"
+    " unless your answer warrants it.\n"
+    "- `global` notes do not apply to a specific part of the diff."
+    " They may refer to the change as a whole, or to something"
+    " outside of it.\n"
+    "- A `diff` block is review context, not an appliable patch.\n"
+    "- `# ...` inside a `diff` block means lines from the same"
+    " hunk were omitted.\n"
+)
 
 
 class Status(enum.Enum):
@@ -696,12 +702,12 @@ def format_output(
         if diff_source:
             out.write(f"# Reviewed diff: `{diff_source}`\n")
         out.write(f"# {approved}/{len(hunks)} hunks approved.\n")
-        out.write(f"# neorev:{encode_approved_bitmap(hunks)}\n")
+        out.write(format_footer(hunks))
         return out.getvalue()
 
     out.write(OUTPUT_PREAMBLE)
     if diff_source:
-        out.write(f"# Reviewed diff: `{diff_source}`\n#\n")
+        out.write(f"- Reviewed diff: `{diff_source}`\n")
 
     for note in global_notes:
         write_note_section(out, note.kind, GLOBAL_TARGET, note.text)
@@ -715,7 +721,7 @@ def format_output(
             diff_block=format_diff_block(hunk, hnote),
         )
 
-    out.write(f"# neorev:{encode_approved_bitmap(hunks)}\n")
+    out.write(format_footer(hunks))
     return out.getvalue()
 
 
@@ -727,17 +733,22 @@ def write_note_section(
     diff_block: str | None = None,
 ) -> None:
     """Write a single note section (global or hunk-scoped) to *out*."""
-    out.write(f"## [{kind.value}] {heading}\n")
+    out.write(f"\n### [{kind.value}] `{heading}`\n\n")
     if diff_block:
         out.write(diff_block)
-    out.writelines(f"> {line}\n" for line in text.splitlines())
+    out.write(text)
     out.write("\n")
 
 
 def format_diff_block(hunk: Hunk, note: HunkNote) -> str:
     """Format the fenced diff block for a hunk note section."""
     trimmed = trim_body_lines(hunk, note)
-    return f"```diff\n{hunk.range_line}\n" + "\n".join(trimmed) + "\n```\n"
+    return f"```diff\n{hunk.range_line}\n" + "\n".join(trimmed) + "\n```\n\n"
+
+
+def format_footer(hunks: list[Hunk]) -> str:
+    """Format the HTML comment footer with the approved-hunk bitmap."""
+    return f"\n<!-- neorev: approved-bitmap={encode_approved_bitmap(hunks)} -->\n"
 
 
 def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
@@ -826,10 +837,10 @@ def load_previous_review(
     annotations: dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]] = {}
     global_notes: list[GlobalNote] = []
 
-    bitmap_match = re.search(r"^# neorev:(\S+)$", text, re.MULTILINE)
+    bitmap_match = FOOTER_RE.search(text)
     bitmap_encoded = bitmap_match.group(1) if bitmap_match else ""
 
-    sections = re.split(r"^## ", text, flags=re.MULTILINE)
+    sections = re.split(r"^### ", text, flags=re.MULTILINE)
     for section in sections:
         parse_review_section(section, annotations, global_notes)
 
@@ -841,7 +852,7 @@ def parse_review_section(
     annotations: dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]],
     global_notes: list[GlobalNote],
 ) -> None:
-    """Parse one ``## ...`` section and populate *annotations* or *global_notes*."""
+    """Parse one ``### ...`` section and populate *annotations* or *global_notes*."""
     if not section.strip():
         return
 
@@ -876,14 +887,11 @@ def parse_review_section(
 
 
 def extract_comment_lines(section: str) -> str:
-    """Extract ``> ``-prefixed comment lines from a review section."""
-    comment_lines: list[str] = []
-    for line in section.splitlines():
-        if line.startswith("> "):
-            comment_lines.append(line[2:])
-        elif line == ">":
-            comment_lines.append("")
-    return "\n".join(comment_lines).strip()
+    """Extract the review message text from a section body."""
+    body = re.sub(r"```diff\n.*?```\n?", "", section, flags=re.DOTALL)
+    body = SECTION_HEADER_RE.sub("", body)
+    body = FOOTER_RE.sub("", body)
+    return body.strip()
 
 
 def apply_previous_review(
@@ -910,7 +918,7 @@ def apply_previous_review(
 
 
 def write_comment_template(
-    file_obj: TextIO,
+    file_obj: IO[str],
     location: str,
     existing: str,
     context_lines: list[str] | None = None,
@@ -1578,9 +1586,7 @@ class Terminal:
             prefix="review-",
             delete=False,
         ) as tmp:
-            jump_line = write_comment_template(
-                cast("TextIO", tmp), location, existing, context_lines
-            )
+            jump_line = write_comment_template(tmp, location, existing, context_lines)
             tmppath = tmp.name
 
         try:
