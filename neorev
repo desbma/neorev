@@ -2167,6 +2167,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "output",
+        nargs="?",
+        default=None,
         help="output file for the review (created or updated)",
     )
     parser.add_argument(
@@ -2201,6 +2203,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="run 'jj show [REV]' and use its output as the diff",
     )
     return parser
+
+
+def resolve_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Resolve ambiguity when -g/-j consumes the output positional."""
+    if args.output is None:
+        for flag in ("git", "jj"):
+            value = getattr(args, flag)
+            if value:
+                setattr(args, flag, "")
+                args.output = value
+                return
+        parser.error("the following arguments are required: output")
 
 
 def fetch_diff_from_vcs(command: list[str]) -> str:
@@ -2321,6 +2335,7 @@ def main() -> None:
     """Run the neorev command-line entry point."""
     parser = build_arg_parser()
     args = parser.parse_args()
+    resolve_args(parser, args)
 
     diff_source = ""
     if args.git is not None:

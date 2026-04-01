@@ -2089,7 +2089,8 @@ class TestArgParser(unittest.TestCase):
         """Omitting the output file raises SystemExit."""
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args([])
+            args = parser.parse_args([])
+            neorev.resolve_args(parser, args)
 
     def test_git_with_revision(self) -> None:
         """The -g flag accepts a revision argument."""
@@ -2121,17 +2122,21 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.jj, "")
         self.assertEqual(args.output, "out.md")
 
-    def test_git_without_revision_before_positional_consumes_it(self) -> None:
-        """Placing -g before the positional without a rev consumes the output."""
+    def test_git_without_revision_before_positional(self) -> None:
+        """Placing -g before the positional without a rev treats the arg as output."""
         parser = neorev.build_arg_parser()
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-g", "out.md"])
+        args = parser.parse_args(["-g", "out.md"])
+        neorev.resolve_args(parser, args)
+        self.assertEqual(args.git, "")
+        self.assertEqual(args.output, "out.md")
 
-    def test_jj_without_revision_before_positional_consumes_it(self) -> None:
-        """Placing -j before the positional without a rev consumes the output."""
+    def test_jj_without_revision_before_positional(self) -> None:
+        """Placing -j before the positional without a rev treats the arg as output."""
         parser = neorev.build_arg_parser()
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-j", "out.md"])
+        args = parser.parse_args(["-j", "out.md"])
+        neorev.resolve_args(parser, args)
+        self.assertEqual(args.jj, "")
+        self.assertEqual(args.output, "out.md")
 
     def test_git_and_jj_mutually_exclusive(self) -> None:
         """Using both -g and -j is rejected."""
