@@ -2296,14 +2296,14 @@ def fetch_diff_from_vcs(command: list[str]) -> str:
         result = subprocess.run(command, capture_output=True, text=True, check=True)
     except FileNotFoundError:
         sys.stderr.write(f"Error: '{command[0]}' not found.\n")
-        sys.exit(1)
+        exit(os.EX_UNAVAILABLE)
     except subprocess.CalledProcessError as exc:
         sys.stderr.write(exc.stderr or f"Error: {command} failed.\n")
-        sys.exit(1)
+        exit(os.EX_DATAERR)
 
     if not result.stdout.strip():
         sys.stderr.write("Empty diff.\n")
-        sys.exit(1)
+        exit(os.EX_DATAERR)
 
     return result.stdout
 
@@ -2315,12 +2315,12 @@ def read_diff_from_stdin_or_exit(
     if sys.stdin.isatty():
         parser.print_usage(sys.stderr)
         sys.stderr.write("\nError: no diff on stdin. Pipe a diff into neorev.\n")
-        sys.exit(1)
+        exit(os.EX_USAGE)
 
     diff_text = sys.stdin.read()
     if not diff_text.strip():
         sys.stderr.write("Empty diff.\n")
-        sys.exit(1)
+        exit(os.EX_DATAERR)
 
     return diff_text
 
@@ -2330,7 +2330,7 @@ def parse_diff_or_exit(diff_text: str) -> list[Hunk]:
     hunks = parse_diff(diff_text)
     if not hunks:
         sys.stderr.write("No hunks found in diff.\n")
-        sys.exit(1)
+        exit(os.EX_DATAERR)
     return hunks
 
 

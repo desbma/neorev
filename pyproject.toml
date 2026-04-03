@@ -5,6 +5,7 @@ ignore = [
     "D203",    # incompatible with D211
     "D212",    # incompatible with D213
     "D401",    # imperative docstrings
+    "PLR1722", # sys.exit vs exit
     "PLW1510", # subprocess.run without check
     "PT",      # pytest
     "PTH108",  # os.unlink -> Path.unlink
