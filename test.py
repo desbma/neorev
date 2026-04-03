@@ -2358,6 +2358,38 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertIn("v1.0", rev_parse_cmd)
 
 
+class TestDetectVcs(unittest.TestCase):
+    """Tests for detect_vcs."""
+
+    def test_returns_none_outside_any_repo(self) -> None:
+        """Return None when neither .jj nor .git exist."""
+        with patch.object(Path, "is_dir", return_value=False):
+            result = neorev.detect_vcs()
+        self.assertIsNone(result)
+
+    def test_returns_jujutsu_in_jj_repo(self) -> None:
+        """Return Vcs.JUJUTSU when .jj directory exists."""
+
+        def fake_is_dir(self: Path) -> bool:
+            """Return True only for .jj."""
+            return self.name == ".jj"
+
+        with patch.object(Path, "is_dir", fake_is_dir):
+            result = neorev.detect_vcs()
+        self.assertEqual(result, neorev.Vcs.JUJUTSU)
+
+    def test_returns_git_in_git_repo(self) -> None:
+        """Return Vcs.GIT when .git exists but .jj does not."""
+
+        def fake_is_dir(self: Path) -> bool:
+            """Return True only for .git."""
+            return self.name == ".git"
+
+        with patch.object(Path, "is_dir", fake_is_dir):
+            result = neorev.detect_vcs()
+        self.assertEqual(result, neorev.Vcs.GIT)
+
+
 class TestMainWorkflow(unittest.TestCase):
     """High-level tests for new review and resume workflows through main()."""
 

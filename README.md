@@ -4,10 +4,10 @@
 
 TUI tool optimized for efficient review of code produced by coding agents.
 
-Pipe diff from `git` or `jj` to `neorev`, view and annotate hunks, then send the output text directly to the agent:
+Review diffs from `git` or `jj` with `neorev`, annotate hunks, then send the output text directly to the agent:
 
 ```bash
-git diff | neorev -o review.md
+neorev -o review.md
 claude -p "@review.md"
 ```
 
@@ -54,11 +54,19 @@ chmod +x ./neorev
 
 ## Usage
 
-1. Pipe any unified diff into `neorev` with an output file:
+1. Run `neorev` on a diff:
 
 ```bash
-git diff HEAD~1 | neorev review.md
-jj show XXX | neorev review.md
+# Auto-detect VCS and review the current revision ('git show HEAD' or 'jj show @'):
+neorev
+
+# Or pipe a diff explicitly:
+git diff HEAD~1 | neorev -o review.md
+jj show XXX | neorev -o review.md
+
+# Or pass a revision directly:
+neorev -g HEAD~2 -o review.md
+neorev -j XXX -o review.md
 ```
 
 2. Navigate and annotate hunks in the TUI:
