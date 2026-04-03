@@ -3868,5 +3868,32 @@ class TestAllClearSkipsFile(unittest.TestCase):
             os.unlink(output_path)
 
 
+class TestCompactPath(unittest.TestCase):
+    """Tests for compact_path: replaces home directory prefix with ~."""
+
+    def test_path_under_home(self) -> None:
+        """Replace home prefix with ~ for a path under the home directory."""
+        home = str(Path.home())
+        self.assertEqual(
+            neorev.compact_path(f"{home}/foo/bar.md"),
+            "~/foo/bar.md",
+        )
+
+    def test_home_itself(self) -> None:
+        """Replace the home directory path itself with ~."""
+        home = str(Path.home())
+        self.assertEqual(neorev.compact_path(home), "~")
+
+    def test_path_outside_home(self) -> None:
+        """Leave paths outside the home directory unchanged."""
+        self.assertEqual(neorev.compact_path("/etc/foo.md"), "/etc/foo.md")
+
+    def test_partial_prefix_not_replaced(self) -> None:
+        """Do not replace when home is only a partial prefix of a component."""
+        home = str(Path.home())
+        path = f"{home}extra/file.md"
+        self.assertEqual(neorev.compact_path(path), path)
+
+
 if __name__ == "__main__":
     unittest.main()
