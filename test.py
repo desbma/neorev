@@ -81,6 +81,7 @@ SCROLL_HALF_PAGE = max(
     (TERM_HEIGHT - neorev.CHROME_ROWS - neorev.SCROLL_INDICATOR_ROWS) // 2,
 )
 LINE_PICKER_MANY_LINES = 30
+MOCK_OUTPUT_PATH = "/mock/output/review.md"
 
 ESC_ARROW_UP = b"\x1b[A"
 ESC_ARROW_DOWN = b"\x1b[B"
@@ -303,7 +304,7 @@ def run_main_with_scripted_terminal(
 ) -> str:
     """Run neorev.main() with a fake terminal script and return captured stderr."""
     stderr = io.StringIO()
-    argv = ["neorev", *(extra_args or []), output_path]
+    argv = ["neorev", *(extra_args or []), "-o", output_path]
     with (
         patch.object(
             neorev,
@@ -2059,43 +2060,63 @@ class TestDispatchKey(unittest.TestCase):
 
 
 class TestArgParser(unittest.TestCase):
-    """Tests for build_arg_parser."""
+    """Tests for build_arg_parser and resolve_args."""
 
-    def test_output_required(self) -> None:
-        """Parser requires an output positional argument."""
+    def test_output_flag(self) -> None:
+        """The -o/--output flag sets the output path."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.md"])
+        args = parser.parse_args(["-o", "out.md"])
         self.assertEqual(args.output, "out.md")
         self.assertFalse(args.clip)
         self.assertFalse(args.clear)
 
+    def test_output_long_form(self) -> None:
+        """The --output long form sets the output path."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["--output", "out.md"])
+        self.assertEqual(args.output, "out.md")
+
     def test_clip_flag(self) -> None:
         """The -x/--clip flag is recognised."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--clip", "out.md"])
+        args = parser.parse_args(["--clip", "-o", "out.md"])
         self.assertTrue(args.clip)
-        args_short = parser.parse_args(["-x", "out.md"])
+        args_short = parser.parse_args(["-x", "-o", "out.md"])
         self.assertTrue(args_short.clip)
 
     def test_clear_flag(self) -> None:
         """The -c/--clear flag is recognised."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--clear", "out.md"])
+        args = parser.parse_args(["--clear", "-o", "out.md"])
         self.assertTrue(args.clear)
-        args_short = parser.parse_args(["-c", "out.md"])
+        args_short = parser.parse_args(["-c", "-o", "out.md"])
         self.assertTrue(args_short.clear)
 
-    def test_missing_output_fails(self) -> None:
-        """Omitting the output file raises SystemExit."""
+    def test_output_defaults_to_none(self) -> None:
+        """Omitting -o leaves output as None for resolve_args to fill."""
         parser = neorev.build_arg_parser()
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            args = parser.parse_args([])
-            neorev.resolve_args(parser, args)
+        args = parser.parse_args([])
+        self.assertIsNone(args.output)
+
+    def test_resolve_args_fills_default_output(self) -> None:
+        """resolve_args fills in a default output path when not provided."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args([])
+        with patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH):
+            neorev.resolve_args(args)
+        self.assertEqual(args.output, MOCK_OUTPUT_PATH)
+
+    def test_resolve_args_keeps_explicit_output(self) -> None:
+        """resolve_args preserves an explicitly provided -o value."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-o", "mine.md"])
+        neorev.resolve_args(args)
+        self.assertEqual(args.output, "mine.md")
 
     def test_git_with_revision(self) -> None:
         """The -g flag accepts a revision argument."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-g", "HEAD~1", "out.md"])
+        args = parser.parse_args(["-g", "HEAD~1", "-o", "out.md"])
         self.assertEqual(args.git, "HEAD~1")
         self.assertIsNone(args.jj)
         self.assertEqual(args.output, "out.md")
@@ -2103,74 +2124,238 @@ class TestArgParser(unittest.TestCase):
     def test_jj_with_revision(self) -> None:
         """The -j flag accepts a revision argument."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "abc123", "out.md"])
+        args = parser.parse_args(["-j", "abc123", "-o", "out.md"])
         self.assertEqual(args.jj, "abc123")
         self.assertIsNone(args.git)
         self.assertEqual(args.output, "out.md")
 
-    def test_git_without_revision_after_positional(self) -> None:
-        """The -g flag without a revision works when placed after the output."""
+    def test_git_without_revision(self) -> None:
+        """The -g flag without a revision defaults to empty string."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.md", "-g"])
+        args = parser.parse_args(["-g"])
         self.assertEqual(args.git, "")
-        self.assertEqual(args.output, "out.md")
 
-    def test_jj_without_revision_after_positional(self) -> None:
-        """The -j flag without a revision works when placed after the output."""
+    def test_jj_without_revision(self) -> None:
+        """The -j flag without a revision defaults to empty string."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.md", "-j"])
+        args = parser.parse_args(["-j"])
         self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.md")
-
-    def test_git_without_revision_before_positional(self) -> None:
-        """Placing -g before the positional without a rev treats the arg as output."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-g", "out.md"])
-        neorev.resolve_args(parser, args)
-        self.assertEqual(args.git, "")
-        self.assertEqual(args.output, "out.md")
-
-    def test_jj_without_revision_before_positional(self) -> None:
-        """Placing -j before the positional without a rev treats the arg as output."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "out.md"])
-        neorev.resolve_args(parser, args)
-        self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.md")
 
     def test_git_and_jj_mutually_exclusive(self) -> None:
         """Using both -g and -j is rejected."""
         parser = neorev.build_arg_parser()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(["-g", "HEAD", "-j", "abc", "out.md"])
-
-    def test_git_without_revision_uses_separator(self) -> None:
-        """Using -- separator lets -g without a rev precede the positional."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-g", "--", "out.md"])
-        self.assertEqual(args.git, "")
-        self.assertEqual(args.output, "out.md")
-
-    def test_jj_without_revision_uses_separator(self) -> None:
-        """Using -- separator lets -j without a rev precede the positional."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "--", "out.md"])
-        self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.md")
+            parser.parse_args(["-g", "HEAD", "-j", "abc"])
 
     def test_long_form_git_with_revision(self) -> None:
         """The --git long form works with a revision."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--git", "v1.0", "out.md"])
+        args = parser.parse_args(["--git", "v1.0"])
         self.assertEqual(args.git, "v1.0")
-        self.assertEqual(args.output, "out.md")
 
     def test_long_form_jj_without_revision(self) -> None:
-        """The --jj long form works without a revision after the positional."""
+        """The --jj long form works without a revision."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["out.md", "--jj"])
+        args = parser.parse_args(["--jj"])
         self.assertEqual(args.jj, "")
-        self.assertEqual(args.output, "out.md")
+
+
+class TestDefaultOutputPath(unittest.TestCase):
+    """Tests for default_output_path and query_vcs_metadata."""
+
+    def make_meta(
+        self,
+        dirname: str = "proj",
+        workspace: str = "",
+        rev: str = "",
+    ) -> neorev.VcsMetadata:
+        """Build a VcsMetadata with test defaults."""
+        return neorev.VcsMetadata(dirname=dirname, workspace=workspace, rev=rev)
+
+    def test_uses_xdg_state_home_env(self) -> None:
+        """Respect $XDG_STATE_HOME when set."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
+            patch.object(neorev, "query_vcs_metadata", return_value=self.make_meta()),
+        ):
+            result = neorev.default_output_path("git", "")
+        self.assertTrue(result.startswith(tmpdir))
+        self.assertTrue(result.endswith(".md"))
+
+    def test_falls_back_to_xdg_default(self) -> None:
+        """Use ~/.local/state when $XDG_STATE_HOME is unset."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(neorev, "query_vcs_metadata", return_value=self.make_meta()),
+            patch.object(Path, "mkdir"),
+        ):
+            result = neorev.default_output_path("git", "")
+        self.assertIn(".local/state/neorev", result)
+
+    def test_filename_parts_basic(self) -> None:
+        """Filename includes review and dirname."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
+            patch.object(
+                neorev,
+                "query_vcs_metadata",
+                return_value=self.make_meta(dirname="myproj"),
+            ),
+        ):
+            result = neorev.default_output_path("git", "")
+        self.assertEqual(Path(result).name, "review-myproj.md")
+
+    def test_filename_parts_with_workspace_and_rev(self) -> None:
+        """Filename includes workspace and rev when available."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
+            patch.object(
+                neorev,
+                "query_vcs_metadata",
+                return_value=self.make_meta(workspace="feat", rev="abc1234"),
+            ),
+        ):
+            result = neorev.default_output_path("jj", "")
+        self.assertEqual(Path(result).name, "review-proj-feat-abc1234.md")
+
+    def test_filename_parts_with_rev_only(self) -> None:
+        """Filename includes rev but skips empty workspace."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
+            patch.object(
+                neorev,
+                "query_vcs_metadata",
+                return_value=self.make_meta(rev="def456"),
+            ),
+        ):
+            result = neorev.default_output_path("git", "")
+        self.assertEqual(Path(result).name, "review-proj-def456.md")
+
+    def test_creates_state_directory(self) -> None:
+        """The state directory is created if it does not exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "sub" / "neorev"
+            with (
+                patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmpdir) / "sub")}),
+                patch.object(
+                    neorev, "query_vcs_metadata", return_value=self.make_meta()
+                ),
+            ):
+                neorev.default_output_path("git", "")
+            self.assertTrue(state_dir.is_dir())
+
+    def test_resolve_args_detects_jj_from_flag(self) -> None:
+        """resolve_args passes 'jj' and empty rev to default_output_path."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-j"])
+        with patch.object(
+            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+        ) as mock:
+            neorev.resolve_args(args)
+        mock.assert_called_once_with("jj", "")
+
+    def test_resolve_args_passes_jj_rev(self) -> None:
+        """resolve_args forwards the jj revision to default_output_path."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-j", "abc123"])
+        with patch.object(
+            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+        ) as mock:
+            neorev.resolve_args(args)
+        mock.assert_called_once_with("jj", "abc123")
+
+    def test_resolve_args_detects_git_from_flag(self) -> None:
+        """resolve_args passes 'git' and empty rev to default_output_path."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-g"])
+        with patch.object(
+            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+        ) as mock:
+            neorev.resolve_args(args)
+        mock.assert_called_once_with("git", "")
+
+    def test_resolve_args_passes_git_rev(self) -> None:
+        """resolve_args forwards the git revision to default_output_path."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args(["-g", "HEAD~2"])
+        with patch.object(
+            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+        ) as mock:
+            neorev.resolve_args(args)
+        mock.assert_called_once_with("git", "HEAD~2")
+
+    def test_resolve_args_detects_jj_from_directory(self) -> None:
+        """resolve_args detects jj from .jj directory when no flag is given."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args([])
+        with (
+            patch.object(Path, "is_dir", return_value=True),
+            patch.object(
+                neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+            ) as mock,
+        ):
+            neorev.resolve_args(args)
+        mock.assert_called_once_with("jj", "")
+
+    def test_jj_uses_shortest_unambiguous_rev(self) -> None:
+        """query_jj_metadata uses shortest() without a fixed length."""
+        calls: list[list[str]] = []
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            calls.append(cmd)
+            if "log" in cmd:
+                return "l"
+            return "default: /some/path"
+
+        with patch.object(neorev, "run_vcs", side_effect=fake_run_vcs):
+            meta = neorev.query_jj_metadata()
+        self.assertEqual(meta.rev, "l")
+        log_cmd = calls[0]
+        template_arg = log_cmd[-1]
+        self.assertIn("shortest()", template_arg)
+        self.assertNotIn("shortest(8)", template_arg)
+
+    def test_jj_passes_custom_rev_to_log(self) -> None:
+        """query_jj_metadata passes a custom rev to jj log -r."""
+        calls: list[list[str]] = []
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            calls.append(cmd)
+            if "log" in cmd:
+                return "x"
+            return "default: /some/path"
+
+        with patch.object(neorev, "run_vcs", side_effect=fake_run_vcs):
+            meta = neorev.query_jj_metadata(rev="myrev")
+        self.assertEqual(meta.rev, "x")
+        log_cmd = calls[0]
+        r_idx = log_cmd.index("-r")
+        self.assertEqual(log_cmd[r_idx + 1], "myrev")
+
+    def test_git_passes_custom_rev_to_rev_parse(self) -> None:
+        """query_git_metadata passes a custom rev to git rev-parse."""
+        calls: list[list[str]] = []
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            calls.append(cmd)
+            if "rev-parse" in cmd and "--short" in cmd:
+                return "abc1234"
+            if "--show-toplevel" in cmd:
+                return "/home/user/proj"
+            return "worktree /home/user/proj\n"
+
+        with patch.object(neorev, "run_vcs", side_effect=fake_run_vcs):
+            meta = neorev.query_git_metadata(rev="v1.0")
+        self.assertEqual(meta.rev, "abc1234")
+        rev_parse_cmd = calls[0]
+        self.assertIn("v1.0", rev_parse_cmd)
 
 
 class TestMainWorkflow(unittest.TestCase):
@@ -2329,7 +2514,7 @@ class TestMainWorkflow(unittest.TestCase):
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-g", "--"],
+                    extra_args=["-g"],
                 )
             output = Path(output_path).read_text()
             self.assertIn("Reviewed diff:", output)
@@ -2352,7 +2537,7 @@ class TestMainWorkflow(unittest.TestCase):
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-j", "--"],
+                    extra_args=["-j"],
                 )
             output = Path(output_path).read_text()
             self.assertIn("Reviewed diff:", output)

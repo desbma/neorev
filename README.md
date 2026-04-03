@@ -7,7 +7,7 @@ TUI tool optimized for efficient review of code produced by coding agents.
 Pipe diff from `git` or `jj` to `neorev`, view and annotate hunks, then send the output text directly to the agent:
 
 ```bash
-git diff | neorev review.md
+git diff | neorev -o review.md
 claude -p "@review.md"
 ```
 
@@ -96,7 +96,7 @@ This basically applies the [squash workflow](https://steveklabnik.github.io/juju
 2. Create another empty commit on top of it, this will be the code **under review**: `jj new`
 3. Prompt the agent to start work
 4. When the agent is done:
-   - `jj show | neorev -x /tmp/review.md`
+   - `jj show | neorev -x -o /tmp/review.md`
    - if code fully meets expectations: `jj squash`, the end
    - if code partially meets expectations: `jj squash -i` to squash the good parts into the vetted commit
 5. Send `@/tmp/review.md` to the agent, go to 4

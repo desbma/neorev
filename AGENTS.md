@@ -8,8 +8,9 @@ neorev is a single-file Python 3 CLI tool (`./neorev`) for interactive human rev
 
 ```sh
 # Usage (no install needed):
-jj show XXX | ./neorev output.txt
-git diff HEAD~1 | ./neorev --clip review.txt
+jj show XXX | ./neorev
+./neorev -j XXX -o output.md
+./neorev -g HEAD~1 --clip
 ```
 
 ## Code Style
@@ -26,6 +27,7 @@ git diff HEAD~1 | ./neorev --clip review.txt
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
 - **IMPORTANT: Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.**
+  - **Exception:** well-known external identifiers (e.g. environment variable names like `"XDG_STATE_HOME"`) that are static, external to this project, and whose variable name already encodes the value may be inlined.
 - Group all module-level constants together at the top of the file, before class and function definitions.
 - Do not add large section-separator comment blocks (e.g. `# ===...` banners). Use class docstrings and natural whitespace to organize code.
 - At the end of any refactor, remove dead code (unused constants, types, helpers, and imports) before finishing.

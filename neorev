@@ -1,37 +1,5 @@
 #!/usr/bin/env python3
-"""
-neorev — human review for agent diffs.
-
-Usage:
-    jj show XXX | neorev for_agent.md
-    jj show XXX | neorev --clip for_agent.md
-    jj show XXX | neorev --clear for_agent.md
-    git diff HEAD~1 | neorev review.md
-
-Reads a unified diff from stdin, renders each hunk through `delta` for
-pretty display, and lets you annotate hunks interactively. On quit,
-writes a compact annotated review to the given output file.
-
-If the output file already exists, previous annotations are loaded and
-applied to matching hunks, so you can resume or refine a review.
-Pass --clear / -c to discard a previous review and start fresh.
-
-Keys:
-    j / ↓         Next hunk
-    k / ↑         Previous hunk
-    Ctrl-D        Scroll diff down (half page)
-    Ctrl-U        Scroll diff up (half page)
-    a             Approve hunk (no comment needed)
-    A             Approve all hunks in current file
-    c             Add question (hunk or line target, opens $EDITOR)
-    f             Add flag / request change (hunk or line target, opens $EDITOR)
-    gc            Add global question (not tied to a specific hunk, opens $EDITOR)
-    gf            Add global flag / request change (not tied to a specific hunk, opens
-                  $EDITOR)
-    m             Manage notes (edit / delete)
-    q / Ctrl-C    Quit and write output to file
-    ?             Show help
-"""
+"""neorev — human review for agent diffs."""
 
 from __future__ import annotations
 
@@ -107,6 +75,14 @@ NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
 NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
 ALL_CLEAR_MESSAGE = "All chunks approved, nothing to report.\n"
 PREVIEW_INTERPUNCT = " · "
+XDG_STATE_HOME_DEFAULT = ".local/state"
+NEOREV_STATE_DIR = "neorev"
+DEFAULT_OUTPUT_STEM = "review"
+DEFAULT_OUTPUT_EXT = ".md"
+DEFAULT_OUTPUT_SEPARATOR = "-"
+JJ_DEFAULT_REV = "@"
+GIT_DEFAULT_REV = "HEAD"
+JJ_DEFAULT_WORKSPACE = "default"
 
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
@@ -2166,18 +2142,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="neorev — human review for agent diffs.",
     )
     parser.add_argument(
-        "output",
-        nargs="?",
-        default=None,
-        help="output file for the review (created or updated)",
-    )
-    parser.add_argument(
-        "-x",
-        "--clip",
-        action="store_true",
-        help="copy @output_file to clipboard (via xclip) on exit",
-    )
-    parser.add_argument(
         "-c",
         "--clear",
         action="store_true",
@@ -2202,19 +2166,128 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="REV",
         help="run 'jj show [REV]' and use its output as the diff",
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="output file for the review (created or updated); "
+        "defaults to $XDG_STATE_HOME/neorev/<review-project-workspace-rev>.md",
+    )
+    parser.add_argument(
+        "-x",
+        "--clip",
+        action="store_true",
+        help="copy @output_file to clipboard (via xclip) on exit",
+    )
     return parser
 
 
-def resolve_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Resolve ambiguity when -g/-j consumes the output positional."""
-    if args.output is None:
-        for flag in ("git", "jj"):
-            value = getattr(args, flag)
-            if value:
-                setattr(args, flag, "")
-                args.output = value
-                return
-        parser.error("the following arguments are required: output")
+@dataclass
+class VcsMetadata:
+    """Project metadata extracted from the VCS for default output naming."""
+
+    dirname: str
+    workspace: str = ""
+    rev: str = ""
+
+
+def run_vcs(command: list[str]) -> str:
+    """Run a VCS command and return stripped stdout."""
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
+    """Return project metadata from the current jujutsu repo."""
+    change_id = run_vcs(
+        [
+            "jj",
+            "log",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-r",
+            rev,
+            "-T",
+            'self.change_id().shortest() ++ "\\n"',
+        ]
+    )
+    workspace = ""
+    ws_output = run_vcs(["jj", "workspace", "list", "--ignore-working-copy"])
+    first_line = ws_output.split("\n", 1)[0]
+    ws_name = first_line.split(":")[0].strip()
+    if ws_name and ws_name != JJ_DEFAULT_WORKSPACE:
+        workspace = ws_name
+    return VcsMetadata(dirname=Path.cwd().name, workspace=workspace, rev=change_id)
+
+
+def query_git_metadata(rev: str = GIT_DEFAULT_REV) -> VcsMetadata:
+    """Return project metadata from the current git repo."""
+    short_hash = run_vcs(["git", "rev-parse", "--short", rev])
+    workspace = ""
+    toplevel = Path(run_vcs(["git", "rev-parse", "--show-toplevel"]))
+    porcelain = run_vcs(["git", "worktree", "list", "--porcelain"])
+    main_dir = ""
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            main_dir = line.split(" ", 1)[1]
+            break
+    if main_dir and Path(main_dir) != toplevel:
+        workspace = toplevel.name
+    return VcsMetadata(dirname=Path.cwd().name, workspace=workspace, rev=short_hash)
+
+
+def query_vcs_metadata(vcs: str, rev: str = "") -> VcsMetadata:
+    """Return project metadata for the current project."""
+    try:
+        if vcs == "jj":
+            return query_jj_metadata(rev) if rev else query_jj_metadata()
+        if vcs == "git":
+            return query_git_metadata(rev) if rev else query_git_metadata()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    return VcsMetadata(dirname=Path.cwd().name)
+
+
+def default_output_path(vcs: str, rev: str = "") -> str:
+    """Build the default output path under the XDG state directory."""
+    xdg_state = os.environ.get(
+        "XDG_STATE_HOME",
+        str(Path.home() / XDG_STATE_HOME_DEFAULT),
+    )
+    state_dir = Path(xdg_state) / NEOREV_STATE_DIR
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = query_vcs_metadata(vcs, rev)
+    parts = [DEFAULT_OUTPUT_STEM, meta.dirname]
+    if meta.workspace:
+        parts.append(meta.workspace)
+    if meta.rev:
+        parts.append(meta.rev)
+    filename = DEFAULT_OUTPUT_SEPARATOR.join(parts) + DEFAULT_OUTPUT_EXT
+    return str(state_dir / filename)
+
+
+def resolve_args(args: argparse.Namespace) -> None:
+    """Fill in *args.output* with the default path when not provided."""
+    if args.output is not None:
+        return
+    if args.jj is not None:
+        vcs = "jj"
+        rev = args.jj
+    elif args.git is not None:
+        vcs = "git"
+        rev = args.git
+    else:
+        vcs = "jj" if Path(".jj").is_dir() else "git"
+        rev = ""
+    args.output = default_output_path(vcs, rev)
 
 
 def fetch_diff_from_vcs(command: list[str]) -> str:
@@ -2335,7 +2408,7 @@ def main() -> None:
     """Run the neorev command-line entry point."""
     parser = build_arg_parser()
     args = parser.parse_args()
-    resolve_args(parser, args)
+    resolve_args(args)
 
     diff_source = ""
     if args.git is not None:
