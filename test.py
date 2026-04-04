@@ -2191,10 +2191,10 @@ class TestDefaultOutputPath(unittest.TestCase):
             patch.object(Path, "mkdir"),
         ):
             result = neorev.default_output_path("git", "")
-        self.assertIn(".local/state/neorev", result)
+        self.assertIn(".local/state/neorev/proj", result)
 
     def test_filename_parts_basic(self) -> None:
-        """Filename includes review and dirname."""
+        """Filename is just review.md; dirname becomes a subdirectory."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -2205,7 +2205,8 @@ class TestDefaultOutputPath(unittest.TestCase):
             ),
         ):
             result = neorev.default_output_path("git", "")
-        self.assertEqual(Path(result).name, "review-myproj.md")
+        self.assertEqual(Path(result).name, "review.md")
+        self.assertEqual(Path(result).parent.name, "myproj")
 
     def test_filename_parts_with_workspace_and_rev(self) -> None:
         """Filename includes workspace and rev when available."""
@@ -2219,7 +2220,8 @@ class TestDefaultOutputPath(unittest.TestCase):
             ),
         ):
             result = neorev.default_output_path("jj", "")
-        self.assertEqual(Path(result).name, "review-proj-feat-abc1234.md")
+        self.assertEqual(Path(result).name, "review-feat-abc1234.md")
+        self.assertEqual(Path(result).parent.name, "proj")
 
     def test_filename_parts_with_rev_only(self) -> None:
         """Filename includes rev but skips empty workspace."""
@@ -2233,12 +2235,13 @@ class TestDefaultOutputPath(unittest.TestCase):
             ),
         ):
             result = neorev.default_output_path("git", "")
-        self.assertEqual(Path(result).name, "review-proj-def456.md")
+        self.assertEqual(Path(result).name, "review-def456.md")
+        self.assertEqual(Path(result).parent.name, "proj")
 
     def test_creates_state_directory(self) -> None:
-        """The state directory is created if it does not exist."""
+        """The state directory including project subdir is created if missing."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_dir = Path(tmpdir) / "sub" / "neorev"
+            state_dir = Path(tmpdir) / "sub" / "neorev" / "proj"
             with (
                 patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmpdir) / "sub")}),
                 patch.object(

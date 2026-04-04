@@ -2185,7 +2185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="output file for the review (created or updated); "
-        "defaults to $XDG_STATE_HOME/neorev/<review-project-workspace-rev>.md",
+        "defaults to $XDG_STATE_HOME/neorev/<project>/<review-workspace-rev>.md",
     )
     parser.add_argument(
         "-x",
@@ -2292,11 +2292,11 @@ def default_output_path(vcs: Vcs, rev: str = "") -> str:
         "XDG_STATE_HOME",
         str(Path.home() / XDG_STATE_HOME_DEFAULT),
     )
-    state_dir = Path(xdg_state) / NEOREV_STATE_DIR
+    meta = query_vcs_metadata(vcs, rev)
+    state_dir = Path(xdg_state) / NEOREV_STATE_DIR / meta.dirname
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = query_vcs_metadata(vcs, rev)
-    parts = [DEFAULT_OUTPUT_STEM, meta.dirname]
+    parts = [DEFAULT_OUTPUT_STEM]
     if meta.workspace:
         parts.append(meta.workspace)
     if meta.rev:
