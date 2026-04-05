@@ -2341,6 +2341,22 @@ class TestDefaultOutputPath(unittest.TestCase):
         r_idx = log_cmd.index("-r")
         self.assertEqual(log_cmd[r_idx + 1], "myrev")
 
+    def test_jj_picks_workspace_matching_cwd(self) -> None:
+        """query_jj_metadata selects the workspace whose path matches cwd."""
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            if "log" in cmd:
+                return "abc"
+            return "default: /home/user/proj\nfeature: /home/user/proj-feature"
+
+        with (
+            patch.object(neorev, "run_vcs", side_effect=fake_run_vcs),
+            patch.object(Path, "cwd", return_value=Path("/home/user/proj-feature")),
+        ):
+            meta = neorev.query_jj_metadata()
+        self.assertEqual(meta.workspace, "feature")
+
     def test_git_passes_custom_rev_to_rev_parse(self) -> None:
         """query_git_metadata passes a custom rev to git rev-parse."""
         calls: list[list[str]] = []

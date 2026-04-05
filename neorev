@@ -83,6 +83,7 @@ DEFAULT_OUTPUT_SEPARATOR = "-"
 JJ_DEFAULT_REV = "@"
 GIT_DEFAULT_REV = "HEAD"
 JJ_DEFAULT_WORKSPACE = "default"
+JJ_WORKSPACE_LIST_FIELDS = 2  # "name: path" → 2 colon-separated fields
 
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
@@ -2243,10 +2244,16 @@ def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
     )
     workspace = ""
     ws_output = run_vcs(["jj", "workspace", "list", "--ignore-working-copy"])
-    first_line = ws_output.split("\n", 1)[0]
-    ws_name = first_line.split(":")[0].strip()
-    if ws_name and ws_name != JJ_DEFAULT_WORKSPACE:
-        workspace = ws_name
+    cwd = Path.cwd()
+    for line in ws_output.splitlines():
+        parts = line.split(":", 1)
+        if len(parts) < JJ_WORKSPACE_LIST_FIELDS:
+            continue
+        ws_name = parts[0].strip()
+        ws_path = Path(parts[1].strip())
+        if ws_path == cwd and ws_name != JJ_DEFAULT_WORKSPACE:
+            workspace = ws_name
+            break
     return VcsMetadata(dirname=Path.cwd().name, workspace=workspace, rev=change_id)
 
 
