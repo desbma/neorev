@@ -114,6 +114,17 @@ Notes :
 - you can stack another commit on top of the "under review" one, to track a round of changes, or to narrow down the review on a specific aspect
 - using Jujutsu [workspaces](https://docs.jj-vcs.dev/latest/cli-reference/#jj-workspace), you can do that on several trees simultaneously without disrupting work
 
+## Cleanup
+
+If no path is given, `neorev` stores review files by default in `~/.local/state/neorev/`. To automatically clean up old review files, install the provided systemd user tmpfiles config:
+
+```bash
+mkdir -p ~/.config/user-tmpfiles.d/
+cp user-tmpfiles.d/neorev.conf ~/.config/user-tmpfiles.d/
+```
+
+This will automatically remove review files older than 2 months.
+
 ## License
 
 [GPLv3](https://www.gnu.org/licenses/gpl-3.0-standalone.html)
