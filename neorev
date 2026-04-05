@@ -83,6 +83,8 @@ DEFAULT_OUTPUT_SEPARATOR = "-"
 JJ_DEFAULT_REV = "@"
 GIT_DEFAULT_REV = "HEAD"
 JJ_DEFAULT_WORKSPACE = "default"
+PROJECT_NAME_COMPONENTS = 2
+PROJECT_NAME_SEPARATOR = "-"
 JJ_WORKSPACE_LIST_FIELDS = 2  # "name: path" → 2 colon-separated fields
 
 QUESTION_ICON = "󰠗"
@@ -2206,6 +2208,13 @@ class VcsMetadata:
     rev: str = ""
 
 
+def project_name() -> str:
+    """Derive a project name from the last path components of the working directory."""
+    parts = [p for p in Path.cwd().parts if p != os.sep]
+    tail = parts[-PROJECT_NAME_COMPONENTS:]
+    return PROJECT_NAME_SEPARATOR.join(p.lower() for p in tail)
+
+
 def detect_vcs() -> Vcs | None:
     """Detect the VCS backend for the current directory."""
     if Path(".jj").is_dir():
@@ -2254,7 +2263,7 @@ def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
         if ws_path == cwd and ws_name != JJ_DEFAULT_WORKSPACE:
             workspace = ws_name
             break
-    return VcsMetadata(dirname=Path.cwd().name, workspace=workspace, rev=change_id)
+    return VcsMetadata(dirname=project_name(), workspace=workspace, rev=change_id)
 
 
 def query_git_metadata(rev: str = GIT_DEFAULT_REV) -> VcsMetadata:
@@ -2270,7 +2279,7 @@ def query_git_metadata(rev: str = GIT_DEFAULT_REV) -> VcsMetadata:
             break
     if main_dir and Path(main_dir) != toplevel:
         workspace = toplevel.name
-    return VcsMetadata(dirname=Path.cwd().name, workspace=workspace, rev=short_hash)
+    return VcsMetadata(dirname=project_name(), workspace=workspace, rev=short_hash)
 
 
 def query_vcs_metadata(vcs: Vcs, rev: str = "") -> VcsMetadata:
@@ -2282,7 +2291,7 @@ def query_vcs_metadata(vcs: Vcs, rev: str = "") -> VcsMetadata:
             return query_git_metadata(rev) if rev else query_git_metadata()
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
-    return VcsMetadata(dirname=Path.cwd().name)
+    return VcsMetadata(dirname=project_name())
 
 
 def compact_path(path: str) -> str:

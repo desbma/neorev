@@ -2377,6 +2377,23 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertIn("v1.0", rev_parse_cmd)
 
 
+class TestProjectName(unittest.TestCase):
+    """Tests for project_name."""
+
+    def test_uses_last_two_components_lowercased(self) -> None:
+        """Return the last 2 path components of cwd, lowercased, joined with '-'."""
+        cwd = Path("/home/user/Projets/NeoRev")
+        with patch.object(Path, "cwd", return_value=cwd):
+            result = neorev.project_name()
+        self.assertEqual(result, "projets-neorev")
+
+    def test_single_component_path(self) -> None:
+        """Return just the single component lowercased when path has depth 1."""
+        with patch.object(Path, "cwd", return_value=Path("/root")):
+            result = neorev.project_name()
+        self.assertEqual(result, "root")
+
+
 class TestDetectVcs(unittest.TestCase):
     """Tests for detect_vcs."""
 
