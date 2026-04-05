@@ -2238,8 +2238,8 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(Path(result).name, "review-def456.md")
         self.assertEqual(Path(result).parent.name, "proj")
 
-    def test_creates_state_directory(self) -> None:
-        """The state directory including project subdir is created if missing."""
+    def test_does_not_create_state_directory(self) -> None:
+        """default_output_path must not create the directory itself."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state_dir = Path(tmpdir) / "sub" / "neorev" / "proj"
             with (
@@ -2249,7 +2249,7 @@ class TestDefaultOutputPath(unittest.TestCase):
                 ),
             ):
                 neorev.default_output_path("git", "")
-            self.assertTrue(state_dir.is_dir())
+            self.assertFalse(state_dir.is_dir())
 
     def test_resolve_args_detects_jj_from_flag(self) -> None:
         """resolve_args passes 'jj' and empty rev to default_output_path."""
@@ -2375,6 +2375,18 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(meta.rev, "abc1234")
         rev_parse_cmd = calls[0]
         self.assertIn("v1.0", rev_parse_cmd)
+
+
+class TestWriteReviewOutput(unittest.TestCase):
+    """Tests for write_review_output."""
+
+    def test_creates_parent_directory(self) -> None:
+        """write_review_output creates missing parent directories before writing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = str(Path(tmpdir) / "nested" / "dir" / "review.md")
+            hunk = make_hunk(file_path="a.py")
+            neorev.write_review_output(output_path, [hunk], [])
+            self.assertTrue(Path(output_path).exists())
 
 
 class TestProjectName(unittest.TestCase):

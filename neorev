@@ -2310,7 +2310,6 @@ def default_output_path(vcs: Vcs, rev: str = "") -> str:
     )
     meta = query_vcs_metadata(vcs, rev)
     state_dir = Path(xdg_state) / NEOREV_STATE_DIR / meta.dirname
-    state_dir.mkdir(parents=True, exist_ok=True)
 
     parts = [DEFAULT_OUTPUT_STEM]
     if meta.workspace:
@@ -2429,7 +2428,9 @@ def write_review_output(
 ) -> None:
     """Write the final review output to *output_path*."""
     review_output = format_output(hunks, global_notes, diff_source)
-    Path(output_path).write_text(review_output)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(review_output)
     sys.stderr.write(f"Review written to {compact_path(output_path)}\n")
 
 
