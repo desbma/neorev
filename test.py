@@ -2361,6 +2361,36 @@ class TestDefaultOutputPath(unittest.TestCase):
             meta = neorev.query_jj_metadata()
         self.assertEqual(meta.workspace, "feature")
 
+    def test_git_default_rev_appends_dirty_suffix(self) -> None:
+        """query_git_metadata with rev=None returns '<short>-dirty' for working tree."""
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            if "rev-parse" in cmd and "--short" in cmd:
+                return "abc1234"
+            if "--show-toplevel" in cmd:
+                return "/home/user/proj"
+            return "worktree /home/user/proj\n"
+
+        with patch.object(neorev, "run_vcs", side_effect=fake_run_vcs):
+            meta = neorev.query_git_metadata()
+        self.assertEqual(meta.rev, "abc1234-dirty")
+
+    def test_git_explicit_rev_has_no_dirty_suffix(self) -> None:
+        """query_git_metadata with an explicit rev returns the bare short hash."""
+
+        def fake_run_vcs(cmd: list[str]) -> str:
+            """Capture calls and return stub output."""
+            if "rev-parse" in cmd and "--short" in cmd:
+                return "abc1234"
+            if "--show-toplevel" in cmd:
+                return "/home/user/proj"
+            return "worktree /home/user/proj\n"
+
+        with patch.object(neorev, "run_vcs", side_effect=fake_run_vcs):
+            meta = neorev.query_git_metadata(rev="v1.0")
+        self.assertEqual(meta.rev, "abc1234")
+
     def test_git_passes_custom_rev_to_rev_parse(self) -> None:
         """query_git_metadata passes a custom rev to git rev-parse."""
         calls: list[list[str]] = []
