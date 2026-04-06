@@ -66,6 +66,8 @@ EDITOR_CONTEXT_RADIUS = 3
 EDITOR_HUNK_CONTEXT_MAX = 15
 EDITOR_TARGET_MARKER = "►"
 EDITOR_CONTEXT_PAD = " "
+EDITOR_LINE_NUMBER_WIDTH = 4
+EDITOR_LINE_NUMBER_BLANK = " " * EDITOR_LINE_NUMBER_WIDTH
 
 NOTE_TARGET_HUNK = "hunk"
 NOTE_PANEL_CURSOR = "▶"
@@ -246,12 +248,12 @@ class NoteScope(enum.Enum):
 class Hunk:
     """A single diff hunk with optional review annotation."""
 
-    file_header: str
+    file_header: str | None
     range_line: str
     body: str
     raw: str
-    file_path: str = ""
-    start_line: int = 0
+    file_path: str | None = None
+    start_line: int | None = None
     approved: bool = False
     notes: list[HunkNote] = field(default_factory=list)
     display_lines: list[DisplayLine] = field(default_factory=list)
@@ -259,11 +261,11 @@ class Hunk:
     @property
     def short_location(self) -> str:
         """Return a compact 'file:line' location string."""
-        return (
-            f"{self.file_path}:{self.start_line}"
-            if self.file_path
-            else self.range_line.strip()
-        )
+        if self.file_path is None:
+            return self.range_line.strip()
+        if self.start_line is None:
+            return self.file_path
+        return f"{self.file_path}:{self.start_line}"
 
     @property
     def summary_status(self) -> Status | None:
@@ -307,10 +309,8 @@ class Hunk:
         end = min(len(self.display_lines), start + EDITOR_HUNK_CONTEXT_MAX)
         lines: list[str] = []
         for dl in self.display_lines[start:end]:
-            line_num = dl.new_line_number or dl.old_line_number or 0
-            lines.append(
-                f"# {EDITOR_CONTEXT_PAD} {line_num:>4} {dl.kind.value} {dl.text}"
-            )
+            line_num = format_editor_line_number(dl)
+            lines.append(f"# {EDITOR_CONTEXT_PAD} {line_num} {dl.kind.value} {dl.text}")
         return lines
 
     def build_line_context(self, target: LineTarget) -> list[str]:
@@ -327,9 +327,9 @@ class Hunk:
 
         lines: list[str] = []
         for dl in self.display_lines[start:end]:
-            line_num = dl.new_line_number or dl.old_line_number or 0
+            line_num = format_editor_line_number(dl)
             marker = EDITOR_TARGET_MARKER if dl.target == target else EDITOR_CONTEXT_PAD
-            lines.append(f"# {marker} {line_num:>4} {dl.kind.value} {dl.text}")
+            lines.append(f"# {marker} {line_num} {dl.kind.value} {dl.text}")
         return lines
 
 
@@ -506,12 +506,22 @@ class NotePanelState:
     scroll_offset: int = 0
 
 
+def format_editor_line_number(dl: DisplayLine) -> str:
+    """Render a right-aligned line number for the editor context block."""
+    line_num = (
+        dl.new_line_number if dl.new_line_number is not None else dl.old_line_number
+    )
+    if line_num is None:
+        return EDITOR_LINE_NUMBER_BLANK
+    return f"{line_num:>{EDITOR_LINE_NUMBER_WIDTH}}"
+
+
 def parse_diff(diff_text: str) -> list[Hunk]:
     """Parse a unified diff into a list of reviewable hunks."""
     hunks: list[Hunk] = []
     lines = diff_text.splitlines(keepends=True)
-    current_file_header = ""
-    current_file_path = ""
+    current_file_header: str | None = None
+    current_file_path: str | None = None
     i = 0
 
     while i < len(lines):
@@ -538,8 +548,8 @@ def parse_diff(diff_text: str) -> list[Hunk]:
 def parse_file_header(
     lines: list[str],
     start: int,
-    current_file_path: str,
-) -> tuple[str, str, int]:
+    current_file_path: str | None,
+) -> tuple[str, str | None, int]:
     """
     Parse a diff file header block starting at *start*.
 
@@ -566,8 +576,8 @@ def parse_file_header(
 def parse_hunk_body(
     lines: list[str],
     start: int,
-    file_header: str,
-    file_path: str,
+    file_header: str | None,
+    file_path: str | None,
 ) -> tuple[Hunk, int]:
     """
     Parse a single @@ hunk starting at *start*.
@@ -576,7 +586,7 @@ def parse_hunk_body(
     """
     range_line = lines[start].rstrip("\n")
     match = re.search(r"\+(\d+)", range_line)
-    start_line = int(match.group(1)) if match else 0
+    start_line = int(match.group(1)) if match else None
 
     body_lines: list[str] = []
     i = start + 1
@@ -710,14 +720,14 @@ def render_through_delta(diff_text: str, width: int = 120) -> bytes:
 def format_output(
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
-    diff_source: str = "",
+    diff_source: str | None = None,
 ) -> str:
     """
     Produce compact, unambiguous review output for an LLM agent.
 
     Approved hunks are omitted.  Each note gets its own section with an
     explicit target (hunk, +N, -N).  Global notes appear first.
-    When *diff_source* is non-empty it is included in the header so the
+    When *diff_source* is provided it is included in the header so the
     agent knows how to retrieve the reviewed diff.
     """
     out = StringIO()
@@ -726,24 +736,25 @@ def format_output(
     if not all_notes and not global_notes:
         approved = sum(1 for h in hunks if h.approved)
         out.write("# Review: all clear, no action needed.\n")
-        if diff_source:
+        if diff_source is not None:
             out.write(f"# Reviewed diff: `{diff_source}`\n")
         out.write(f"# {approved}/{len(hunks)} hunks approved.\n")
         out.write(format_footer(hunks))
         return out.getvalue()
 
     out.write(OUTPUT_PREAMBLE)
-    if diff_source:
+    if diff_source is not None:
         out.write(f"- Reviewed diff: `{diff_source}`\n")
 
     for note in global_notes:
         write_note_section(out, note.kind, GLOBAL_TARGET, note.text)
 
     for hunk, hnote in all_notes:
+        heading_path = hunk.file_path if hunk.file_path is not None else hunk.range_line
         write_note_section(
             out,
             hnote.kind,
-            f"{hunk.file_path} @ {hnote.target}",
+            f"{heading_path} @ {hnote.target}",
             hnote.text,
             diff_block=format_diff_block(hunk, hnote),
         )
@@ -844,28 +855,30 @@ def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
 def load_previous_review(
     path: str,
 ) -> tuple[
-    dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]], list[GlobalNote], str
+    dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
+    list[GlobalNote],
+    str | None,
 ]:
     """
     Parse a previous review output file.
 
     Returns a mapping of ``(file_path, range_line, target) → (kind, text)``
     for hunk annotations, a list of ``GlobalNote`` for global ones, and
-    the raw approved-bitmap string (empty if absent).
+    the raw approved-bitmap string (None if absent).
     """
     try:
         text = Path(path).read_text()
     except (FileNotFoundError, OSError):
-        return {}, [], ""
+        return {}, [], None
 
     if not text.strip():
-        return {}, [], ""
+        return {}, [], None
 
-    annotations: dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]] = {}
+    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]] = {}
     global_notes: list[GlobalNote] = []
 
     bitmap_match = FOOTER_RE.search(text)
-    bitmap_encoded = bitmap_match.group(1) if bitmap_match else ""
+    bitmap_encoded = bitmap_match.group(1) if bitmap_match else None
 
     sections = re.split(r"^### ", text, flags=re.MULTILINE)
     for section in sections:
@@ -876,7 +889,7 @@ def load_previous_review(
 
 def parse_review_section(
     section: str,
-    annotations: dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]],
+    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
     global_notes: list[GlobalNote],
 ) -> None:
     """Parse one ``### ...`` section and populate *annotations* or *global_notes*."""
@@ -923,14 +936,14 @@ def extract_comment_lines(section: str) -> str:
 
 def apply_previous_review(
     hunks: list[Hunk],
-    annotations: dict[tuple[str, str, NoteTarget], tuple[NoteKind, str]],
+    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
 ) -> int:
     """
     Apply previously saved annotations to *hunks*.
 
     Returns the number of annotations that matched.
     """
-    lookup: dict[tuple[str, str], Hunk] = {}
+    lookup: dict[tuple[str | None, str], Hunk] = {}
     for hunk in hunks:
         lookup[(hunk.file_path, hunk.range_line)] = hunk
 
@@ -1270,7 +1283,7 @@ def build_top_bar(
     current_index: int,
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
-    term_width: int = 0,
+    term_width: int | None = None,
 ) -> str:
     """Build the top status bar string for the current hunk."""
     counters = build_top_bar_counters(hunks, global_notes)
@@ -1282,7 +1295,7 @@ def build_top_bar(
         f" {BOLD}{hunk.short_location}{RESET}"
         f"{counters}"
     )
-    if term_width > 0:
+    if term_width is not None:
         bar = truncate_ansi_text(bar, term_width)
     return bar
 
@@ -2246,8 +2259,8 @@ class VcsMetadata:
     """Project metadata extracted from the VCS for default output naming."""
 
     dirname: str
-    workspace: str = ""
-    rev: str = ""
+    workspace: str | None = None
+    rev: str | None = None
 
 
 def project_name() -> str:
@@ -2293,7 +2306,7 @@ def query_jj_metadata(rev: str | None = None) -> VcsMetadata:
             'self.change_id().shortest() ++ "\\n"',
         ]
     )
-    workspace = ""
+    workspace: str | None = None
     ws_output = run_vcs(["jj", "workspace", "list", "--ignore-working-copy"])
     cwd = Path.cwd()
     for line in ws_output.splitlines():
@@ -2315,15 +2328,15 @@ def query_git_metadata(rev: str | None = None) -> VcsMetadata:
     )
     if rev is None:
         short_hash = f"{short_hash}{GIT_DIRTY_SUFFIX}"
-    workspace = ""
+    workspace: str | None = None
     toplevel = Path(run_vcs(["git", "rev-parse", "--show-toplevel"]))
     porcelain = run_vcs(["git", "worktree", "list", "--porcelain"])
-    main_dir = ""
+    main_dir: str | None = None
     for line in porcelain.splitlines():
         if line.startswith("worktree "):
             main_dir = line.split(" ", 1)[1]
             break
-    if main_dir and Path(main_dir) != toplevel:
+    if main_dir is not None and Path(main_dir) != toplevel:
         workspace = toplevel.name
     return VcsMetadata(dirname=project_name(), workspace=workspace, rev=short_hash)
 
@@ -2358,9 +2371,9 @@ def default_output_path(vcs: Vcs, rev: str | None = None) -> str:
     state_dir = Path(xdg_state) / NEOREV_STATE_DIR / meta.dirname
 
     parts = [DEFAULT_OUTPUT_STEM]
-    if meta.workspace:
+    if meta.workspace is not None:
         parts.append(meta.workspace)
-    if meta.rev:
+    if meta.rev is not None:
         parts.append(meta.rev)
     filename = DEFAULT_OUTPUT_SEPARATOR.join(parts) + DEFAULT_OUTPUT_EXT
     return str(state_dir / filename)
@@ -2431,14 +2444,18 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     previous_annotations, previous_global_notes, bitmap_encoded = load_previous_review(
         output_path,
     )
-    if not previous_annotations and not previous_global_notes and not bitmap_encoded:
+    if (
+        not previous_annotations
+        and not previous_global_notes
+        and bitmap_encoded is None
+    ):
         return []
 
     matched = apply_previous_review(hunks, previous_annotations)
     stale = len(previous_annotations) - matched
 
     approved_from_bitmap = 0
-    if bitmap_encoded:
+    if bitmap_encoded is not None:
         approved = decode_approved_bitmap(bitmap_encoded, len(hunks))
         for i, is_approved in enumerate(approved):
             if is_approved and not hunks[i].notes:
@@ -2467,7 +2484,7 @@ def write_review_output(
     output_path: str,
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
-    diff_source: str = "",
+    diff_source: str | None = None,
 ) -> None:
     """Write the final review output to *output_path*."""
     review_output = format_output(hunks, global_notes, diff_source)
@@ -2535,12 +2552,13 @@ def main() -> None:
     resolve_args(args)
 
     selection: VcsSelection | None = args.vcs_rev
+    diff_source: str | None
     if selection is not None:
         diff_text, diff_source = run_vcs_diff(selection)
     else:
         try:
             diff_text = read_diff_from_stdin()
-            diff_source = ""
+            diff_source = None
         except NoDiffOnStdinError:
             selection = (autodetect_vcs_or_exit(parser), None)
             diff_text, diff_source = run_vcs_diff(selection)

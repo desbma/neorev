@@ -420,9 +420,9 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(hunk.short_location, "hello.py:1")
 
     def test_short_location_no_file(self) -> None:
-        """short_location falls back to range_line when file_path is empty."""
-        hunk = make_hunk(file_path="")
-        hunk.file_path = ""
+        """short_location falls back to range_line when file_path is absent."""
+        hunk = make_hunk()
+        hunk.file_path = None
         self.assertEqual(hunk.short_location, hunk.range_line.strip())
 
     def test_hunk_raw_includes_header(self) -> None:
@@ -724,7 +724,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         annotations, notes, bitmap = neorev.load_previous_review("/no/such/file")
         self.assertEqual(annotations, {})
         self.assertEqual(notes, [])
-        self.assertEqual(bitmap, "")
+        self.assertIsNone(bitmap)
 
     def test_round_trip_through_file(self) -> None:
         """format_output → load_previous_review recovers annotations."""
@@ -847,7 +847,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         annotations, notes, bitmap = neorev.load_previous_review(path)
         self.assertEqual(annotations, {})
         self.assertEqual(notes, [])
-        self.assertEqual(bitmap, "")
+        self.assertIsNone(bitmap)
 
     def test_multiline_comment_round_trip(self) -> None:
         """A multi-line comment survives format_output → load_previous_review."""
@@ -2170,8 +2170,8 @@ class TestDefaultOutputPath(unittest.TestCase):
     def make_meta(
         self,
         dirname: str = "proj",
-        workspace: str = "",
-        rev: str = "",
+        workspace: str | None = None,
+        rev: str | None = None,
     ) -> neorev.VcsMetadata:
         """Build a VcsMetadata with test defaults."""
         return neorev.VcsMetadata(dirname=dirname, workspace=workspace, rev=rev)
@@ -2920,9 +2920,9 @@ class TestTopBarTruncation(unittest.TestCase):
         self.assertLessEqual(visible, NARROW_PROGRESS_WIDTH)
 
     def test_no_truncation_without_width(self) -> None:
-        """Top bar is not truncated when term_width is 0 (default)."""
+        """Top bar is not truncated when term_width is None (default)."""
         hunk = make_hunk()
-        bar = neorev.build_top_bar(hunk, 0, [hunk], [], term_width=0)
+        bar = neorev.build_top_bar(hunk, 0, [hunk], [], term_width=None)
         visible = neorev.visible_len(bar)
         self.assertGreater(visible, NARROW_PROGRESS_WIDTH)
 
