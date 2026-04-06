@@ -2841,18 +2841,15 @@ class TestGlobalNoteLifecycle(unittest.TestCase):
         self.assertEqual(self.state.global_notes[0].kind, neorev.NoteKind.FLAG)
         self.assertEqual(self.state.global_notes[0].text, GLOBAL_NOTE_CREATED_TEXT)
 
-    def test_manage_global_notes_edit_then_delete(self) -> None:
-        """Global notes manager supports edit and delete in one session."""
+    def test_manage_global_notes_edit_closes_menu(self) -> None:
+        """Editing a note from the manage menu closes the menu."""
         self.state.global_notes.append(
             neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text=GLOBAL_NOTE_CREATED_TEXT)
         )
-        key_sequence = [
-            GLOBAL_NOTE_EDIT_KEY,
-            GLOBAL_NOTE_DELETE_KEY,
-            GLOBAL_NOTE_EXIT_KEY,
-        ]
         with (
-            patch.object(self.term, "read_key", side_effect=key_sequence),
+            patch.object(
+                self.term, "read_key", side_effect=[GLOBAL_NOTE_EDIT_KEY]
+            ) as read_key,
             patch.object(self.term, "render_note_panel"),
             patch.object(
                 self.term,
@@ -2863,6 +2860,30 @@ class TestGlobalNoteLifecycle(unittest.TestCase):
             patch("neorev.render_through_delta", return_value=b""),
         ):
             self.term.handle_manage_notes(self.state)
+        self.assertEqual(read_key.call_count, 1)
+        self.assertEqual(
+            self.state.global_notes,
+            [
+                neorev.GlobalNote(
+                    kind=neorev.NoteKind.FLAG, text=GLOBAL_NOTE_EDITED_TEXT
+                )
+            ],
+        )
+
+    def test_manage_global_notes_delete_closes_menu(self) -> None:
+        """Deleting a note from the manage menu closes the menu."""
+        self.state.global_notes.append(
+            neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text=GLOBAL_NOTE_CREATED_TEXT)
+        )
+        with (
+            patch.object(
+                self.term, "read_key", side_effect=[GLOBAL_NOTE_DELETE_KEY]
+            ) as read_key,
+            patch.object(self.term, "render_note_panel"),
+            patch("neorev.render_through_delta", return_value=b""),
+        ):
+            self.term.handle_manage_notes(self.state)
+        self.assertEqual(read_key.call_count, 1)
         self.assertEqual(self.state.global_notes, [])
 
 

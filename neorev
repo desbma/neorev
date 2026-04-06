@@ -1828,8 +1828,10 @@ class Terminal:
             elif key in ("e", "\r") and refs:
                 self.modify_managed_note(state, refs[panel.cursor], edit=True)
                 tty.setraw(self.fd)
+                break
             elif key == "d" and refs:
                 self.modify_managed_note(state, refs[panel.cursor], edit=False)
+                break
 
     def render_note_panel(
         self,
