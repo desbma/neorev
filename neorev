@@ -7,6 +7,7 @@ import argparse
 import base64
 import binascii
 import enum
+import hashlib
 import os
 import re
 import select
@@ -106,6 +107,11 @@ FOOTER_RE = re.compile(
     r"^<!-- neorev: approved-bitmap=(\S+) -->$",
     re.MULTILINE,
 )
+ANCHOR_PAYLOAD_VERSION = "v1"
+ANCHOR_DIGEST_BYTES = 8
+ANCHOR_LENGTH_PREFIX_BYTES = 8
+ANCHOR_COMMENT_TEMPLATE = "<!-- neorev: note-anchor={value} -->"
+ANCHOR_COMMENT_RE = re.compile(r"<!-- neorev: note-anchor=(\S+) -->")
 LINE_PICKER_FOOTER_SEGMENTS = [
     ("j/k", "move"),
     ("Enter", "select line"),
@@ -372,6 +378,29 @@ class HunkNote:
     kind: NoteKind
     target: NoteTarget
     text: str
+
+
+@dataclass(frozen=True)
+class SavedAnnotation:
+    """A previously saved hunk-scoped review annotation parsed from disk."""
+
+    kind: NoteKind
+    text: str
+    anchor: str | None
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    """Outcome of reapplying saved annotations to current hunks."""
+
+    matched: int
+    stale_unmatched: int
+    stale_anchor: int
+    stale_missing_target: int
+
+
+SavedAnnotationKey = tuple[str | None, str, NoteTarget]
+SavedAnnotationMap = dict[SavedAnnotationKey, SavedAnnotation]
 
 
 @dataclass(frozen=True)
@@ -717,6 +746,22 @@ def render_through_delta(diff_text: str, width: int = 120) -> bytes:
     return diff_text.encode()
 
 
+def compute_note_anchor(hunk_body: str, target: NoteTarget) -> str:
+    """Return the canonical note anchor string for *hunk_body* and *target*."""
+    normalized_body = hunk_body.replace("\r\n", "\n").replace("\r", "\n")
+    parts = (ANCHOR_PAYLOAD_VERSION, str(target), normalized_body)
+    payload = b"".join(
+        len(encoded).to_bytes(ANCHOR_LENGTH_PREFIX_BYTES, "big") + encoded
+        for encoded in (part.encode("utf-8") for part in parts)
+    )
+    digest = hashlib.md5(payload, usedforsecurity=False).digest()
+    return (
+        base64.urlsafe_b64encode(digest[:ANCHOR_DIGEST_BYTES])
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+
 def format_output(
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
@@ -756,11 +801,22 @@ def format_output(
             hnote.kind,
             f"{heading_path} @ {hnote.target}",
             hnote.text,
-            diff_block=format_diff_block(hunk, hnote),
+            extras=HunkNoteExtras(
+                diff_block=format_diff_block(hunk, hnote),
+                anchor=compute_note_anchor(hunk.body, hnote.target),
+            ),
         )
 
     out.write(format_footer(hunks))
     return out.getvalue()
+
+
+@dataclass(frozen=True)
+class HunkNoteExtras:
+    """Extra payload written for hunk-scoped note sections."""
+
+    diff_block: str
+    anchor: str
 
 
 def write_note_section(
@@ -768,12 +824,13 @@ def write_note_section(
     kind: NoteKind,
     heading: str,
     text: str,
-    diff_block: str | None = None,
+    extras: HunkNoteExtras | None = None,
 ) -> None:
     """Write a single note section (global or hunk-scoped) to *out*."""
     out.write(f"\n### [{kind.value}] `{heading}`\n\n")
-    if diff_block:
-        out.write(diff_block)
+    if extras is not None:
+        out.write(ANCHOR_COMMENT_TEMPLATE.format(value=extras.anchor) + "\n\n")
+        out.write(extras.diff_block)
     out.write(text)
     out.write("\n")
 
@@ -854,15 +911,11 @@ def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
 
 def load_previous_review(
     path: str,
-) -> tuple[
-    dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
-    list[GlobalNote],
-    str | None,
-]:
+) -> tuple[SavedAnnotationMap, list[GlobalNote], str | None]:
     """
     Parse a previous review output file.
 
-    Returns a mapping of ``(file_path, range_line, target) → (kind, text)``
+    Returns a mapping of ``(file_path, range_line, target) → SavedAnnotation``
     for hunk annotations, a list of ``GlobalNote`` for global ones, and
     the raw approved-bitmap string (None if absent).
     """
@@ -874,7 +927,7 @@ def load_previous_review(
     if not text.strip():
         return {}, [], None
 
-    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]] = {}
+    annotations: SavedAnnotationMap = {}
     global_notes: list[GlobalNote] = []
 
     bitmap_match = FOOTER_RE.search(text)
@@ -889,7 +942,7 @@ def load_previous_review(
 
 def parse_review_section(
     section: str,
-    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
+    annotations: SavedAnnotationMap,
     global_notes: list[GlobalNote],
 ) -> None:
     """Parse one ``### ...`` section and populate *annotations* or *global_notes*."""
@@ -923,7 +976,14 @@ def parse_review_section(
         if parsed is not None:
             target = parsed
 
-    annotations[(file_or_global, range_line, target)] = (kind, comment)
+    anchor_match = ANCHOR_COMMENT_RE.search(section)
+    anchor = anchor_match.group(1) if anchor_match else None
+
+    annotations[(file_or_global, range_line, target)] = SavedAnnotation(
+        kind=kind,
+        text=comment,
+        anchor=anchor,
+    )
 
 
 def extract_comment_lines(section: str) -> str:
@@ -931,30 +991,54 @@ def extract_comment_lines(section: str) -> str:
     body = re.sub(r"```diff\n.*?```\n?", "", section, flags=re.DOTALL)
     body = SECTION_HEADER_RE.sub("", body)
     body = FOOTER_RE.sub("", body)
+    body = ANCHOR_COMMENT_RE.sub("", body)
     return body.strip()
+
+
+def line_target_exists(hunk: Hunk, target: LineTarget) -> bool:
+    """Return whether *target* still corresponds to a line in *hunk*."""
+    return any(dl.target == target for dl in hunk.display_lines)
 
 
 def apply_previous_review(
     hunks: list[Hunk],
-    annotations: dict[tuple[str | None, str, NoteTarget], tuple[NoteKind, str]],
-) -> int:
+    annotations: SavedAnnotationMap,
+) -> ApplyResult:
     """
-    Apply previously saved annotations to *hunks*.
+    Apply previously saved annotations to *hunks*, validating each anchor.
 
-    Returns the number of annotations that matched.
+    Returns counters describing matched and stale annotations. An annotation
+    is dropped when its tuple key has no current hunk, when its line target
+    no longer exists in the current hunk, or when its anchor is missing or
+    differs from the recomputed value.
     """
     lookup: dict[tuple[str | None, str], Hunk] = {}
     for hunk in hunks:
         lookup[(hunk.file_path, hunk.range_line)] = hunk
 
     matched = 0
-    for (file_path, range_line, target), (kind, text) in annotations.items():
+    stale_unmatched = 0
+    stale_anchor = 0
+    stale_missing_target = 0
+    for (file_path, range_line, target), saved in annotations.items():
         hunk = lookup.get((file_path, range_line))
         if hunk is None:
+            stale_unmatched += 1
             continue
-        hunk.upsert_note(kind, target, text)
+        if isinstance(target, LineTarget) and not line_target_exists(hunk, target):
+            stale_missing_target += 1
+            continue
+        if compute_note_anchor(hunk.body, target) != saved.anchor:
+            stale_anchor += 1
+            continue
+        hunk.upsert_note(saved.kind, target, saved.text)
         matched += 1
-    return matched
+    return ApplyResult(
+        matched=matched,
+        stale_unmatched=stale_unmatched,
+        stale_anchor=stale_anchor,
+        stale_missing_target=stale_missing_target,
+    )
 
 
 def write_comment_template(
@@ -2453,8 +2537,7 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     ):
         return []
 
-    matched = apply_previous_review(hunks, previous_annotations)
-    stale = len(previous_annotations) - matched
+    result = apply_previous_review(hunks, previous_annotations)
 
     approved_from_bitmap = 0
     if bitmap_encoded is not None:
@@ -2466,13 +2549,24 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
 
     display_path = compact_path(output_path)
     sys.stderr.write(
-        f"Loaded {matched} hunk annotation(s), "
+        f"Loaded {result.matched} hunk annotation(s), "
         f"{approved_from_bitmap} approved hunk(s), and "
         f"{len(previous_global_notes)} global note(s) from {display_path}\n",
     )
-    if stale:
+    if result.stale_unmatched:
         sys.stderr.write(
-            f"  ({stale} previous annotation(s) no longer match any hunk)\n",
+            f"  ({result.stale_unmatched} previous annotation(s)"
+            " no longer match any hunk)\n",
+        )
+    if result.stale_anchor:
+        sys.stderr.write(
+            f"  ({result.stale_anchor} previous annotation(s)"
+            " were dropped because the hunk body changed)\n",
+        )
+    if result.stale_missing_target:
+        sys.stderr.write(
+            f"  ({result.stale_missing_target} previous annotation(s)"
+            " target a line that no longer exists)\n",
         )
     return previous_global_notes
 

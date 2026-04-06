@@ -745,9 +745,10 @@ class TestLoadPreviousReview(unittest.TestCase):
         annotations, _, _ = neorev.load_previous_review(path)
         key = ("a.py", hunks[0].range_line, neorev.HunkTarget())
         self.assertIn(key, annotations)
-        kind, comment = annotations[key]
-        self.assertEqual(kind, neorev.NoteKind.FLAG)
-        self.assertEqual(comment, ROUND_TRIP_COMMENT_TEXT)
+        saved = annotations[key]
+        self.assertEqual(saved.kind, neorev.NoteKind.FLAG)
+        self.assertEqual(saved.text, ROUND_TRIP_COMMENT_TEXT)
+        self.assertIsNotNone(saved.anchor)
 
     def test_extract_comment_lines(self) -> None:
         """extract_comment_lines pulls plain text after the heading."""
@@ -802,10 +803,14 @@ class TestLoadPreviousReview(unittest.TestCase):
         hunks = [make_hunk(file_path="x.py")]
         target = neorev.HunkTarget()
         annotations = {
-            ("x.py", hunks[0].range_line, target): (neorev.NoteKind.QUESTION, "why?"),
+            ("x.py", hunks[0].range_line, target): neorev.SavedAnnotation(
+                kind=neorev.NoteKind.QUESTION,
+                text="why?",
+                anchor=neorev.compute_note_anchor(hunks[0].body, target),
+            ),
         }
-        matched = neorev.apply_previous_review(hunks, annotations)
-        self.assertEqual(matched, 1)
+        result = neorev.apply_previous_review(hunks, annotations)
+        self.assertEqual(result.matched, 1)
         self.assertEqual(len(hunks[0].notes), 1)
         self.assertEqual(hunks[0].notes[0].kind, neorev.NoteKind.QUESTION)
         self.assertEqual(hunks[0].notes[0].text, "why?")
@@ -815,10 +820,15 @@ class TestLoadPreviousReview(unittest.TestCase):
         hunks = [make_hunk(file_path="x.py")]
         target = neorev.HunkTarget()
         annotations = {
-            ("other.py", "@@ -1 +1 @@", target): (neorev.NoteKind.FLAG, "n/a"),
+            ("other.py", "@@ -1 +1 @@", target): neorev.SavedAnnotation(
+                kind=neorev.NoteKind.FLAG,
+                text="n/a",
+                anchor=neorev.compute_note_anchor("body", target),
+            ),
         }
-        matched = neorev.apply_previous_review(hunks, annotations)
-        self.assertEqual(matched, 0)
+        result = neorev.apply_previous_review(hunks, annotations)
+        self.assertEqual(result.matched, 0)
+        self.assertEqual(result.stale_unmatched, 1)
         self.assertEqual(hunks[0].notes, [])
 
     def test_global_notes_round_trip(self) -> None:
@@ -866,10 +876,10 @@ class TestLoadPreviousReview(unittest.TestCase):
 
         annotations, _, _ = neorev.load_previous_review(path)
         key = ("m.py", hunks[0].range_line, neorev.HunkTarget())
-        _, comment = annotations[key]
-        self.assertIn("first line", comment)
-        self.assertIn("second line", comment)
-        self.assertIn("third line", comment)
+        saved = annotations[key]
+        self.assertIn("first line", saved.text)
+        self.assertIn("second line", saved.text)
+        self.assertIn("third line", saved.text)
 
     def test_multiple_global_notes_round_trip(self) -> None:
         """Multiple global notes of different kinds survive round-trip."""
@@ -912,16 +922,184 @@ class TestLoadPreviousReview(unittest.TestCase):
         ]
         target = neorev.HunkTarget()
         annotations = {
-            ("a.py", hunks[0].range_line, target): (neorev.NoteKind.FLAG, "fix a"),
-            ("b.py", hunks[1].range_line, target): (
-                neorev.NoteKind.QUESTION,
-                "why b",
+            ("a.py", hunks[0].range_line, target): neorev.SavedAnnotation(
+                kind=neorev.NoteKind.FLAG,
+                text="fix a",
+                anchor=neorev.compute_note_anchor(hunks[0].body, target),
+            ),
+            ("b.py", hunks[1].range_line, target): neorev.SavedAnnotation(
+                kind=neorev.NoteKind.QUESTION,
+                text="why b",
+                anchor=neorev.compute_note_anchor(hunks[1].body, target),
             ),
         }
-        matched = neorev.apply_previous_review(hunks, annotations)
-        self.assertEqual(matched, 2)
+        result = neorev.apply_previous_review(hunks, annotations)
+        self.assertEqual(result.matched, 2)
         self.assertEqual(hunks[0].notes[0].kind, neorev.NoteKind.FLAG)
         self.assertEqual(hunks[1].notes[0].kind, neorev.NoteKind.QUESTION)
+
+
+ANCHOR_BODY_ORIGINAL = "+first\n+second"
+ANCHOR_BODY_CHANGED = "+first\n+second-modified"
+ANCHOR_RANGE_LINE = "@@ -1,1 +1,3 @@"
+ANCHOR_NOTE_TEXT = "look here"
+ANCHOR_LEGACY_COMMENT = "legacy note"
+
+
+class TestNoteAnchor(unittest.TestCase):
+    """Tests for compute_note_anchor and anchor-based resume validation."""
+
+    def setUp(self) -> None:
+        """Create a temporary directory for review files."""
+        self.tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        """Remove the temporary directory."""
+        self.tmpdir.cleanup()
+
+    def tmp_path(self, name: str = "review.md") -> str:
+        """Return a path inside the temporary directory."""
+        return str(Path(self.tmpdir.name) / name)
+
+    def test_compute_note_anchor_format(self) -> None:
+        """Anchor strings are an 11-character urlsafe base64 digest."""
+        anchor = neorev.compute_note_anchor("body", neorev.HunkTarget())
+        self.assertRegex(anchor, r"^[A-Za-z0-9_-]{11}$")
+
+    def test_compute_note_anchor_changes_with_body(self) -> None:
+        """Different hunk bodies produce different anchors for the same target."""
+        target = neorev.HunkTarget()
+        self.assertNotEqual(
+            neorev.compute_note_anchor("body one", target),
+            neorev.compute_note_anchor("body two", target),
+        )
+
+    def test_compute_note_anchor_changes_with_target(self) -> None:
+        """Different targets produce different anchors for the same body."""
+        body = ANCHOR_BODY_ORIGINAL
+        line_anchor = neorev.compute_note_anchor(
+            body,
+            neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=1),
+        )
+        hunk_anchor = neorev.compute_note_anchor(body, neorev.HunkTarget())
+        self.assertNotEqual(line_anchor, hunk_anchor)
+
+    def test_format_output_contains_anchor_comment(self) -> None:
+        """Freshly written review output contains a note-anchor comment."""
+        hunk = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+            status=neorev.Status.FLAG,
+            comment=ANCHOR_NOTE_TEXT,
+        )
+        output = neorev.format_output([hunk], [])
+        self.assertRegex(output, r"<!-- neorev: note-anchor=[A-Za-z0-9_-]{11} -->")
+
+    def test_resume_identical_diff_restores_note(self) -> None:
+        """Resume on identical diff: anchored note is restored."""
+        hunk = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+            status=neorev.Status.FLAG,
+            comment=ANCHOR_NOTE_TEXT,
+        )
+        path = self.tmp_path()
+        Path(path).write_text(neorev.format_output([hunk], []))
+
+        annotations, _, _ = neorev.load_previous_review(path)
+        fresh = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+        )
+        result = neorev.apply_previous_review([fresh], annotations)
+        self.assertEqual(result.matched, 1)
+        self.assertEqual(len(fresh.notes), 1)
+        self.assertEqual(fresh.notes[0].text, ANCHOR_NOTE_TEXT)
+
+    def test_resume_changed_body_invalidates_note(self) -> None:
+        """Same file/range/target but a changed hunk body drops the note."""
+        original = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+            status=neorev.Status.FLAG,
+            comment=ANCHOR_NOTE_TEXT,
+        )
+        path = self.tmp_path()
+        Path(path).write_text(neorev.format_output([original], []))
+
+        annotations, _, _ = neorev.load_previous_review(path)
+        changed = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_CHANGED,
+            range_line=ANCHOR_RANGE_LINE,
+        )
+        result = neorev.apply_previous_review([changed], annotations)
+        self.assertEqual(result.matched, 0)
+        self.assertEqual(result.stale_anchor, 1)
+        self.assertEqual(changed.notes, [])
+
+    def test_resume_missing_line_target_invalidates_note(self) -> None:
+        """A line-target note whose line no longer exists is dropped."""
+        target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=2)
+        original = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+            notes=[
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG,
+                    target=target,
+                    text=ANCHOR_NOTE_TEXT,
+                )
+            ],
+        )
+        path = self.tmp_path()
+        Path(path).write_text(neorev.format_output([original], []))
+
+        annotations, _, _ = neorev.load_previous_review(path)
+        shrunk = make_hunk(
+            file_path="a.py",
+            body="+first",
+            range_line=ANCHOR_RANGE_LINE,
+        )
+        result = neorev.apply_previous_review([shrunk], annotations)
+        self.assertEqual(result.matched, 0)
+        self.assertEqual(result.stale_missing_target, 1)
+        self.assertEqual(shrunk.notes, [])
+
+    def test_unanchored_review_is_treated_as_anchor_mismatch(self) -> None:
+        """A review file without an anchor is dropped like a hash mismatch."""
+        unanchored_content = (
+            "### [CHANGE REQUESTED] `a.py @ hunk`\n\n"
+            "```diff\n"
+            f"{ANCHOR_RANGE_LINE}\n"
+            "+first\n"
+            "+second\n"
+            "```\n\n"
+            f"{ANCHOR_LEGACY_COMMENT}\n\n"
+            "<!-- neorev: approved-bitmap=AA== -->\n"
+        )
+        path = self.tmp_path()
+        Path(path).write_text(unanchored_content)
+
+        annotations, _, _ = neorev.load_previous_review(path)
+        key = ("a.py", ANCHOR_RANGE_LINE, neorev.HunkTarget())
+        self.assertIn(key, annotations)
+        self.assertIsNone(annotations[key].anchor)
+
+        hunk = make_hunk(
+            file_path="a.py",
+            body=ANCHOR_BODY_ORIGINAL,
+            range_line=ANCHOR_RANGE_LINE,
+        )
+        result = neorev.apply_previous_review([hunk], annotations)
+        self.assertEqual(result.matched, 0)
+        self.assertEqual(result.stale_anchor, 1)
+        self.assertEqual(hunk.notes, [])
 
 
 class TestNavigation(unittest.TestCase):
@@ -3296,9 +3474,10 @@ class TestParsePreviousReview(unittest.TestCase):
             annotations, _, _ = neorev.load_previous_review(path)
             key = ("target.py", hunk.range_line, target)
             self.assertIn(key, annotations)
-            kind, comment = annotations[key]
-            self.assertEqual(kind, neorev.NoteKind.FLAG)
-            self.assertEqual(comment, LINE_TARGET_NOTE_TEXT)
+            saved = annotations[key]
+            self.assertEqual(saved.kind, neorev.NoteKind.FLAG)
+            self.assertEqual(saved.text, LINE_TARGET_NOTE_TEXT)
+            self.assertIsNotNone(saved.anchor)
         finally:
             os.unlink(path)
 
@@ -3330,20 +3509,25 @@ class TestApplyPreviousReview(unittest.TestCase):
 
     def test_match_by_file_range_and_target(self) -> None:
         """Apply a line-target annotation and verify it creates the right note."""
-        hunks = [make_hunk(file_path="x.py")]
+        hunks = [
+            make_hunk(
+                file_path="x.py",
+                body="+a\n+b",
+                range_line="@@ -1,1 +1,3 @@",
+            )
+        ]
         target = neorev.LineTarget(
             side=neorev.LineSide.ADDED, line_number=ADDED_LINE_NUMBER
         )
-        annotations: dict[
-            tuple[str, str, neorev.NoteTarget], tuple[neorev.NoteKind, str]
-        ] = {
-            ("x.py", hunks[0].range_line, target): (
-                neorev.NoteKind.FLAG,
-                LINE_TARGET_APPLY_TEXT,
+        annotations: neorev.SavedAnnotationMap = {
+            ("x.py", hunks[0].range_line, target): neorev.SavedAnnotation(
+                kind=neorev.NoteKind.FLAG,
+                text=LINE_TARGET_APPLY_TEXT,
+                anchor=neorev.compute_note_anchor(hunks[0].body, target),
             ),
         }
-        matched = neorev.apply_previous_review(hunks, annotations)
-        self.assertEqual(matched, 1)
+        result = neorev.apply_previous_review(hunks, annotations)
+        self.assertEqual(result.matched, 1)
         self.assertEqual(len(hunks[0].notes), 1)
         note = hunks[0].notes[0]
         self.assertEqual(note.kind, neorev.NoteKind.FLAG)
