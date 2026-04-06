@@ -2952,12 +2952,11 @@ class TestMainWorkflow(unittest.TestCase):
                 lambda _state: None,
                 extra_args=["--clear"],
             )
-            output = Path(output_path).read_text()
-            self.assertNotIn(WORKFLOW_RESUME_FLAG, output)
-            self.assertNotIn(WORKFLOW_RESUME_GLOBAL, output)
+            self.assertFalse(Path(output_path).exists())
             self.assertNotIn("Loaded", stderr)
         finally:
-            os.unlink(output_path)
+            if Path(output_path).exists():
+                os.unlink(output_path)
 
 
 class TestGlobalNoteLifecycle(unittest.TestCase):
@@ -4239,6 +4238,60 @@ class TestAllClearSkipsFile(unittest.TestCase):
             self.assertTrue(Path(output_path).exists())
         finally:
             os.unlink(output_path)
+
+    def test_immediate_exit_skips_file(self) -> None:
+        """Exiting without approving or annotating anything writes no output."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Do nothing — simulate an immediate exit."""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            output_path = f.name
+
+        os.unlink(output_path)
+        try:
+            run_main_with_scripted_terminal(
+                TWO_HUNK_DIFF,
+                output_path,
+                script,
+            )
+            self.assertFalse(
+                Path(output_path).exists(),
+                "Output file should not be created when no review actions were taken",
+            )
+        finally:
+            if Path(output_path).exists():
+                os.unlink(output_path)
+
+
+class TestReviewHasContent(unittest.TestCase):
+    """Tests for review_has_content."""
+
+    def test_no_actions_taken(self) -> None:
+        """Return False when no hunks are approved and no notes exist."""
+        hunks = [make_hunk(), make_hunk()]
+        self.assertFalse(neorev.review_has_content(hunks, []))
+
+    def test_one_approved(self) -> None:
+        """Return True when at least one hunk is approved."""
+        hunks = [make_hunk(approved=True), make_hunk()]
+        self.assertTrue(neorev.review_has_content(hunks, []))
+
+    def test_all_approved(self) -> None:
+        """Return True when all hunks are approved."""
+        hunks = [make_hunk(approved=True), make_hunk(approved=True)]
+        self.assertTrue(neorev.review_has_content(hunks, []))
+
+    def test_hunk_with_notes(self) -> None:
+        """Return True when a hunk has notes."""
+        hunks = [make_hunk(status=neorev.Status.FLAG, comment="fix")]
+        self.assertTrue(neorev.review_has_content(hunks, []))
+
+    def test_global_notes_only(self) -> None:
+        """Return True when only global notes exist."""
+        hunks = [make_hunk()]
+        notes = [neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text="concern")]
+        self.assertTrue(neorev.review_has_content(hunks, notes))
 
 
 class TestCompactPath(unittest.TestCase):

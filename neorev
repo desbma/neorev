@@ -2571,6 +2571,15 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     return previous_global_notes
 
 
+def review_has_content(hunks: list[Hunk], global_notes: list[GlobalNote]) -> bool:
+    """Return True when the review contains any user action (approval or note)."""
+    return (
+        any(h.approved for h in hunks)
+        or any(h.notes for h in hunks)
+        or bool(global_notes)
+    )
+
+
 def review_is_all_clear(hunks: list[Hunk], global_notes: list[GlobalNote]) -> bool:
     """Return True when every hunk is approved and there are no global notes."""
     return all(h.approved for h in hunks) and not global_notes
@@ -2682,6 +2691,8 @@ def main() -> None:
         finally:
             term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
 
+    if not review_has_content(hunks, global_notes):
+        return
     if review_is_all_clear(hunks, global_notes):
         sys.stderr.write(ALL_CLEAR_MESSAGE)
     else:
