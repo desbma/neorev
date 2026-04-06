@@ -2114,32 +2114,36 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.output, "mine.md")
 
     def test_git_with_revision(self) -> None:
-        """The -g flag accepts a revision argument."""
+        """The -g flag records (Vcs.GIT, rev) in vcs_rev."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-g", "HEAD~1", "-o", "out.md"])
-        self.assertEqual(args.git, "HEAD~1")
-        self.assertIsNone(args.jj)
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.GIT, "HEAD~1"))
         self.assertEqual(args.output, "out.md")
 
     def test_jj_with_revision(self) -> None:
-        """The -j flag accepts a revision argument."""
+        """The -j flag records (Vcs.JUJUTSU, rev) in vcs_rev."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j", "abc123", "-o", "out.md"])
-        self.assertEqual(args.jj, "abc123")
-        self.assertIsNone(args.git)
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.JUJUTSU, "abc123"))
         self.assertEqual(args.output, "out.md")
 
     def test_git_without_revision(self) -> None:
-        """The -g flag without a revision defaults to empty string."""
+        """The -g flag without a revision records (Vcs.GIT, None)."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-g"])
-        self.assertEqual(args.git, "")
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.GIT, None))
 
     def test_jj_without_revision(self) -> None:
-        """The -j flag without a revision defaults to empty string."""
+        """The -j flag without a revision records (Vcs.JUJUTSU, None)."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j"])
-        self.assertEqual(args.jj, "")
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.JUJUTSU, None))
+
+    def test_vcs_rev_none_when_no_flag_passed(self) -> None:
+        """Without -g/-j, vcs_rev defaults to None."""
+        parser = neorev.build_arg_parser()
+        args = parser.parse_args([])
+        self.assertIsNone(args.vcs_rev)
 
     def test_git_and_jj_mutually_exclusive(self) -> None:
         """Using both -g and -j is rejected."""
@@ -2151,13 +2155,13 @@ class TestArgParser(unittest.TestCase):
         """The --git long form works with a revision."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--git", "v1.0"])
-        self.assertEqual(args.git, "v1.0")
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.GIT, "v1.0"))
 
     def test_long_form_jj_without_revision(self) -> None:
         """The --jj long form works without a revision."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--jj"])
-        self.assertEqual(args.jj, "")
+        self.assertEqual(args.vcs_rev, (neorev.Vcs.JUJUTSU, None))
 
 
 class TestDefaultOutputPath(unittest.TestCase):
@@ -2179,7 +2183,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
             patch.object(neorev, "query_vcs_metadata", return_value=self.make_meta()),
         ):
-            result = neorev.default_output_path("git", "")
+            result = neorev.default_output_path(neorev.Vcs.GIT)
         self.assertTrue(result.startswith(tmpdir))
         self.assertTrue(result.endswith(".md"))
 
@@ -2190,7 +2194,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             patch.object(neorev, "query_vcs_metadata", return_value=self.make_meta()),
             patch.object(Path, "mkdir"),
         ):
-            result = neorev.default_output_path("git", "")
+            result = neorev.default_output_path(neorev.Vcs.GIT)
         self.assertIn(".local/state/neorev/proj", result)
 
     def test_filename_parts_basic(self) -> None:
@@ -2204,7 +2208,7 @@ class TestDefaultOutputPath(unittest.TestCase):
                 return_value=self.make_meta(dirname="myproj"),
             ),
         ):
-            result = neorev.default_output_path("git", "")
+            result = neorev.default_output_path(neorev.Vcs.GIT)
         self.assertEqual(Path(result).name, "review.md")
         self.assertEqual(Path(result).parent.name, "myproj")
 
@@ -2219,7 +2223,7 @@ class TestDefaultOutputPath(unittest.TestCase):
                 return_value=self.make_meta(workspace="feat", rev="abc1234"),
             ),
         ):
-            result = neorev.default_output_path("jj", "")
+            result = neorev.default_output_path(neorev.Vcs.JUJUTSU)
         self.assertEqual(Path(result).name, "review-feat-abc1234.md")
         self.assertEqual(Path(result).parent.name, "proj")
 
@@ -2234,7 +2238,7 @@ class TestDefaultOutputPath(unittest.TestCase):
                 return_value=self.make_meta(rev="def456"),
             ),
         ):
-            result = neorev.default_output_path("git", "")
+            result = neorev.default_output_path(neorev.Vcs.GIT)
         self.assertEqual(Path(result).name, "review-def456.md")
         self.assertEqual(Path(result).parent.name, "proj")
 
@@ -2248,18 +2252,18 @@ class TestDefaultOutputPath(unittest.TestCase):
                     neorev, "query_vcs_metadata", return_value=self.make_meta()
                 ),
             ):
-                neorev.default_output_path("git", "")
+                neorev.default_output_path(neorev.Vcs.GIT)
             self.assertFalse(state_dir.is_dir())
 
     def test_resolve_args_detects_jj_from_flag(self) -> None:
-        """resolve_args passes 'jj' and empty rev to default_output_path."""
+        """resolve_args passes Vcs.JUJUTSU and None rev to default_output_path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j"])
         with patch.object(
             neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
         ) as mock:
             neorev.resolve_args(args)
-        mock.assert_called_once_with("jj", "")
+        mock.assert_called_once_with(neorev.Vcs.JUJUTSU, None)
 
     def test_resolve_args_passes_jj_rev(self) -> None:
         """resolve_args forwards the jj revision to default_output_path."""
@@ -2269,17 +2273,17 @@ class TestDefaultOutputPath(unittest.TestCase):
             neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
         ) as mock:
             neorev.resolve_args(args)
-        mock.assert_called_once_with("jj", "abc123")
+        mock.assert_called_once_with(neorev.Vcs.JUJUTSU, "abc123")
 
     def test_resolve_args_detects_git_from_flag(self) -> None:
-        """resolve_args passes 'git' and empty rev to default_output_path."""
+        """resolve_args passes Vcs.GIT and None rev to default_output_path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-g"])
         with patch.object(
             neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
         ) as mock:
             neorev.resolve_args(args)
-        mock.assert_called_once_with("git", "")
+        mock.assert_called_once_with(neorev.Vcs.GIT, None)
 
     def test_resolve_args_passes_git_rev(self) -> None:
         """resolve_args forwards the git revision to default_output_path."""
@@ -2289,7 +2293,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
         ) as mock:
             neorev.resolve_args(args)
-        mock.assert_called_once_with("git", "HEAD~2")
+        mock.assert_called_once_with(neorev.Vcs.GIT, "HEAD~2")
 
     def test_resolve_args_detects_jj_from_directory(self) -> None:
         """resolve_args detects jj from .jj directory when no flag is given."""
@@ -2302,7 +2306,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             ) as mock,
         ):
             neorev.resolve_args(args)
-        mock.assert_called_once_with("jj", "")
+        mock.assert_called_once_with(neorev.Vcs.JUJUTSU, None)
 
     def test_jj_uses_shortest_unambiguous_rev(self) -> None:
         """query_jj_metadata uses shortest() without a fixed length."""
@@ -2579,8 +2583,8 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_git_without_revision_includes_diff_source(self) -> None:
-        """Using -g without a revision still includes 'git show' as diff source."""
+    def test_git_without_revision_uses_git_diff(self) -> None:
+        """Using -g without a revision runs 'git diff' and records it as the source."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
@@ -2589,16 +2593,102 @@ class TestMainWorkflow(unittest.TestCase):
                 neorev,
                 "fetch_diff_from_vcs",
                 return_value=TWO_HUNK_DIFF,
-            ):
+            ) as fetch_mock:
                 run_main_with_scripted_terminal(
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
                     extra_args=["-g"],
                 )
+            fetch_mock.assert_called_once_with(["git", "diff"])
             output = Path(output_path).read_text()
             self.assertIn("Reviewed diff:", output)
-            self.assertIn("git show", output)
+            self.assertIn("`git diff`", output)
+            self.assertNotIn("git show", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_auto_detect_git_uses_git_diff(self) -> None:
+        """When no diff is piped and a git repo is detected, default to 'git diff'."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            output_path = f.name
+
+        try:
+            with (
+                patch.object(
+                    neorev,
+                    "read_diff_from_stdin",
+                    side_effect=neorev.NoDiffOnStdinError,
+                ),
+                patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.GIT),
+                patch.object(
+                    neorev,
+                    "fetch_diff_from_vcs",
+                    return_value=TWO_HUNK_DIFF,
+                ) as fetch_mock,
+            ):
+                run_main_with_scripted_terminal(
+                    TWO_HUNK_DIFF,
+                    output_path,
+                    lambda state: state.hunks[0].__setattr__("approved", True),
+                )
+            fetch_mock.assert_called_once_with(["git", "diff"])
+            output = Path(output_path).read_text()
+            self.assertIn("`git diff`", output)
+            self.assertNotIn("git show", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_auto_detect_jj_uses_jj_show(self) -> None:
+        """When no diff is piped and a jj repo is detected, default to 'jj show @'."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            output_path = f.name
+
+        try:
+            with (
+                patch.object(
+                    neorev,
+                    "read_diff_from_stdin",
+                    side_effect=neorev.NoDiffOnStdinError,
+                ),
+                patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.JUJUTSU),
+                patch.object(
+                    neorev,
+                    "fetch_diff_from_vcs",
+                    return_value=TWO_HUNK_DIFF,
+                ) as fetch_mock,
+            ):
+                run_main_with_scripted_terminal(
+                    TWO_HUNK_DIFF,
+                    output_path,
+                    lambda state: state.hunks[0].__setattr__("approved", True),
+                )
+            fetch_mock.assert_called_once_with(["jj", "show"])
+            output = Path(output_path).read_text()
+            self.assertIn("`jj show`", output)
+        finally:
+            os.unlink(output_path)
+
+    def test_git_with_revision_uses_git_show(self) -> None:
+        """Using -g with a revision runs 'git show REV' and records it as the source."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            output_path = f.name
+
+        try:
+            with patch.object(
+                neorev,
+                "fetch_diff_from_vcs",
+                return_value=TWO_HUNK_DIFF,
+            ) as fetch_mock:
+                run_main_with_scripted_terminal(
+                    TWO_HUNK_DIFF,
+                    output_path,
+                    lambda state: state.hunks[0].__setattr__("approved", True),
+                    extra_args=["-g", "HEAD~1"],
+                )
+            fetch_mock.assert_called_once_with(["git", "show", "HEAD~1"])
+            output = Path(output_path).read_text()
+            self.assertIn("`git show HEAD~1`", output)
         finally:
             os.unlink(output_path)
 

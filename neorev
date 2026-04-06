@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from typing import IO, Self
 
 CSI = "\033["
@@ -134,6 +134,43 @@ class Vcs(enum.StrEnum):
 
     JUJUTSU = "jj"
     GIT = "git"
+
+
+VcsSelection = tuple[Vcs, str | None]
+
+
+VCS_REV_ACTION_TYPE_ERROR = "VcsRevAction expects a string or None"
+
+
+class VcsRevAction(argparse.Action):
+    """argparse Action recording ``(Vcs, rev)`` for the -g/-j flags."""
+
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        vcs: Vcs,
+        **kwargs: object,
+    ) -> None:
+        """Store the VCS this action represents and forward to the base class."""
+        self.vcs = vcs
+        super().__init__(
+            option_strings=list(option_strings),
+            dest=dest,
+            **kwargs,  # ty: ignore[invalid-argument-type]
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,  # noqa: ARG002
+        namespace: argparse.Namespace,
+        values: str | Sequence[object] | None,
+        option_string: str | None = None,  # noqa: ARG002
+    ) -> None:
+        """Record ``(self.vcs, values)`` on *namespace*."""
+        if values is not None and not isinstance(values, str):
+            raise TypeError(VCS_REV_ACTION_TYPE_ERROR)
+        setattr(namespace, self.dest, (self.vcs, values))
 
 
 class Status(enum.Enum):
@@ -2156,7 +2193,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=__doc__,
         epilog="When no diff is piped and no -g/-j revision is given, "
         "auto-detects the VCS backend and defaults to "
-        f"'jj show {JJ_DEFAULT_REV}' or 'git show {GIT_DEFAULT_REV}'.",
+        f"'jj show {JJ_DEFAULT_REV}' or 'git diff'.",
     )
     parser.add_argument(
         "-c",
@@ -2168,21 +2205,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     rev_group.add_argument(
         "-g",
         "--git",
+        action=VcsRevAction,
+        vcs=Vcs.GIT,
+        dest="vcs_rev",
         nargs="?",
-        const="",
-        default=None,
         metavar="REV",
-        help="run 'git show [REV]' and use its output as the diff",
+        help="run 'git show REV' (or 'git diff' if REV is omitted) "
+        "and use its output as the diff",
     )
     rev_group.add_argument(
         "-j",
         "--jj",
+        action=VcsRevAction,
+        vcs=Vcs.JUJUTSU,
+        dest="vcs_rev",
         nargs="?",
-        const="",
-        default=None,
         metavar="REV",
         help="run 'jj show [REV]' and use its output as the diff",
     )
+    parser.set_defaults(vcs_rev=None)
     parser.add_argument(
         "-o",
         "--output",
@@ -2237,7 +2278,7 @@ def run_vcs(command: list[str]) -> str:
     return result.stdout.strip()
 
 
-def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
+def query_jj_metadata(rev: str | None = None) -> VcsMetadata:
     """Return project metadata from the current jujutsu repo."""
     change_id = run_vcs(
         [
@@ -2246,7 +2287,7 @@ def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
             "--no-graph",
             "--ignore-working-copy",
             "-r",
-            rev,
+            rev if rev is not None else JJ_DEFAULT_REV,
             "-T",
             'self.change_id().shortest() ++ "\\n"',
         ]
@@ -2266,9 +2307,11 @@ def query_jj_metadata(rev: str = JJ_DEFAULT_REV) -> VcsMetadata:
     return VcsMetadata(dirname=project_name(), workspace=workspace, rev=change_id)
 
 
-def query_git_metadata(rev: str = GIT_DEFAULT_REV) -> VcsMetadata:
+def query_git_metadata(rev: str | None = None) -> VcsMetadata:
     """Return project metadata from the current git repo."""
-    short_hash = run_vcs(["git", "rev-parse", "--short", rev])
+    short_hash = run_vcs(
+        ["git", "rev-parse", "--short", rev if rev is not None else GIT_DEFAULT_REV]
+    )
     workspace = ""
     toplevel = Path(run_vcs(["git", "rev-parse", "--show-toplevel"]))
     porcelain = run_vcs(["git", "worktree", "list", "--porcelain"])
@@ -2282,13 +2325,13 @@ def query_git_metadata(rev: str = GIT_DEFAULT_REV) -> VcsMetadata:
     return VcsMetadata(dirname=project_name(), workspace=workspace, rev=short_hash)
 
 
-def query_vcs_metadata(vcs: Vcs, rev: str = "") -> VcsMetadata:
+def query_vcs_metadata(vcs: Vcs, rev: str | None = None) -> VcsMetadata:
     """Return project metadata for the current project."""
     try:
         if vcs == Vcs.JUJUTSU:
-            return query_jj_metadata(rev) if rev else query_jj_metadata()
+            return query_jj_metadata(rev)
         if vcs == Vcs.GIT:
-            return query_git_metadata(rev) if rev else query_git_metadata()
+            return query_git_metadata(rev)
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
     return VcsMetadata(dirname=project_name())
@@ -2302,7 +2345,7 @@ def compact_path(path: str) -> str:
     return path
 
 
-def default_output_path(vcs: Vcs, rev: str = "") -> str:
+def default_output_path(vcs: Vcs, rev: str | None = None) -> str:
     """Build the default output path under the XDG state directory."""
     xdg_state = os.environ.get(
         "XDG_STATE_HOME",
@@ -2324,17 +2367,14 @@ def resolve_args(args: argparse.Namespace) -> None:
     """Fill in *args.output* with the default path when not provided."""
     if args.output is not None:
         return
-    if args.jj is not None:
-        vcs = Vcs.JUJUTSU
-        rev = args.jj
-    elif args.git is not None:
-        vcs = Vcs.GIT
-        rev = args.git
+    selection: VcsSelection | None = args.vcs_rev
+    if selection is not None:
+        vcs, rev = selection
     else:
         vcs = detect_vcs()
         if vcs is None:
             return
-        rev = ""
+        rev = None
     args.output = default_output_path(vcs, rev)
 
 
@@ -2451,39 +2491,58 @@ def copy_output_reference_to_clipboard(output_path: str) -> None:
         sys.stderr.write(f"Clipboard copy failed: {exc}\n")
 
 
+def git_diff_command(rev: str | None) -> list[str]:
+    """Return the command to show the git diff for *rev*, or the working tree."""
+    if rev is None:
+        return ["git", "diff"]
+    return ["git", "show", rev]
+
+
+def jj_diff_command(rev: str | None) -> list[str]:
+    """Return the command to show the jj diff for *rev*, or the working copy."""
+    if rev is None:
+        return ["jj", "show"]
+    return ["jj", "show", rev]
+
+
+def run_vcs_diff(selection: VcsSelection) -> tuple[str, str]:
+    """Run the diff command for *selection* and return ``(diff text, source label)``."""
+    vcs, rev = selection
+    cmd = jj_diff_command(rev) if vcs == Vcs.JUJUTSU else git_diff_command(rev)
+    return fetch_diff_from_vcs(cmd), " ".join(cmd)
+
+
+def autodetect_vcs_or_exit(parser: argparse.ArgumentParser) -> Vcs:
+    """Return a VCS detected from the working directory, or exit with usage error."""
+    vcs = detect_vcs()
+    if vcs is None:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write(
+            "\nError: no diff on stdin and no VCS detected."
+            " Pipe a diff or pass a revision with -g/-j.\n",
+        )
+        exit(os.EX_USAGE)
+    return vcs
+
+
 def main() -> None:
     """Run the neorev command-line entry point."""
     parser = build_arg_parser()
     args = parser.parse_args()
     resolve_args(args)
 
-    diff_source = ""
-    if args.git is not None:
-        cmd = ["git", "show"] + ([args.git] if args.git else [])
-        diff_text = fetch_diff_from_vcs(cmd)
-        diff_source = f"git show {args.git}".strip()
-    elif args.jj is not None:
-        cmd = ["jj", "show"] + ([args.jj] if args.jj else [])
-        diff_text = fetch_diff_from_vcs(cmd)
-        diff_source = f"jj show {args.jj}".strip()
+    selection: VcsSelection | None = args.vcs_rev
+    if selection is not None:
+        diff_text, diff_source = run_vcs_diff(selection)
     else:
         try:
             diff_text = read_diff_from_stdin()
+            diff_source = ""
         except NoDiffOnStdinError:
-            vcs = detect_vcs()
-            if vcs is None:
-                parser.print_usage(sys.stderr)
-                sys.stderr.write(
-                    "\nError: no diff on stdin and no VCS detected."
-                    " Pipe a diff or pass a revision with -g/-j.\n",
-                )
-                exit(os.EX_USAGE)
-            default_rev = JJ_DEFAULT_REV if vcs == Vcs.JUJUTSU else GIT_DEFAULT_REV
-            cmd = [vcs, "show", default_rev]
-            diff_text = fetch_diff_from_vcs(cmd)
-            diff_source = f"{vcs} show {default_rev}"
+            selection = (autodetect_vcs_or_exit(parser), None)
+            diff_text, diff_source = run_vcs_diff(selection)
             if args.output is None:
-                args.output = default_output_path(vcs)
+                args.output = default_output_path(*selection)
     hunks = parse_diff_or_exit(diff_text)
 
     if args.clear:

@@ -57,7 +57,7 @@ chmod +x ./neorev
 1. Run `neorev` on a diff:
 
 ```bash
-# Auto-detect VCS and review the current revision ('git show HEAD' or 'jj show @'):
+# Auto-detect VCS and review the current changes ('git diff' or 'jj show @'):
 neorev
 
 # Or pipe a diff explicitly:
