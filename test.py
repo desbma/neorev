@@ -17,7 +17,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Self
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # neorev is a script without .py extension; import it as a module.
 NEOREV_PATH = str(Path(__file__).resolve().parent / "neorev")
@@ -2280,7 +2280,10 @@ class TestArgParser(unittest.TestCase):
         """resolve_args fills in a default output path when not provided."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
-        with patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH):
+        with (
+            patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.GIT),
+            patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH),
+        ):
             neorev.resolve_args(args)
         self.assertEqual(args.output, MOCK_OUTPUT_PATH)
 
@@ -2474,11 +2477,11 @@ class TestDefaultOutputPath(unittest.TestCase):
         mock.assert_called_once_with(neorev.Vcs.GIT, "HEAD~2")
 
     def test_resolve_args_detects_jj_from_directory(self) -> None:
-        """resolve_args detects jj from .jj directory when no flag is given."""
+        """resolve_args detects jj when no flag is given."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         with (
-            patch.object(Path, "is_dir", return_value=True),
+            patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.JUJUTSU),
             patch.object(
                 neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
             ) as mock,
@@ -2622,30 +2625,39 @@ class TestDetectVcs(unittest.TestCase):
     """Tests for detect_vcs."""
 
     def test_returns_none_outside_any_repo(self) -> None:
-        """Return None when neither .jj nor .git exist."""
-        with patch.object(Path, "is_dir", return_value=False):
+        """Return None when no VCS probe command succeeds."""
+        with patch("neorev.try_vcs", return_value=False):
             result = neorev.detect_vcs()
         self.assertIsNone(result)
 
     def test_returns_jujutsu_in_jj_repo(self) -> None:
-        """Return Vcs.JUJUTSU when .jj directory exists."""
+        """Return Vcs.JUJUTSU when jj root succeeds."""
 
-        def fake_is_dir(self: Path) -> bool:
-            """Return True only for .jj."""
-            return self.name == ".jj"
+        def fake_try_vcs(command: list[str]) -> bool:
+            """Succeed only for jj."""
+            return command[0] == "jj"
 
-        with patch.object(Path, "is_dir", fake_is_dir):
+        with patch("neorev.try_vcs", side_effect=fake_try_vcs):
             result = neorev.detect_vcs()
         self.assertEqual(result, neorev.Vcs.JUJUTSU)
 
+    def test_prefers_jujutsu_over_git_and_short_circuits(self) -> None:
+        """Return Vcs.JUJUTSU and only probe jj when both backends are present."""
+        mock = MagicMock(return_value=True)
+        with patch("neorev.try_vcs", mock):
+            result = neorev.detect_vcs()
+        self.assertEqual(result, neorev.Vcs.JUJUTSU)
+        mock.assert_called_once()
+        self.assertEqual(mock.call_args[0][0][0], "jj")
+
     def test_returns_git_in_git_repo(self) -> None:
-        """Return Vcs.GIT when .git exists but .jj does not."""
+        """Return Vcs.GIT when git rev-parse succeeds but jj root does not."""
 
-        def fake_is_dir(self: Path) -> bool:
-            """Return True only for .git."""
-            return self.name == ".git"
+        def fake_try_vcs(command: list[str]) -> bool:
+            """Succeed only for git."""
+            return command[0] == "git"
 
-        with patch.object(Path, "is_dir", fake_is_dir):
+        with patch("neorev.try_vcs", side_effect=fake_try_vcs):
             result = neorev.detect_vcs()
         self.assertEqual(result, neorev.Vcs.GIT)
 

@@ -2356,11 +2356,27 @@ def project_name() -> str:
     return PROJECT_NAME_SEPARATOR.join(p.lower() for p in tail)
 
 
+def try_vcs(command: list[str]) -> bool:
+    """Return whether a VCS probe command succeeds."""
+    try:
+        subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    else:
+        return True
+
+
 def detect_vcs() -> Vcs | None:
     """Detect the VCS backend for the current directory."""
-    if Path(".jj").is_dir():
+    if try_vcs(["jj", "root"]):
         return Vcs.JUJUTSU
-    if Path(".git").is_dir():
+    if try_vcs(["git", "rev-parse", "--show-toplevel"]):
         return Vcs.GIT
     return None
 
