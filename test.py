@@ -2650,7 +2650,10 @@ class TestWriteReviewOutput(unittest.TestCase):
 
     def test_creates_parent_directory(self) -> None:
         """write_review_output creates missing parent directories before writing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(neorev.sys, "stderr", new=io.StringIO()),
+        ):
             output_path = str(Path(tmpdir) / "nested" / "dir" / "review.md")
             hunk = make_hunk(file_path="a.py")
             neorev.write_review_output(output_path, [hunk], [])
@@ -3376,7 +3379,8 @@ class TestApplyResize(unittest.TestCase):
 
     def test_cache_cleared_on_width_change(self) -> None:
         """Delta cache is cleared when terminal width changes."""
-        cache: dict[int, bytes] = {0: b"old"}
+        stream = MagicMock(spec=neorev.DeltaStream)
+        cache: dict[int, neorev.DeltaStream] = {0: stream}
         self.term.width = TERM_WIDTH
         new_width = TERM_WIDTH + RESIZE_WIDTH_DELTA
         winsize = struct.pack(
@@ -3390,12 +3394,121 @@ class TestApplyResize(unittest.TestCase):
         self.term.apply_resize(cache)
         self.assertEqual(cache, {})
         self.assertEqual(self.term.width, new_width)
+        stream.kill.assert_called_once()
 
     def test_cache_kept_on_same_width(self) -> None:
         """Delta cache is kept when width does not change."""
-        cache: dict[int, bytes] = {0: b"old"}
+        stream = MagicMock(spec=neorev.DeltaStream)
+        cache: dict[int, neorev.DeltaStream] = {0: stream}
         self.term.apply_resize(cache)
-        self.assertEqual(cache, {0: b"old"})
+        self.assertEqual(len(cache), 1)
+        stream.kill.assert_not_called()
+
+
+LARGE_BODY_LINE_COUNT = 100
+
+
+def make_large_diff(line_count: int = LARGE_BODY_LINE_COUNT) -> str:
+    """Build a synthetic diff with *line_count* added lines."""
+    header = (
+        "diff --git a/big.txt b/big.txt\n"
+        "--- a/big.txt\n"
+        "+++ b/big.txt\n"
+        f"@@ -0,0 +1,{line_count} @@\n"
+    )
+    body = "".join(f"+line {i}\n" for i in range(line_count))
+    return header + body
+
+
+class TestScrollWithPartialStream(unittest.TestCase):
+    """Tests for scrolling when only partial delta output is available."""
+
+    def setUp(self) -> None:
+        """Create a fake TTY and Terminal for rendering tests."""
+        self.fake = FakeTTY()
+        self.term = self.fake.make_terminal()
+
+    def tearDown(self) -> None:
+        """Restore terminal state and close the pty."""
+        with contextlib.suppress(OSError):
+            self.term.close()
+        self.fake.close()
+
+    def test_scroll_offset_clamped_to_actual_content(self) -> None:
+        """Scroll offset must not exceed the actual rendered content."""
+        hunks = neorev.parse_diff(make_large_diff())
+        hunk = hunks[0]
+        body_lines = hunk.body.split("\n")
+        half = len(body_lines) // 2
+        truncated_body = "\n".join(body_lines[:half])
+        delta_output = truncated_body.encode()
+        diff_lines = neorev.build_display_lines(delta_output, self.term.width)
+        far_scroll = len(diff_lines) + TERM_HEIGHT
+        returned_offset = self.term.render_review_screen(
+            hunks,
+            0,
+            delta_output,
+            [],
+            scroll_offset=far_scroll,
+        )
+        self.assertLessEqual(
+            returned_offset + 1,
+            len(diff_lines),
+            "scroll offset must be clamped so at least one line is visible",
+        )
+
+    def test_no_lines_below_count_while_streaming(self) -> None:
+        """While the stream is not exhausted, no specific 'lines below' is shown."""
+        hunks = neorev.parse_diff(make_large_diff())
+        hunk = hunks[0]
+        # Use only half the body so the content is clearly scrollable.
+        body_lines = hunk.body.split("\n")
+        half_body = "\n".join(body_lines[: len(body_lines) // 2])
+        delta_output = half_body.encode()
+        self.term.render_review_screen(
+            hunks,
+            0,
+            delta_output,
+            [],
+            scroll_offset=0,
+            streaming=True,
+        )
+        output = self.fake.read_output()
+        visible = decode_visible_terminal_output(output)
+        self.assertNotIn("lines below", visible)
+
+
+class TestDeltaStream(unittest.TestCase):
+    """Tests for DeltaStream incremental delta output reading."""
+
+    def test_kill_already_finished(self) -> None:
+        """Killing a stream whose delta process has already exited does not raise."""
+        stream = neorev.DeltaStream(make_large_diff(), TERM_WIDTH)
+        stream.read_all()
+        stream.kill()
+
+    def test_incremental_read(self) -> None:
+        """Reading fewer lines than total still allows draining the rest later."""
+        stream = neorev.DeltaStream(make_large_diff(), TERM_WIDTH)
+        try:
+            stream.ensure_lines(3)
+            self.assertGreaterEqual(len(stream.lines), 3)
+            all_lines = stream.read_all()
+            self.assertGreaterEqual(len(all_lines), LARGE_BODY_LINE_COUNT)
+        finally:
+            stream.kill()
+
+    def test_exhausted_output_is_stable_across_counts(self) -> None:
+        """Once exhausted, get_output returns all cached content regardless of count."""
+        stream = neorev.DeltaStream(make_large_diff(), TERM_WIDTH)
+        try:
+            stream.read_all()
+            self.assertTrue(stream.exhausted)
+            small = stream.get_output(1)
+            large = stream.get_output(LARGE_BODY_LINE_COUNT * 10)
+            self.assertEqual(small, large)
+        finally:
+            stream.kill()
 
 
 class TestLineTargetMapping(unittest.TestCase):

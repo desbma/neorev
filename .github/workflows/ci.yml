@@ -11,6 +11,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{matrix.python-version}}
+      - run: |
+          sudo apt update
+          sudo apt install git-delta
       - run: ./test.py
 
   lint:

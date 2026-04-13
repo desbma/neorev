@@ -16,9 +16,10 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import tty
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -107,6 +108,8 @@ FOOTER_RE = re.compile(
     re.MULTILINE,
 )
 APPROVAL_HASH_BYTES = 8
+DELTA_STREAM_READ_SIZE = 8192
+DELTA_VIEWPORT_LINE_BUFFER = 20
 ANCHOR_PAYLOAD_VERSION = "v1"
 ANCHOR_DIGEST_BYTES = 8
 ANCHOR_LENGTH_PREFIX_BYTES = 8
@@ -533,6 +536,94 @@ class NotePanelState:
 
     cursor: int = 0
     scroll_offset: int = 0
+
+
+class DeltaStream:
+    """Streams delta output incrementally, caching lines for reuse."""
+
+    def __init__(self, raw: str, width: int) -> None:
+        """Spawn a delta process on *raw* and prepare for incremental reads."""
+        self.lines: list[bytes] = []
+        self.buf: bytes = b""
+        self.exhausted: bool = False
+        self.leading_stripped: bool = False
+        self.process: subprocess.Popen[bytes] = subprocess.Popen(
+            [
+                "delta",
+                "--width",
+                str(width),
+                "--file-style",
+                "omit",
+                "--hunk-header-style",
+                "omit",
+                "--paging",
+                "never",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self.feeder: threading.Thread = threading.Thread(
+            target=feed_pipe,
+            args=(self.process.stdin, raw.encode()),
+            daemon=True,
+        )
+        self.feeder.start()
+
+    def ensure_lines(self, count: int) -> None:
+        """Read from the pipe until at least *count* lines are cached or stream ends."""
+        while len(self.lines) < count and not self.exhausted:
+            self.read_chunk()
+
+    def read_all(self) -> list[bytes]:
+        """Drain all remaining output and return every cached line."""
+        while not self.exhausted:
+            self.read_chunk()
+        return self.lines
+
+    def read_chunk(self) -> None:
+        """Read one chunk from stdout and append complete lines to the cache."""
+        if self.process.stdout is None:
+            self.exhausted = True
+            return
+        chunk = self.process.stdout.read(DELTA_STREAM_READ_SIZE)
+        if not chunk:
+            if self.buf:
+                self.lines.append(self.buf)
+                self.buf = b""
+            self.exhausted = True
+            self.process.stdout.close()
+            self.process.wait()
+            if self.lines and self.lines[-1] == b"":
+                self.lines.pop()
+            return
+        self.buf += chunk
+        parts = self.buf.split(b"\n")
+        self.buf = parts[-1]
+        self.lines.extend(parts[:-1])
+        if not self.leading_stripped and self.lines and self.lines[0] == b"":
+            self.lines.pop(0)
+            self.leading_stripped = True
+
+    def get_output(self, line_count: int) -> bytes:
+        """Read at least *line_count* lines, then join every cached line as bytes."""
+        self.ensure_lines(line_count)
+        return b"\n".join(self.lines)
+
+    def kill(self) -> None:
+        """Terminate the delta process and join the feeder thread."""
+        if self.process.poll() is None:
+            self.process.kill()
+            if self.process.stdout is not None:
+                self.process.stdout.close()
+            self.process.wait()
+        self.feeder.join()
+
+
+def feed_pipe(pipe: IO[bytes], data: bytes) -> None:
+    """Write *data* into *pipe* and close it, swallowing broken-pipe errors."""
+    with closing(pipe), suppress(BrokenPipeError):
+        pipe.write(data)
 
 
 def format_editor_line_number(dl: DisplayLine) -> str:
@@ -1653,11 +1744,13 @@ class Terminal:
                 getattr(self, "height", self.DEFAULT_HEIGHT), MIN_TERMINAL_HEIGHT
             )
 
-    def apply_resize(self, delta_cache: dict[int, bytes]) -> None:
+    def apply_resize(self, delta_cache: dict[int, DeltaStream]) -> None:
         """Refresh geometry and clear cache if width changed."""
         old_width = self.width
         self.refresh_geometry()
         if self.width != old_width:
+            for stream in delta_cache.values():
+                stream.kill()
             delta_cache.clear()
 
     def close(self) -> None:
@@ -1765,13 +1858,15 @@ class Terminal:
         tty.setraw(self.fd)
         return comment
 
-    def render_review_screen(
+    def render_review_screen(  # noqa: PLR0913
         self,
         hunks: list[Hunk],
         current_index: int,
         delta_output: bytes,
         global_notes: list[GlobalNote],
         scroll_offset: int = 0,
+        *,
+        streaming: bool = False,
     ) -> int:
         """Render the full review screen and return the clamped scroll offset."""
         hunk = hunks[current_index]
@@ -1788,7 +1883,7 @@ class Terminal:
         self.write(chrome_line(markers, self.width) + "\r\n")
 
         self.render_diff_body(diff_lines, viewport)
-        self.render_footer(viewport)
+        self.render_footer(viewport, streaming=streaming)
 
         return viewport.scroll_offset
 
@@ -1811,15 +1906,17 @@ class Terminal:
             self.write(b"\r\n")
 
     def render_footer(
-        self, viewport: DiffViewport, footer_text: str | None = None
+        self,
+        viewport: DiffViewport,
+        footer_text: str | None = None,
+        *,
+        streaming: bool = False,
     ) -> None:
         """Render the scroll-down indicator and bottom key hints."""
         if viewport.can_scroll_down:
             self.write(f"{CSI}{self.height - 1};1H")
-            self.write(
-                f"  {BOLD}{WHITE}▼ Ctrl-D to scroll down "
-                f"({viewport.lines_below} lines below){RESET}",
-            )
+            suffix = "" if streaming else f" ({viewport.lines_below} lines below)"
+            self.write(f"  {BOLD}{WHITE}▼ Ctrl-D to scroll down{suffix}{RESET}")
 
         self.write(f"{CSI}{self.height};1H")
         if footer_text is None:
@@ -2244,15 +2341,15 @@ class Terminal:
     def run_review_loop(
         self,
         state: ReviewState,
-        delta_cache: dict[int, bytes],
+        delta_cache: dict[int, DeltaStream],
     ) -> None:
         """Run the interactive key-handling loop until the user quits."""
         with nonblocking_pipe() as (wakeup_r, wakeup_w):
 
-            def get_delta(index: int) -> bytes:
-                """Return cached delta output for hunk at *index*."""
+            def get_stream(index: int) -> DeltaStream:
+                """Return the cached delta stream for hunk at *index*."""
                 if index not in delta_cache:
-                    delta_cache[index] = render_through_delta(
+                    delta_cache[index] = DeltaStream(
                         state.hunks[index].raw,
                         width=self.width,
                     )
@@ -2260,12 +2357,19 @@ class Terminal:
 
             def redraw() -> None:
                 """Redraw the review screen."""
+                viewport_lines = self.height - CHROME_ROWS
+                needed = (
+                    state.scroll_offset + viewport_lines + DELTA_VIEWPORT_LINE_BUFFER
+                )
+                stream = get_stream(state.current_index)
+                delta_output = stream.get_output(needed)
                 state.scroll_offset = self.render_review_screen(
                     state.hunks,
                     state.current_index,
-                    get_delta(state.current_index),
+                    delta_output,
                     state.global_notes,
                     state.scroll_offset,
+                    streaming=not stream.exhausted,
                 )
 
             prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
@@ -2291,6 +2395,8 @@ class Terminal:
                     if handled:
                         redraw()
             finally:
+                for stream in delta_cache.values():
+                    stream.kill()
                 self.wakeup_read_fd = None
                 signal.signal(signal.SIGWINCH, prev_handler)
                 signal.set_wakeup_fd(prev_wakeup_fd)
@@ -2702,7 +2808,7 @@ def main() -> None:
 
     global_notes = load_or_resume_review(hunks, args.output)
 
-    delta_cache: dict[int, bytes] = {}
+    delta_cache: dict[int, DeltaStream] = {}
 
     state = ReviewState(
         hunks=hunks,
