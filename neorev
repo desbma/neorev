@@ -48,7 +48,6 @@ ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 HUNK_BODY_MAX_LINES = 10
 HUNK_BODY_CONTEXT_LINES = HUNK_BODY_MAX_LINES // 2
-BITS_PER_BYTE = 8
 DRAIN_READ_SIZE = 256
 ESC_SEQUENCE_TIMEOUT = 0.05
 CHROME_ROWS = 3  # top bar + markers + footer
@@ -104,9 +103,10 @@ SECTION_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 FOOTER_RE = re.compile(
-    r"^<!-- neorev: approved-bitmap=(\S+) -->$",
+    r"^<!-- neorev: approved-hashes=(\S*) -->$",
     re.MULTILINE,
 )
+APPROVAL_HASH_BYTES = 8
 ANCHOR_PAYLOAD_VERSION = "v1"
 ANCHOR_DIGEST_BYTES = 8
 ANCHOR_LENGTH_PREFIX_BYTES = 8
@@ -842,8 +842,8 @@ def format_diff_block(hunk: Hunk, note: HunkNote) -> str:
 
 
 def format_footer(hunks: list[Hunk]) -> str:
-    """Format the HTML comment footer with the approved-hunk bitmap."""
-    return f"\n<!-- neorev: approved-bitmap={encode_approved_bitmap(hunks)} -->\n"
+    """Format the HTML comment footer with approved-hunk hashes."""
+    return f"\n<!-- neorev: approved-hashes={encode_approved_hashes(hunks)} -->\n"
 
 
 def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
@@ -880,33 +880,43 @@ def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
     return trimmed
 
 
-def bitmap_byte_length(num_hunks: int) -> int:
-    """Return the number of bytes needed to store *num_hunks* approval bits."""
-    return (num_hunks + BITS_PER_BYTE - 1) // BITS_PER_BYTE
+def hunk_identity_hash(hunk: Hunk) -> bytes:
+    """Return a fixed-size identity digest for *hunk* based on its content."""
+    parts = (hunk.file_path or "", hunk.range_line, hunk.body)
+    payload = b"".join(
+        len(encoded).to_bytes(ANCHOR_LENGTH_PREFIX_BYTES, "big") + encoded
+        for encoded in (part.encode("utf-8") for part in parts)
+    )
+    return hashlib.md5(payload, usedforsecurity=False).digest()[:APPROVAL_HASH_BYTES]
 
 
-def encode_approved_bitmap(hunks: list[Hunk]) -> str:
-    """Encode the approved/pending state of *hunks* as a base64 string."""
-    n = bitmap_byte_length(len(hunks))
-    bits = sum(1 << i for i, h in enumerate(hunks) if h.approved)
-    return base64.b64encode(bits.to_bytes(n, "little")).decode("ascii")
+def encode_approved_hashes(hunks: list[Hunk]) -> str:
+    """Encode the approved hunks as concatenated identity hashes, base64-encoded."""
+    chunks = b"".join(hunk_identity_hash(hunk) for hunk in hunks if hunk.approved)
+    if not chunks:
+        return ""
+    return base64.b64encode(chunks).decode("ascii")
 
 
-def decode_approved_bitmap(encoded: str, num_hunks: int) -> list[bool]:
+def decode_approved_hashes(encoded: str) -> set[bytes]:
     """
-    Decode a base64 bitmap into a list of booleans (one per hunk).
+    Decode a base64 string of concatenated hunk identity hashes into a set.
 
-    Returns an empty list if *encoded* is invalid or the length does not
-    match *num_hunks*.
+    Return an empty set if *encoded* is empty, invalid, or its length is
+    not a multiple of the hash size.
     """
+    if not encoded:
+        return set()
     try:
         raw = base64.b64decode(encoded)
     except (ValueError, binascii.Error):
-        return []
-    if len(raw) != bitmap_byte_length(num_hunks):
-        return []
-    bits = int.from_bytes(raw, "little")
-    return [bool(bits & (1 << i)) for i in range(num_hunks)]
+        return set()
+    if len(raw) % APPROVAL_HASH_BYTES != 0:
+        return set()
+    return {
+        raw[i : i + APPROVAL_HASH_BYTES]
+        for i in range(0, len(raw), APPROVAL_HASH_BYTES)
+    }
 
 
 def load_previous_review(
@@ -2540,33 +2550,33 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
     """
     Load a previous review from *output_path* if it exists.
 
-    Applies matching annotations and the approved-hunk bitmap to *hunks*
+    Applies matching annotations and approved-hunk hashes to *hunks*
     in place and returns the list of global notes.
     """
-    previous_annotations, previous_global_notes, bitmap_encoded = load_previous_review(
+    previous_annotations, previous_global_notes, hashes_encoded = load_previous_review(
         output_path,
     )
     if (
         not previous_annotations
         and not previous_global_notes
-        and bitmap_encoded is None
+        and hashes_encoded is None
     ):
         return []
 
     result = apply_previous_review(hunks, previous_annotations)
 
-    approved_from_bitmap = 0
-    if bitmap_encoded is not None:
-        approved = decode_approved_bitmap(bitmap_encoded, len(hunks))
-        for i, is_approved in enumerate(approved):
-            if is_approved and not hunks[i].notes:
-                hunks[i].approved = True
-                approved_from_bitmap += 1
+    approved_from_hashes = 0
+    if hashes_encoded is not None:
+        approved_set = decode_approved_hashes(hashes_encoded)
+        for hunk in hunks:
+            if hunk_identity_hash(hunk) in approved_set and not hunk.notes:
+                hunk.approved = True
+                approved_from_hashes += 1
 
     display_path = compact_path(output_path)
     sys.stderr.write(
         f"Loaded {result.matched} hunk annotation(s), "
-        f"{approved_from_bitmap} approved hunk(s), and "
+        f"{approved_from_hashes} approved hunk(s), and "
         f"{len(previous_global_notes)} global note(s) from {display_path}\n",
     )
     if result.stale_unmatched:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for neorev — interactive diff review tool."""
 
+import base64
 import contextlib
 import fcntl
 import importlib.machinery
@@ -41,8 +42,7 @@ OVERFLOW_HUNK_INDEX = 50
 OVERFLOWING_LINE_COUNT = 100
 OUT_OF_BOUNDS_OFFSET = 9999
 MIDDLE_SCROLL_OFFSET = 5
-BYTE_BOUNDARY_HUNK_COUNT = 8
-OVER_BYTE_BOUNDARY_HUNK_COUNT = 9
+MANY_APPROVED_COUNT = 20
 MULTI_FILE_HUNK_COUNT = 6
 HUNKS_PER_FILE = 2
 TOP_BAR_INDEX_TOKEN = "Hunk 1/5"
@@ -488,97 +488,148 @@ class TestParseDiff(unittest.TestCase):
         self.assertTrue(hunks[0].file_path.startswith("/"))
 
 
-class TestBitmap(unittest.TestCase):
-    """Tests for encode_approved_bitmap / decode_approved_bitmap round-trip."""
+class TestApprovedHashes(unittest.TestCase):
+    """Tests for encode_approved_hashes / decode_approved_hashes round-trip."""
 
-    def test_round_trip(self) -> None:
-        """Encoding then decoding recovers the original approval states."""
+    def test_round_trip_mixed(self) -> None:
+        """Encoding then decoding recovers exactly the approved hunks."""
         hunks = [
-            make_hunk(status=neorev.Status.APPROVED),
-            make_hunk(),
-            make_hunk(status=neorev.Status.APPROVED),
+            make_hunk(file_path="a.py", body="+line a", status=neorev.Status.APPROVED),
+            make_hunk(file_path="b.py", body="+line b"),
+            make_hunk(file_path="c.py", body="+line c", status=neorev.Status.APPROVED),
         ]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        decoded = neorev.decode_approved_bitmap(encoded, len(hunks))
-        self.assertEqual(decoded, [True, False, True])
+        encoded = neorev.encode_approved_hashes(hunks)
+        result = neorev.decode_approved_hashes(encoded)
+        approved_ids = {neorev.hunk_identity_hash(h) for h in hunks if h.approved}
+        self.assertEqual(result, approved_ids)
 
     def test_all_approved(self) -> None:
-        """All-approved bitmap round-trips correctly."""
-        hunks = [make_hunk(status=neorev.Status.APPROVED) for _ in range(10)]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        decoded = neorev.decode_approved_bitmap(encoded, 10)
-        self.assertTrue(all(decoded))
+        """All-approved set round-trips correctly."""
+        hunks = [
+            make_hunk(
+                file_path=f"f{i}.py",
+                body=f"+line {i}",
+                status=neorev.Status.APPROVED,
+            )
+            for i in range(MANY_APPROVED_COUNT)
+        ]
+        encoded = neorev.encode_approved_hashes(hunks)
+        result = neorev.decode_approved_hashes(encoded)
+        self.assertEqual(len(result), MANY_APPROVED_COUNT)
 
     def test_none_approved(self) -> None:
-        """No-approval bitmap round-trips correctly."""
-        hunks = [make_hunk() for _ in range(5)]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        decoded = neorev.decode_approved_bitmap(encoded, 5)
-        self.assertFalse(any(decoded))
-
-    def test_invalid_base64(self) -> None:
-        """Invalid base64 returns empty list."""
-        self.assertEqual(neorev.decode_approved_bitmap("!!!bad", 3), [])
-
-    def test_length_mismatch(self) -> None:
-        """Mismatched hunk count returns empty list."""
-        hunks = [make_hunk(status=neorev.Status.APPROVED)]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        self.assertEqual(neorev.decode_approved_bitmap(encoded, 99), [])
-
-    def test_single_hunk_approved(self) -> None:
-        """Edge case: single approved hunk."""
-        hunks = [make_hunk(status=neorev.Status.APPROVED)]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        self.assertEqual(neorev.decode_approved_bitmap(encoded, 1), [True])
-
-    def test_exactly_8_hunks(self) -> None:
-        """8 hunks (exactly 1 byte boundary) round-trip correctly."""
-        statuses = [
-            neorev.Status.APPROVED,
-            None,
-            neorev.Status.APPROVED,
-            None,
-            None,
-            neorev.Status.APPROVED,
-            neorev.Status.APPROVED,
-            None,
-        ]
-        hunks = [make_hunk(status=s) for s in statuses]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        decoded = neorev.decode_approved_bitmap(encoded, BYTE_BOUNDARY_HUNK_COUNT)
-        expected = [s == neorev.Status.APPROVED for s in statuses]
-        self.assertEqual(decoded, expected)
-
-    def test_9_hunks(self) -> None:
-        """9 hunks (2 bytes) with mixed approvals round-trip correctly."""
-        statuses = [
-            neorev.Status.APPROVED,
-            None,
-            neorev.Status.APPROVED,
-            None,
-            None,
-            neorev.Status.APPROVED,
-            neorev.Status.APPROVED,
-            None,
-            neorev.Status.APPROVED,
-        ]
-        hunks = [make_hunk(status=s) for s in statuses]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        decoded = neorev.decode_approved_bitmap(encoded, OVER_BYTE_BOUNDARY_HUNK_COUNT)
-        expected = [s == neorev.Status.APPROVED for s in statuses]
-        self.assertEqual(decoded, expected)
+        """No approved hunks produce an empty encoded string."""
+        hunks = [make_hunk(file_path="a.py", body="+x")]
+        encoded = neorev.encode_approved_hashes(hunks)
+        result = neorev.decode_approved_hashes(encoded)
+        self.assertEqual(result, set())
 
     def test_empty_hunks(self) -> None:
-        """0 hunks encodes and decodes to empty list."""
-        encoded = neorev.encode_approved_bitmap([])
-        self.assertEqual(neorev.decode_approved_bitmap(encoded, 0), [])
+        """Empty hunk list encodes and decodes to empty set."""
+        encoded = neorev.encode_approved_hashes([])
+        self.assertEqual(neorev.decode_approved_hashes(encoded), set())
 
-    def test_decode_truncated_data(self) -> None:
-        """Valid base64 with too few bytes for num_hunks returns empty list."""
+    def test_single_approved(self) -> None:
+        """Single approved hunk round-trips."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
-        encoded = neorev.encode_approved_bitmap(hunks)
-        self.assertEqual(neorev.decode_approved_bitmap(encoded, 16), [])
+        encoded = neorev.encode_approved_hashes(hunks)
+        result = neorev.decode_approved_hashes(encoded)
+        self.assertEqual(len(result), 1)
+        self.assertIn(neorev.hunk_identity_hash(hunks[0]), result)
+
+    def test_changed_body_invalidates_approval(self) -> None:
+        """A hunk whose body changed does not match the saved hash."""
+        original = make_hunk(
+            file_path="f.py",
+            body="+old line",
+            status=neorev.Status.APPROVED,
+        )
+        encoded = neorev.encode_approved_hashes([original])
+        result = neorev.decode_approved_hashes(encoded)
+        modified = make_hunk(file_path="f.py", body="+new line")
+        self.assertNotIn(neorev.hunk_identity_hash(modified), result)
+
+    def test_changed_file_path_invalidates_approval(self) -> None:
+        """A hunk whose file path changed does not match the saved hash."""
+        original = make_hunk(
+            file_path="old.py",
+            body="+same",
+            status=neorev.Status.APPROVED,
+        )
+        encoded = neorev.encode_approved_hashes([original])
+        result = neorev.decode_approved_hashes(encoded)
+        moved = make_hunk(file_path="new.py", body="+same")
+        self.assertNotIn(neorev.hunk_identity_hash(moved), result)
+
+    def test_changed_range_line_invalidates_approval(self) -> None:
+        """A hunk whose range line changed does not match the saved hash."""
+        original = make_hunk(
+            file_path="f.py",
+            body="+same",
+            range_line="@@ -1,3 +1,4 @@",
+            status=neorev.Status.APPROVED,
+        )
+        encoded = neorev.encode_approved_hashes([original])
+        result = neorev.decode_approved_hashes(encoded)
+        shifted = make_hunk(
+            file_path="f.py",
+            body="+same",
+            range_line="@@ -5,3 +5,4 @@",
+        )
+        self.assertNotIn(neorev.hunk_identity_hash(shifted), result)
+
+    def test_invalid_base64(self) -> None:
+        """Invalid base64 returns empty set."""
+        self.assertEqual(neorev.decode_approved_hashes("!!!bad"), set())
+
+    def test_truncated_hash_bytes(self) -> None:
+        """Non-multiple-of-digest-size base64 returns empty set."""
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
+        encoded = neorev.encode_approved_hashes(hunks)
+        raw = base64.b64decode(encoded)
+        truncated = base64.b64encode(raw[:-1]).decode("ascii")
+        self.assertEqual(neorev.decode_approved_hashes(truncated), set())
+
+    def test_shifted_hash_bytes(self) -> None:
+        """Prepending a byte shifts all hashes, invalidating every entry."""
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
+        encoded = neorev.encode_approved_hashes(hunks)
+        raw = base64.b64decode(encoded)
+        shifted = base64.b64encode(b"\x00" + raw).decode("ascii")
+        result = neorev.decode_approved_hashes(shifted)
+        self.assertNotIn(neorev.hunk_identity_hash(hunks[0]), result)
+
+    def test_extra_hash_bytes_appended(self) -> None:
+        """Extra digest-sized bytes add a spurious hash; originals survive."""
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
+        encoded = neorev.encode_approved_hashes(hunks)
+        raw = base64.b64decode(encoded)
+        extended = base64.b64encode(raw + b"\xff" * neorev.APPROVAL_HASH_BYTES).decode(
+            "ascii"
+        )
+        result = neorev.decode_approved_hashes(extended)
+        self.assertIn(neorev.hunk_identity_hash(hunks[0]), result)
+
+    def test_empty_string_returns_empty_set(self) -> None:
+        """An empty encoded string decodes to an empty set."""
+        self.assertEqual(neorev.decode_approved_hashes(""), set())
+
+    def test_identity_hash_deterministic(self) -> None:
+        """The same hunk always produces the same identity hash."""
+        hunk = make_hunk(file_path="f.py", body="+x")
+        self.assertEqual(
+            neorev.hunk_identity_hash(hunk),
+            neorev.hunk_identity_hash(hunk),
+        )
+
+    def test_identity_hash_differs_for_different_hunks(self) -> None:
+        """Two hunks with different content produce different hashes."""
+        h1 = make_hunk(file_path="f.py", body="+a")
+        h2 = make_hunk(file_path="f.py", body="+b")
+        self.assertNotEqual(
+            neorev.hunk_identity_hash(h1),
+            neorev.hunk_identity_hash(h2),
+        )
 
 
 class TestFormatOutput(unittest.TestCase):
@@ -625,11 +676,11 @@ class TestFormatOutput(unittest.TestCase):
         output = neorev.format_output(hunks, [])
         self.assertIn("# ...", output)
 
-    def test_bitmap_present_in_output(self) -> None:
-        """Output always contains a neorev footer comment."""
+    def test_footer_present_in_output(self) -> None:
+        """Output always contains a neorev approved-hashes footer comment."""
         hunks = [make_hunk(status=neorev.Status.FLAG, comment="x")]
         output = neorev.format_output(hunks, [])
-        self.assertIn("<!-- neorev: approved-bitmap=", output)
+        self.assertIn("<!-- neorev: approved-hashes=", output)
 
     def test_no_status_hunks(self) -> None:
         """Hunks with no status and no actionable items get 'all clear'."""
@@ -637,7 +688,7 @@ class TestFormatOutput(unittest.TestCase):
         output = neorev.format_output(hunks, [])
         self.assertIn("all clear", output)
         self.assertIn("0/2 hunks approved", output)
-        self.assertIn("<!-- neorev: approved-bitmap=", output)
+        self.assertIn("<!-- neorev: approved-hashes=", output)
 
     def test_global_note_question_label(self) -> None:
         """A global question note section header uses QUESTION label."""
@@ -721,10 +772,12 @@ class TestLoadPreviousReview(unittest.TestCase):
 
     def test_nonexistent_file(self) -> None:
         """Loading a missing file returns empty results."""
-        annotations, notes, bitmap = neorev.load_previous_review("/no/such/file")
+        annotations, notes, hashes_encoded = neorev.load_previous_review(
+            "/no/such/file",
+        )
         self.assertEqual(annotations, {})
         self.assertEqual(notes, [])
-        self.assertIsNone(bitmap)
+        self.assertIsNone(hashes_encoded)
 
     def test_round_trip_through_file(self) -> None:
         """format_output → load_previous_review recovers annotations."""
@@ -793,7 +846,7 @@ class TestLoadPreviousReview(unittest.TestCase):
         section = (
             "[CHANGE REQUESTED] `baz.py @ hunk`\n\n"
             "fix the bug\n\n"
-            "<!-- neorev: approved-bitmap=AQ== -->\n"
+            "<!-- neorev: approved-hashes=AQ== -->\n"
         )
         result = neorev.extract_comment_lines(section)
         self.assertEqual(result, "fix the bug")
@@ -854,10 +907,10 @@ class TestLoadPreviousReview(unittest.TestCase):
         with open(path, "w") as f:
             f.write("   \n\n")
 
-        annotations, notes, bitmap = neorev.load_previous_review(path)
+        annotations, notes, hashes_encoded = neorev.load_previous_review(path)
         self.assertEqual(annotations, {})
         self.assertEqual(notes, [])
-        self.assertIsNone(bitmap)
+        self.assertIsNone(hashes_encoded)
 
     def test_multiline_comment_round_trip(self) -> None:
         """A multi-line comment survives format_output → load_previous_review."""
@@ -904,15 +957,15 @@ class TestLoadPreviousReview(unittest.TestCase):
         content = (
             "### [CHANGE REQUESTED] `broken.py`\n\n"
             "some comment\n\n"
-            "<!-- neorev: approved-bitmap=AQ== -->\n"
+            "<!-- neorev: approved-hashes=AQ== -->\n"
         )
         path = self.tmp_path()
         with open(path, "w") as f:
             f.write(content)
 
-        annotations, _, bitmap = neorev.load_previous_review(path)
+        annotations, _, hashes_encoded = neorev.load_previous_review(path)
         self.assertEqual(annotations, {})
-        self.assertNotEqual(bitmap, "")
+        self.assertIsNotNone(hashes_encoded)
 
     def test_apply_previous_review_multiple_matches(self) -> None:
         """Multiple hunks matching annotations all get annotated."""
@@ -1081,7 +1134,7 @@ class TestNoteAnchor(unittest.TestCase):
             "+second\n"
             "```\n\n"
             f"{ANCHOR_LEGACY_COMMENT}\n\n"
-            "<!-- neorev: approved-bitmap=AA== -->\n"
+            "<!-- neorev: approved-hashes= -->\n"
         )
         path = self.tmp_path()
         Path(path).write_text(unanchored_content)
@@ -2666,7 +2719,7 @@ class TestMainWorkflow(unittest.TestCase):
     """High-level tests for new review and resume workflows through main()."""
 
     def test_new_review_flow_writes_expected_output(self) -> None:
-        """A scripted review session writes hunk/global annotations and bitmap."""
+        """A scripted review writes annotations and approval hashes."""
 
         def script(state: neorev.ReviewState) -> None:
             """Apply one flag, one approval, and one global note."""
@@ -2695,12 +2748,12 @@ class TestMainWorkflow(unittest.TestCase):
             self.assertIn(WORKFLOW_FLAG_COMMENT, output)
             self.assertIn("[QUESTION] `global`", output)
             self.assertIn(WORKFLOW_GLOBAL_NOTE, output)
-            self.assertIn("<!-- neorev: approved-bitmap=", output)
+            self.assertIn("<!-- neorev: approved-hashes=", output)
         finally:
             os.unlink(output_path)
 
-    def test_resume_workflow_applies_annotations_bitmap_and_global_notes(self) -> None:
-        """Resuming from an existing output restores notes and bitmap approvals."""
+    def test_resume_workflow_applies_annotations_and_global_notes(self) -> None:
+        """Resuming from an existing output restores notes and hash-keyed approvals."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         previous_hunks[0].notes = [
             neorev.HunkNote(
@@ -2734,8 +2787,8 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_resume_annotation_precedence_over_bitmap(self) -> None:
-        """Explicit annotation status wins when bitmap marks the same hunk approved."""
+    def test_resume_annotation_precedence_over_hashes(self) -> None:
+        """Explicit annotation status wins when hashes mark the same hunk approved."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         previous_hunks[0].notes = [
             neorev.HunkNote(
@@ -2744,16 +2797,8 @@ class TestMainWorkflow(unittest.TestCase):
                 text=WORKFLOW_PRECEDENCE_QUESTION,
             )
         ]
+        previous_hunks[0].approved = True
         previous_output = neorev.format_output(previous_hunks, [])
-
-        bitmap_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
-        bitmap_hunks[0].approved = True
-        conflicting_bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
-        previous_output = re.sub(
-            r"<!-- neorev: approved-bitmap=\S+ -->",
-            f"<!-- neorev: approved-bitmap={conflicting_bitmap} -->",
-            previous_output,
-        )
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(previous_output)
@@ -2771,11 +2816,11 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_resume_with_stale_annotation_reports_and_keeps_bitmap(self) -> None:
-        """Stale annotations are reported while bitmap approvals still resume."""
-        bitmap_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
-        bitmap_hunks[1].approved = True
-        bitmap = neorev.encode_approved_bitmap(bitmap_hunks)
+    def test_resume_with_stale_annotation_reports_and_keeps_hashes(self) -> None:
+        """Stale annotations are reported while hash approvals still resume."""
+        hash_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
+        hash_hunks[1].approved = True
+        hashes = neorev.encode_approved_hashes(hash_hunks)
         stale_output = (
             "### [CHANGE REQUESTED] `stale.py @ hunk`\n\n"
             "```diff\n"
@@ -2783,7 +2828,7 @@ class TestMainWorkflow(unittest.TestCase):
             "+stale\n"
             "```\n\n"
             "stale note\n\n"
-            f"<!-- neorev: approved-bitmap={bitmap} -->\n"
+            f"<!-- neorev: approved-hashes={hashes} -->\n"
         )
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
