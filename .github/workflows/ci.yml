@@ -14,7 +14,7 @@ jobs:
       - run: |
           sudo apt update
           sudo apt install git-delta
-      - run: ./test.py
+      - run: python3 -m unittest discover -s tests -v
 
   lint:
     runs-on: ubuntu-latest
@@ -30,11 +30,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/ruff-action@v3
         with:
-          args: format --check neorev test.py
+          args: format --check neorev tests
 
   type-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
-      - run: uvx ty check neorev test.py
+      - run: uvx ty check neorev tests

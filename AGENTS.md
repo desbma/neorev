@@ -43,20 +43,20 @@ Unless stated otherwise, always use a red-green testing approach:
 
 ## Testing
 
-Tests use `unittest` (stdlib only) and live in `test.py`.
+Tests use `unittest` (stdlib only), live under `tests/`, and are split across logical modules.
 
 - Tests must follow the same code style conventions as the main code (docstrings, type annotations, named constants, etc.).
 - Tests must pass the same formatter, linter, and type checker as the main code.
 
 ```sh
 # Run all tests:
-./test.py
+python3 -m unittest discover -s tests
 
 # Run a single test class:
-python3 -m unittest test.TestParseDiff
+python3 -m unittest tests.test_diff.TestParseDiff
 
 # Run a single test method:
-python3 -m unittest test.TestParseDiff.test_single_hunk
+python3 -m unittest tests.test_diff.TestParseDiff.test_single_hunk
 ```
 
 ## Linting & Formatting
@@ -72,7 +72,7 @@ ruff format --check neorev
 Tests must also pass:
 
 ```sh
-ty check test.py
-ruff check test.py
-ruff format --check test.py
+ty check tests
+ruff check tests
+ruff format --check tests
 ```
