@@ -789,6 +789,22 @@ class TestNavigation(unittest.TestCase):
         self.state.approve()
         self.assertEqual(self.state.current_index, 2)
 
+    def test_approve_resets_scroll_offset(self) -> None:
+        """Approving a hunk and advancing resets the scroll position."""
+        self.state.scroll_offset = 42
+        self.state.approve()
+        self.assertEqual(self.state.current_index, 1)
+        self.assertEqual(self.state.scroll_offset, 0)
+
+    def test_approve_without_advance_keeps_scroll_offset(self) -> None:
+        """Un-approving (toggle off) does not move, so scroll is preserved."""
+        self.hunks[0].approved = True
+        self.state.scroll_offset = 17
+        self.state.approve()
+        self.assertFalse(self.hunks[0].approved)
+        self.assertEqual(self.state.current_index, 0)
+        self.assertEqual(self.state.scroll_offset, 17)
+
     def test_approve_file(self) -> None:
         """Approve-file approves all hunks with the same file_path."""
         for h in self.hunks:
@@ -796,6 +812,16 @@ class TestNavigation(unittest.TestCase):
         self.state.approve_file()
         for h in self.hunks:
             self.assertTrue(h.approved)
+
+    def test_approve_file_resets_scroll_offset(self) -> None:
+        """Approve-file advances to the next unhandled hunk and resets scroll."""
+        self.hunks[0].file_path = "a.py"
+        self.hunks[1].file_path = "a.py"
+        self.hunks[2].file_path = "b.py"
+        self.state.scroll_offset = 25
+        self.state.approve_file()
+        self.assertEqual(self.state.current_index, 2)
+        self.assertEqual(self.state.scroll_offset, 0)
 
     def test_approve_file_skips_other_files(self) -> None:
         """Approve-file only touches hunks matching the current file."""

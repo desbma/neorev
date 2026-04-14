@@ -457,7 +457,7 @@ class ReviewState:
             hunk.approved = False
         elif not hunk.notes:
             hunk.approved = True
-            self.current_index = self.find_next_unhandled()
+            self.advance_to_next_unhandled()
 
     def approve_file(self) -> None:
         """Approve all note-free hunks in the same file as the current hunk."""
@@ -465,7 +465,14 @@ class ReviewState:
         for hunk in self.hunks:
             if hunk.file_path == current_file and not hunk.approved and not hunk.notes:
                 hunk.approved = True
-        self.current_index = self.find_next_unhandled()
+        self.advance_to_next_unhandled()
+
+    def advance_to_next_unhandled(self) -> None:
+        """Move to the next unhandled hunk, resetting scroll on change."""
+        new_index = self.find_next_unhandled()
+        if new_index != self.current_index:
+            self.current_index = new_index
+            self.scroll_offset = 0
 
     def managed_note_refs(self) -> list[ManagedNoteRef]:
         """Build a flat list of note references for the manage-notes panel."""
