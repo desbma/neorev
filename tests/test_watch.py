@@ -1,4 +1,4 @@
-"""Tests for watch mode and its jujutsu --ignore-working-copy behavior."""
+"""Tests for watch mode and jujutsu working-copy snapshot behavior."""
 
 import io
 import os
@@ -23,7 +23,7 @@ UNUSED_OUTPUT_PATH = "unused-review.md"
 APPROVED_HASHES_TOKEN = "approved-hashes="
 ALL_CLEAR_TOKEN = "all clear"
 INOTIFYWAIT_FAKE_PATH = "/usr/bin/inotifywait"
-JJ_WORKING_COPY_SOURCE = "jj show --ignore-working-copy"
+JJ_WORKING_COPY_SOURCE = "jj show"
 
 LoopAction = Callable[[neorev.ReviewState | None], None]
 LoopScript = list[tuple[LoopAction, neorev.LoopResult]]
@@ -107,21 +107,21 @@ class WatchScriptTerminal:
         return result
 
 
-class TestJjIgnoreWorkingCopy(unittest.TestCase):
-    """jujutsu commands must pass --ignore-working-copy."""
+class TestJjWorkingCopyFlag(unittest.TestCase):
+    """The diff command snapshots the working copy; metadata queries skip it."""
 
     def test_jj_diff_command_without_rev(self) -> None:
-        """jj_diff_command omits a rev but keeps --ignore-working-copy."""
+        """jj_diff_command omits both the rev and --ignore-working-copy."""
         self.assertEqual(
             neorev.jj_diff_command(None),
-            ["jj", "show", "--ignore-working-copy"],
+            ["jj", "show"],
         )
 
     def test_jj_diff_command_with_rev(self) -> None:
-        """jj_diff_command appends the rev after the flag."""
+        """jj_diff_command appends the rev and keeps snapshotting enabled."""
         self.assertEqual(
             neorev.jj_diff_command("abc123"),
-            ["jj", "show", "--ignore-working-copy", "abc123"],
+            ["jj", "show", "abc123"],
         )
 
     def test_jj_root_probes_with_ignore_working_copy(self) -> None:
@@ -203,7 +203,7 @@ class TestFetchWatchDiff(unittest.TestCase):
         with patch("neorev.subprocess.run", side_effect=error):
             text, source = neorev.fetch_watch_diff(neorev.JjSource("abc"))
         self.assertEqual(text, "")
-        self.assertEqual(source, "jj show --ignore-working-copy abc")
+        self.assertEqual(source, "jj show abc")
 
 
 class TestBuildWatchState(unittest.TestCase):

@@ -177,9 +177,9 @@ class TestMainWorkflow(unittest.TestCase):
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
                 )
-            fetch_mock.assert_called_once_with(["jj", "show", "--ignore-working-copy"])
+            fetch_mock.assert_called_once_with(["jj", "show"])
             output = Path(output_path).read_text()
-            self.assertIn("`jj show --ignore-working-copy`", output)
+            self.assertIn("`jj show`", output)
         finally:
             os.unlink(output_path)
 
@@ -200,11 +200,9 @@ class TestMainWorkflow(unittest.TestCase):
                     lambda state: state.hunks[0].__setattr__("approved", True),
                     extra_args=["-j", "abc123"],
                 )
-            fetch_mock.assert_called_once_with(
-                ["jj", "show", "--ignore-working-copy", "abc123"]
-            )
+            fetch_mock.assert_called_once_with(["jj", "show", "abc123"])
             output = Path(output_path).read_text()
-            self.assertIn("`jj show --ignore-working-copy abc123`", output)
+            self.assertIn("`jj show abc123`", output)
         finally:
             os.unlink(output_path)
 

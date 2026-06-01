@@ -2797,7 +2797,9 @@ def copy_output_reference_to_clipboard(output_path: str) -> None:
 
 def jj_diff_command(rev: str | None) -> list[str]:
     """Return the command to show the jj diff for *rev*, or the working copy."""
-    cmd = ["jj", "show", "--ignore-working-copy"]
+    # No --ignore-working-copy here (unlike the metadata queries): snapshotting
+    # imports pending edits into @ so the diff reflects the current files.
+    cmd = ["jj", "show"]
     if rev is not None:
         cmd.append(rev)
     return cmd
