@@ -94,7 +94,7 @@ JJ_WORKSPACE_LIST_FIELDS = 2  # "name: path" → 2 colon-separated fields
 
 WATCH_DEBOUNCE_TIMEOUT = 0.5
 GIT_WATCH_STATE_PATHS = ("HEAD", "index", "logs/HEAD", "packed-refs", "refs/heads")
-JJ_WATCH_STATE_PATH = "repo/op_heads/heads"
+JJ_OP_HEADS_REL = "op_heads/heads"
 EMPTY_DIFF_WAIT_MESSAGE = "Empty diff, waiting for changes…"
 WATCH_WAIT_FOOTER_SEGMENTS = [("q", "quit")]
 
@@ -2947,6 +2947,16 @@ def git_tracked_dirs(root: str) -> set[Path]:
     return {(root_path / name).parent for name in listing.split("\0") if name}
 
 
+def jj_op_heads_dir(root: str) -> Path:
+    """Return the jj operation-heads directory, following a workspace repo pointer."""
+    repo = Path(root) / ".jj" / "repo"
+    # In a non-default workspace, .jj/repo is a file holding the path to the
+    # default workspace's shared repo directory rather than the directory itself.
+    if repo.is_file():
+        repo = (repo.parent / repo.read_text().strip()).resolve()
+    return repo / JJ_OP_HEADS_REL
+
+
 def watch_paths(vcs: Vcs, root: str) -> list[str]:
     """Return existing filesystem paths to watch for *vcs* under *root*."""
     root_path = Path(root)
@@ -2956,7 +2966,7 @@ def watch_paths(vcs: Vcs, root: str) -> list[str]:
         candidates.extend(sorted(git_tracked_dirs(root)))
         candidates.extend(root_path / ".git" / rel for rel in GIT_WATCH_STATE_PATHS)
     else:
-        candidates.append(root_path / ".jj" / JJ_WATCH_STATE_PATH)
+        candidates.append(jj_op_heads_dir(root))
     unique: dict[str, None] = {}
     for path in candidates:
         if path.exists():

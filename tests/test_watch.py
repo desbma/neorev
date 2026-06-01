@@ -193,6 +193,19 @@ class TestWatchPaths(unittest.TestCase):
             paths = neorev.watch_paths(neorev.Vcs.JUJUTSU, str(root))
         self.assertEqual(paths, [str(op_heads)])
 
+    def test_jj_secondary_workspace_resolves_repo_pointer(self) -> None:
+        """Follow a workspace's .jj/repo pointer file to the shared op-heads dir."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            op_heads = root / "default" / ".jj" / "repo" / "op_heads" / "heads"
+            op_heads.mkdir(parents=True)
+            secondary_jj = root / "secondary" / ".jj"
+            secondary_jj.mkdir(parents=True)
+            (secondary_jj / "repo").write_text("../../default/.jj/repo")
+            paths = neorev.watch_paths(neorev.Vcs.JUJUTSU, str(root / "secondary"))
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(Path(paths[0]).resolve(), op_heads.resolve())
+
 
 class TestFetchWatchDiff(unittest.TestCase):
     """fetch_watch_diff tolerates empty diffs and command failures."""
