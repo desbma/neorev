@@ -153,62 +153,6 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_git_without_revision_uses_git_diff(self) -> None:
-        """Using -g without a revision runs 'git diff' and records it as the source."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            output_path = f.name
-
-        try:
-            with patch.object(
-                neorev,
-                "fetch_diff_from_vcs",
-                return_value=TWO_HUNK_DIFF,
-            ) as fetch_mock:
-                run_main_with_scripted_terminal(
-                    TWO_HUNK_DIFF,
-                    output_path,
-                    lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-g"],
-                )
-            fetch_mock.assert_called_once_with(["git", "diff"])
-            output = Path(output_path).read_text()
-            self.assertIn("Reviewed diff:", output)
-            self.assertIn("`git diff`", output)
-            self.assertNotIn("git show", output)
-        finally:
-            os.unlink(output_path)
-
-    def test_auto_detect_git_uses_git_diff(self) -> None:
-        """When no diff is piped and a git repo is detected, default to 'git diff'."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            output_path = f.name
-
-        try:
-            with (
-                patch.object(
-                    neorev,
-                    "read_diff_from_stdin",
-                    side_effect=neorev.NoDiffOnStdinError,
-                ),
-                patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.GIT),
-                patch.object(
-                    neorev,
-                    "fetch_diff_from_vcs",
-                    return_value=TWO_HUNK_DIFF,
-                ) as fetch_mock,
-            ):
-                run_main_with_scripted_terminal(
-                    TWO_HUNK_DIFF,
-                    output_path,
-                    lambda state: state.hunks[0].__setattr__("approved", True),
-                )
-            fetch_mock.assert_called_once_with(["git", "diff"])
-            output = Path(output_path).read_text()
-            self.assertIn("`git diff`", output)
-            self.assertNotIn("git show", output)
-        finally:
-            os.unlink(output_path)
-
     def test_auto_detect_jj_uses_jj_show(self) -> None:
         """When no diff is piped and a jj repo is detected, default to 'jj show @'."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -221,10 +165,10 @@ class TestMainWorkflow(unittest.TestCase):
                     "read_diff_from_stdin",
                     side_effect=neorev.NoDiffOnStdinError,
                 ),
-                patch.object(neorev, "detect_vcs", return_value=neorev.Vcs.JUJUTSU),
+                patch.object(neorev, "jj_root", return_value="/repo"),
                 patch.object(
                     neorev,
-                    "fetch_diff_from_vcs",
+                    "fetch_diff_from_jj",
                     return_value=TWO_HUNK_DIFF,
                 ) as fetch_mock,
             ):
@@ -239,26 +183,28 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_git_with_revision_uses_git_show(self) -> None:
-        """Using -g with a revision runs 'git show REV' and records it as the source."""
+    def test_jj_with_revision_uses_jj_show_rev(self) -> None:
+        """Using -j with a revision runs 'jj show REV' and records it as the source."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
         try:
             with patch.object(
                 neorev,
-                "fetch_diff_from_vcs",
+                "fetch_diff_from_jj",
                 return_value=TWO_HUNK_DIFF,
             ) as fetch_mock:
                 run_main_with_scripted_terminal(
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-g", "HEAD~1"],
+                    extra_args=["-j", "abc123"],
                 )
-            fetch_mock.assert_called_once_with(["git", "show", "HEAD~1"])
+            fetch_mock.assert_called_once_with(
+                ["jj", "show", "--ignore-working-copy", "abc123"]
+            )
             output = Path(output_path).read_text()
-            self.assertIn("`git show HEAD~1`", output)
+            self.assertIn("`jj show --ignore-working-copy abc123`", output)
         finally:
             os.unlink(output_path)
 
@@ -270,7 +216,7 @@ class TestMainWorkflow(unittest.TestCase):
         try:
             with patch.object(
                 neorev,
-                "fetch_diff_from_vcs",
+                "fetch_diff_from_jj",
                 return_value=TWO_HUNK_DIFF,
             ):
                 run_main_with_scripted_terminal(

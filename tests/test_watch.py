@@ -18,12 +18,12 @@ from tests.helpers import (
     neorev,
 )
 
-GIT_LS_FILES_NUL = "src/a.py\0pkg/sub/b.py\0"
 WATCH_OUTPUT_NAME = "review.md"
 UNUSED_OUTPUT_PATH = "unused-review.md"
 APPROVED_HASHES_TOKEN = "approved-hashes="
 ALL_CLEAR_TOKEN = "all clear"
 INOTIFYWAIT_FAKE_PATH = "/usr/bin/inotifywait"
+JJ_WORKING_COPY_SOURCE = "jj show --ignore-working-copy"
 
 LoopAction = Callable[[neorev.ReviewState | None], None]
 LoopScript = list[tuple[LoopAction, neorev.LoopResult]]
@@ -56,7 +56,7 @@ class FakeWatcher:
             self.closed = True
 
 
-def fake_restart(old: FakeWatcher | None, _vcs: neorev.Vcs) -> FakeWatcher:
+def fake_restart(old: FakeWatcher | None) -> FakeWatcher:
     """Replacement for restart_watcher that closes *old* and returns a fake."""
     if old is not None:
         old.close()
@@ -124,18 +124,11 @@ class TestJjIgnoreWorkingCopy(unittest.TestCase):
             ["jj", "show", "--ignore-working-copy", "abc123"],
         )
 
-    def test_detect_vcs_probes_jj_with_ignore_working_copy(self) -> None:
-        """detect_vcs probes jj root with --ignore-working-copy."""
-        seen: list[list[str]] = []
-
-        def fake_try_vcs(command: list[str]) -> bool:
-            """Record each probe and succeed only for jj."""
-            seen.append(command)
-            return command[0] == "jj"
-
-        with patch("neorev.try_vcs", side_effect=fake_try_vcs):
-            neorev.detect_vcs()
-        self.assertIn(["jj", "root", "--ignore-working-copy"], seen)
+    def test_jj_root_probes_with_ignore_working_copy(self) -> None:
+        """jj_root probes jj root with --ignore-working-copy."""
+        with patch.object(neorev, "run_jj", return_value="/repo") as mock:
+            neorev.jj_root()
+        self.assertEqual(mock.call_args[0][0], ["jj", "root", "--ignore-working-copy"])
 
 
 class TestWatchArgParsing(unittest.TestCase):
@@ -161,39 +154,23 @@ class TestWatchArgParsing(unittest.TestCase):
 
 
 class TestWatchPaths(unittest.TestCase):
-    """watch_paths derives existing dirs/files per backend."""
+    """watch_paths derives the existing jj operation-heads directory."""
 
-    def test_git_includes_tracked_dirs_and_state(self) -> None:
-        """Return tracked dirs, root, and existing .git files for git."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "a.py").write_text("x")
-            (root / "pkg" / "sub").mkdir(parents=True)
-            (root / "pkg" / "sub" / "b.py").write_text("y")
-            git_dir = root / ".git"
-            git_dir.mkdir()
-            (git_dir / "HEAD").write_text("ref")
-            (git_dir / "index").write_text("idx")
-            with patch.object(neorev, "run_vcs", return_value=GIT_LS_FILES_NUL):
-                paths = neorev.watch_paths(neorev.Vcs.GIT, str(root))
-        self.assertIn(str(root), paths)
-        self.assertIn(str(root / "src"), paths)
-        self.assertIn(str(root / "pkg" / "sub"), paths)
-        self.assertIn(str(git_dir / "HEAD"), paths)
-        self.assertIn(str(git_dir / "index"), paths)
-        self.assertNotIn(str(git_dir / "packed-refs"), paths)
-
-    def test_jj_watches_only_op_heads(self) -> None:
-        """Return only the operation-heads directory for jj."""
+    def test_watches_op_heads(self) -> None:
+        """Return only the operation-heads directory."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             op_heads = root / ".jj" / "repo" / "op_heads" / "heads"
             op_heads.mkdir(parents=True)
-            paths = neorev.watch_paths(neorev.Vcs.JUJUTSU, str(root))
+            paths = neorev.watch_paths(str(root))
         self.assertEqual(paths, [str(op_heads)])
 
-    def test_jj_secondary_workspace_resolves_repo_pointer(self) -> None:
+    def test_missing_op_heads_returns_empty(self) -> None:
+        """Return no paths when the operation-heads directory does not exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(neorev.watch_paths(tmp), [])
+
+    def test_secondary_workspace_resolves_repo_pointer(self) -> None:
         """Follow a workspace's .jj/repo pointer file to the shared op-heads dir."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -202,7 +179,7 @@ class TestWatchPaths(unittest.TestCase):
             secondary_jj = root / "secondary" / ".jj"
             secondary_jj.mkdir(parents=True)
             (secondary_jj / "repo").write_text("../../default/.jj/repo")
-            paths = neorev.watch_paths(neorev.Vcs.JUJUTSU, str(root / "secondary"))
+            paths = neorev.watch_paths(str(root / "secondary"))
         self.assertEqual(len(paths), 1)
         self.assertEqual(Path(paths[0]).resolve(), op_heads.resolve())
 
@@ -216,15 +193,15 @@ class TestFetchWatchDiff(unittest.TestCase):
             args=[], returncode=0, stdout=SIMPLE_DIFF
         )
         with patch("neorev.subprocess.run", return_value=completed):
-            text, source = neorev.fetch_watch_diff((neorev.Vcs.GIT, None))
+            text, source = neorev.fetch_watch_diff(neorev.JjSource(None))
         self.assertEqual(text, SIMPLE_DIFF)
-        self.assertEqual(source, "git diff")
+        self.assertEqual(source, JJ_WORKING_COPY_SOURCE)
 
     def test_returns_empty_on_failure(self) -> None:
         """A failed command yields empty text without raising."""
         error = subprocess.CalledProcessError(1, ["jj", "show"])
         with patch("neorev.subprocess.run", side_effect=error):
-            text, source = neorev.fetch_watch_diff((neorev.Vcs.JUJUTSU, "abc"))
+            text, source = neorev.fetch_watch_diff(neorev.JjSource("abc"))
         self.assertEqual(text, "")
         self.assertEqual(source, "jj show --ignore-working-copy abc")
 
@@ -284,7 +261,7 @@ class TestWatchModeGuards(unittest.TestCase):
     def test_missing_inotifywait_is_fatal(self) -> None:
         """--watch without inotifywait exits before fetching any diff."""
         with patch("neorev.shutil.which", return_value=None):
-            argv = ["neorev", "-w", "-g", "HEAD", "-o", "out.md"]
+            argv = ["neorev", "-w", "-j", "abc", "-o", "out.md"]
             with patch.object(sys, "stderr", io.StringIO()):
                 code = self.run_main(argv, "")
         self.assertEqual(code, os.EX_UNAVAILABLE)
@@ -320,7 +297,7 @@ class TestWatchLoop(unittest.TestCase):
             clip=True,
             watch=True,
             clear=False,
-            vcs_rev=(neorev.Vcs.GIT, None),
+            source=neorev.JjSource(None),
         )
 
     def run_session(
@@ -342,7 +319,7 @@ class TestWatchLoop(unittest.TestCase):
                 patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
                 patch.object(sys, "stderr", io.StringIO()),
             ):
-                neorev.run_watch_session(args, (neorev.Vcs.GIT, None))
+                neorev.run_watch_session(args, neorev.JjSource(None))
             return clipboard, Path(output).read_text()
 
     def test_all_clear_persisted_and_clipboard_once_on_quit(self) -> None:
@@ -351,7 +328,7 @@ class TestWatchLoop(unittest.TestCase):
             (approve_all, neorev.LoopResult.RELOAD),
             (noop, neorev.LoopResult.QUIT),
         ]
-        fetch_results = [(SIMPLE_DIFF, "git diff")] * 3
+        fetch_results = [(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE)] * 3
         clipboard, content = self.run_session(scripts, fetch_results)
         self.assertEqual(clipboard.call_count, 1)
         self.assertIn(ALL_CLEAR_TOKEN, content)
@@ -365,7 +342,10 @@ class TestWatchLoop(unittest.TestCase):
             (noop, neorev.LoopResult.RELOAD),
             (approve_all, neorev.LoopResult.QUIT),
         ]
-        fetch_results = [("", "git diff"), (SIMPLE_DIFF, "git diff")]
+        fetch_results = [
+            ("", JJ_WORKING_COPY_SOURCE),
+            (SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
+        ]
         term_holder: list[WatchScriptTerminal] = []
 
         clipboard = MagicMock()
@@ -386,7 +366,7 @@ class TestWatchLoop(unittest.TestCase):
                 patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
                 patch.object(sys, "stderr", io.StringIO()),
             ):
-                neorev.run_watch_session(args, (neorev.Vcs.GIT, None))
+                neorev.run_watch_session(args, neorev.JjSource(None))
             content = Path(output).read_text()
 
         self.assertEqual(term_holder[0].wait_calls, 1)

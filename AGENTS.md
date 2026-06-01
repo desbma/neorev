@@ -2,16 +2,7 @@
 
 ## Overview
 
-neorev is a single-file Python 3 CLI tool (`./neorev`) for interactive human review of unified diffs (git/jj). It reads a diff from stdin, renders hunks via `delta`, and lets the user annotate them. No build step, no external Python dependencies — only stdlib and the `delta` binary. Tested on Python 3.13+; may work on earlier Python 3 versions.
-
-## Running
-
-```sh
-# Usage (no install needed):
-jj show XXX | ./neorev
-./neorev -j XXX -o output.md
-./neorev -g HEAD~1 --clip
-```
+neorev is a single-file Python 3 CLI tool (`./neorev`) for interactive human review of [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) unified diffs. It reads a diff from stdin, renders hunks via `delta`, and lets the user annotate them. No build step, no external Python dependencies — only stdlib and the `delta` binary. Tested on Python 3.13+; may work on earlier Python 3 versions.
 
 ## Code Style
 

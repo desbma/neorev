@@ -4,7 +4,7 @@
 
 TUI tool optimized for efficient review of code produced by coding agents.
 
-Review diffs from `git` or `jj` with `neorev`, annotate hunks, then send the output text directly to the agent:
+Review [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) diffs with `neorev`, annotate hunks, then send the output text directly to the agent:
 
 ```bash
 neorev -o review.md
@@ -57,15 +57,13 @@ chmod +x ./neorev
 1. Run `neorev` on a diff:
 
 ```bash
-# Auto-detect VCS and review the current changes ('git diff' or 'jj show @'):
+# Review the current changes in the jj working copy ('jj show @'):
 neorev
 
 # Or pipe a diff explicitly:
-git diff HEAD~1 | neorev -o review.md
 jj show XXX | neorev -o review.md
 
 # Or pass a revision directly:
-neorev -g HEAD~2 -o review.md
 neorev -j XXX -o review.md
 ```
 
@@ -96,7 +94,7 @@ Pass `-x`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to 
 
 Pass `-c`/`--clear` to discard a previous review and start fresh.
 
-Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-g`/`-j` or auto-detected source — it cannot watch a piped diff). The current review is saved before each reload, just like quitting and reopening; with `-x`, the clipboard is only updated when you quit, never on an automatic reload.
+Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-j` or auto-detected jj source — it cannot watch a piped diff). The current review is saved before each reload, just like quitting and reopening; with `-x`, the clipboard is only updated when you quit, never on an automatic reload.
 
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 

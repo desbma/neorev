@@ -129,8 +129,8 @@ class TestFormatOutput(unittest.TestCase):
     def test_diff_source_in_all_clear(self) -> None:
         """The diff source appears in the all-clear output."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
-        output = neorev.format_output(hunks, [], diff_source="git show HEAD~1")
-        self.assertIn("# Reviewed diff: `git show HEAD~1`\n", output)
+        output = neorev.format_output(hunks, [], diff_source="jj show xyz")
+        self.assertIn("# Reviewed diff: `jj show xyz`\n", output)
 
     def test_no_diff_source_by_default(self) -> None:
         """No diff source line when the parameter is empty."""
