@@ -96,6 +96,8 @@ Pass `-x`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to 
 
 Pass `-c`/`--clear` to discard a previous review and start fresh.
 
+Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-g`/`-j` or auto-detected source — it cannot watch a piped diff). The current review is saved before each reload, just like quitting and reopening; with `-x`, the clipboard is only updated when you quit, never on an automatic reload.
+
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 
 This basically applies the [squash workflow](https://steveklabnik.github.io/jujutsu-tutorial/real-world-workflows/the-squash-workflow.html) to the agentic development process.

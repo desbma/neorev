@@ -233,9 +233,9 @@ class TestMainWorkflow(unittest.TestCase):
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
                 )
-            fetch_mock.assert_called_once_with(["jj", "show"])
+            fetch_mock.assert_called_once_with(["jj", "show", "--ignore-working-copy"])
             output = Path(output_path).read_text()
-            self.assertIn("`jj show`", output)
+            self.assertIn("`jj show --ignore-working-copy`", output)
         finally:
             os.unlink(output_path)
 

@@ -11,6 +11,7 @@ import hashlib
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -90,6 +91,12 @@ JJ_DEFAULT_WORKSPACE = "default"
 PROJECT_NAME_COMPONENTS = 2
 PROJECT_NAME_SEPARATOR = "-"
 JJ_WORKSPACE_LIST_FIELDS = 2  # "name: path" → 2 colon-separated fields
+
+WATCH_DEBOUNCE_TIMEOUT = 0.5
+GIT_WATCH_STATE_PATHS = ("HEAD", "index", "logs/HEAD", "packed-refs", "refs/heads")
+JJ_WATCH_STATE_PATH = "repo/op_heads/heads"
+EMPTY_DIFF_WAIT_MESSAGE = "Empty diff, waiting for changes…"
+WATCH_WAIT_FOOTER_SEGMENTS = [("q", "quit")]
 
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
@@ -251,6 +258,13 @@ class NoteScope(enum.Enum):
     GLOBAL = enum.auto()
     HUNK = enum.auto()
     LINE = enum.auto()
+
+
+class LoopResult(enum.Enum):
+    """Reason the interactive review loop returned to its caller."""
+
+    QUIT = enum.auto()
+    RELOAD = enum.auto()
 
 
 @dataclass
@@ -1692,13 +1706,18 @@ def drain_fd(fd: int) -> None:
             break
 
 
-def debounce_resize(wakeup_read_fd: int) -> None:
-    """Wait briefly to coalesce rapid resize signals into one redraw."""
+def debounce_events(read_fd: int, timeout: float) -> None:
+    """Drain *read_fd* until it stays quiet for *timeout* seconds."""
     while True:
-        ready, _, _ = select.select([wakeup_read_fd], [], [], RESIZE_DEBOUNCE_TIMEOUT)
+        ready, _, _ = select.select([read_fd], [], [], timeout)
         if not ready:
             break
-        drain_fd(wakeup_read_fd)
+        drain_fd(read_fd)
+
+
+def debounce_resize(wakeup_read_fd: int) -> None:
+    """Wait briefly to coalesce rapid resize signals into one redraw."""
+    debounce_events(wakeup_read_fd, RESIZE_DEBOUNCE_TIMEOUT)
 
 
 class Terminal:
@@ -1721,6 +1740,7 @@ class Terminal:
     KEY_CTRL_D = "\x04"
     KEY_CTRL_U = "\x15"
     KEY_RESIZE = "resize"
+    KEY_RELOAD = "reload"
 
     def __init__(self) -> None:
         """Open ``/dev/tty`` read-write and capture geometry and attributes."""
@@ -1771,26 +1791,39 @@ class Terminal:
             data = data.encode()
         os.write(self.fd, data)
 
-    def read_key(self, wakeup_read_fd: int | None = None) -> str:
-        """Read one keypress, with optional wakeup pipe for resize signals."""
-        if wakeup_read_fd is not None:
-            readable, _, _ = select.select([self.fd, wakeup_read_fd], [], [])
-            if wakeup_read_fd in readable:
+    def read_key(
+        self,
+        wakeup_read_fd: int | None = None,
+        watch_read_fd: int | None = None,
+    ) -> str:
+        """Read one keypress, with optional wakeup and repo-watch pipes."""
+        extra_fds = [fd for fd in (wakeup_read_fd, watch_read_fd) if fd is not None]
+        if extra_fds:
+            readable, _, _ = select.select([self.fd, *extra_fds], [], [])
+            if watch_read_fd is not None and watch_read_fd in readable:
+                drain_fd(watch_read_fd)
+                debounce_events(watch_read_fd, WATCH_DEBOUNCE_TIMEOUT)
+                return self.KEY_RELOAD
+            if wakeup_read_fd is not None and wakeup_read_fd in readable:
                 drain_fd(wakeup_read_fd)
                 debounce_resize(wakeup_read_fd)
                 return self.KEY_RESIZE
         ch = os.read(self.fd, 1)
         if ch == self.ESC_BYTE:
-            ready, _, _ = select.select([self.fd], [], [], ESC_SEQUENCE_TIMEOUT)
-            if not ready:
-                return "esc"
-            seq = os.read(self.fd, 2)
-            if seq == self.ARROW_UP_SEQ:
-                return "up"
-            if seq == self.ARROW_DOWN_SEQ:
-                return "down"
-            return "esc"
+            return self.read_escape_sequence()
         return ch.decode("utf-8", errors="replace")
+
+    def read_escape_sequence(self) -> str:
+        """Resolve an escape byte into an arrow key, or 'esc' on timeout."""
+        ready, _, _ = select.select([self.fd], [], [], ESC_SEQUENCE_TIMEOUT)
+        if not ready:
+            return "esc"
+        seq = os.read(self.fd, 2)
+        if seq == self.ARROW_UP_SEQ:
+            return "up"
+        if seq == self.ARROW_DOWN_SEQ:
+            return "down"
+        return "esc"
 
     def edit_comment(
         self,
@@ -2349,8 +2382,9 @@ class Terminal:
         self,
         state: ReviewState,
         delta_cache: dict[int, DeltaStream],
-    ) -> None:
-        """Run the interactive key-handling loop until the user quits."""
+        watch_read_fd: int | None = None,
+    ) -> LoopResult:
+        """Run the interactive key-handling loop until quit or repo change."""
         with nonblocking_pipe() as (wakeup_r, wakeup_w):
 
             def get_stream(index: int) -> DeltaStream:
@@ -2388,15 +2422,20 @@ class Terminal:
                 redraw()
 
                 while True:
-                    key = self.read_key(wakeup_read_fd=wakeup_r)
+                    key = self.read_key(
+                        wakeup_read_fd=wakeup_r, watch_read_fd=watch_read_fd
+                    )
 
                     if key == self.KEY_RESIZE:
                         self.apply_resize(delta_cache)
                         redraw()
                         continue
 
+                    if key == self.KEY_RELOAD:
+                        return LoopResult.RELOAD
+
                     if key in ("q", self.KEY_CTRL_C):
-                        break
+                        return LoopResult.QUIT
 
                     handled = self.dispatch_key(key, state, redraw)
                     if handled:
@@ -2407,6 +2446,88 @@ class Terminal:
                 self.wakeup_read_fd = None
                 signal.signal(signal.SIGWINCH, prev_handler)
                 signal.set_wakeup_fd(prev_wakeup_fd)
+
+    def render_wait_screen(self) -> None:
+        """Render the placeholder shown while the watched diff is empty."""
+        self.write(self.CLEAR_SCREEN)
+        row = max(1, self.height // 2)
+        col = max(1, (self.width - visible_len(EMPTY_DIFF_WAIT_MESSAGE)) // 2 + 1)
+        self.write(f"{CSI}{row};{col}H{DIM}{EMPTY_DIFF_WAIT_MESSAGE}{RESET}")
+        self.write(f"{CSI}{self.height};1H")
+        footer = build_keyhint_footer(WATCH_WAIT_FOOTER_SEGMENTS, self.width)
+        self.write(chrome_line(footer, self.width))
+
+    def run_wait_screen(self, watch_read_fd: int) -> LoopResult:
+        """Wait on the empty-diff placeholder until a repo change or quit."""
+        with nonblocking_pipe() as (wakeup_r, wakeup_w):
+            prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
+            prev_handler = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, lambda *_: None)
+            self.wakeup_read_fd = wakeup_r
+            try:
+                tty.setraw(self.fd)
+                self.render_wait_screen()
+                while True:
+                    key = self.read_key(
+                        wakeup_read_fd=wakeup_r, watch_read_fd=watch_read_fd
+                    )
+                    if key == self.KEY_RELOAD:
+                        return LoopResult.RELOAD
+                    if key == self.KEY_RESIZE:
+                        self.refresh_geometry()
+                        self.render_wait_screen()
+                    elif key in ("q", self.KEY_CTRL_C):
+                        return LoopResult.QUIT
+            finally:
+                self.wakeup_read_fd = None
+                signal.signal(signal.SIGWINCH, prev_handler)
+                signal.set_wakeup_fd(prev_wakeup_fd)
+
+
+class RepoWatcher:
+    """Monitors repository paths via ``inotifywait`` and signals on a pipe."""
+
+    def __init__(self, paths: list[str]) -> None:
+        """Spawn ``inotifywait`` on *paths* and a thread forwarding events."""
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+        self.process: subprocess.Popen[bytes] | None = None
+        if paths:
+            self.process = subprocess.Popen(
+                [
+                    "inotifywait",
+                    "-m",
+                    "-q",
+                    "-e",
+                    "close_write,create,delete,move",
+                    "--",
+                    *paths,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        self.reader: threading.Thread = threading.Thread(target=self.pump, daemon=True)
+        self.reader.start()
+
+    def pump(self) -> None:
+        """Forward every ``inotifywait`` event line as one wakeup byte."""
+        if self.process is None or self.process.stdout is None:
+            return
+        for _ in self.process.stdout:
+            with suppress(OSError):
+                os.write(self.write_fd, b"\x01")
+
+    def close(self) -> None:
+        """Terminate ``inotifywait`` and release the pipe and thread."""
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                self.process.wait()
+            if self.process.stdout is not None:
+                self.process.stdout.close()
+        self.reader.join()
+        os.close(self.read_fd)
+        os.close(self.write_fd)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2422,7 +2543,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-c",
         "--clear",
         action="store_true",
-        help="discard previous review and start fresh",
+        help="Discard previous review and start fresh",
     )
     rev_group = parser.add_mutually_exclusive_group()
     rev_group.add_argument(
@@ -2433,7 +2554,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="vcs_rev",
         nargs="?",
         metavar="REV",
-        help="run 'git show REV' (or 'git diff' if REV is omitted) "
+        help="Run 'git show REV' (or 'git diff' if REV is omitted) "
         "and use its output as the diff",
     )
     rev_group.add_argument(
@@ -2444,21 +2565,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="vcs_rev",
         nargs="?",
         metavar="REV",
-        help="run 'jj show [REV]' and use its output as the diff",
+        help="Run 'jj show [REV]' and use its output as the diff",
     )
     parser.set_defaults(vcs_rev=None)
     parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="output file for the review (created or updated); "
+        help="Output file for the review (created or updated); "
         "defaults to $XDG_STATE_HOME/neorev/<project>/<review-workspace-rev>.md",
     )
     parser.add_argument(
         "-x",
         "--clip",
         action="store_true",
-        help="copy @output_file to clipboard (via xclip) on exit",
+        help="Copy @output_file to clipboard (via xclip) on exit",
+    )
+    parser.add_argument(
+        "-w",
+        "--watch",
+        action="store_true",
+        help="Reload the review when the repository changes "
+        "(requires inotifywait and a -g/-j or auto-detected VCS source)",
     )
     return parser
 
@@ -2497,7 +2625,7 @@ def try_vcs(command: list[str]) -> bool:
 
 def detect_vcs() -> Vcs | None:
     """Detect the VCS backend for the current directory."""
-    if try_vcs(["jj", "root"]):
+    if try_vcs(["jj", "root", "--ignore-working-copy"]):
         return Vcs.JUJUTSU
     if try_vcs(["git", "rev-parse", "--show-toplevel"]):
         return Vcs.GIT
@@ -2659,12 +2787,18 @@ def parse_diff_or_exit(diff_text: str) -> list[Hunk]:
     return hunks
 
 
-def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNote]:
+def load_or_resume_review(
+    hunks: list[Hunk],
+    output_path: str,
+    *,
+    quiet: bool = False,
+) -> list[GlobalNote]:
     """
     Load a previous review from *output_path* if it exists.
 
     Applies matching annotations and approved-hunk hashes to *hunks*
-    in place and returns the list of global notes.
+    in place and returns the list of global notes. When *quiet* is set,
+    suppresses the progress messages written to stderr.
     """
     previous_annotations, previous_global_notes, hashes_encoded = load_previous_review(
         output_path,
@@ -2685,6 +2819,9 @@ def load_or_resume_review(hunks: list[Hunk], output_path: str) -> list[GlobalNot
             if hunk_identity_hash(hunk) in approved_set and not hunk.notes:
                 hunk.approved = True
                 approved_from_hashes += 1
+
+    if quiet:
+        return previous_global_notes
 
     display_path = compact_path(output_path)
     sys.stderr.write(
@@ -2729,13 +2866,16 @@ def write_review_output(
     hunks: list[Hunk],
     global_notes: list[GlobalNote],
     diff_source: str | None = None,
+    *,
+    quiet: bool = False,
 ) -> None:
     """Write the final review output to *output_path*."""
     review_output = format_output(hunks, global_notes, diff_source)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(review_output)
-    sys.stderr.write(f"Review written to {compact_path(output_path)}\n")
+    if not quiet:
+        sys.stderr.write(f"Review written to {compact_path(output_path)}\n")
 
 
 def copy_output_reference_to_clipboard(output_path: str) -> None:
@@ -2764,9 +2904,10 @@ def git_diff_command(rev: str | None) -> list[str]:
 
 def jj_diff_command(rev: str | None) -> list[str]:
     """Return the command to show the jj diff for *rev*, or the working copy."""
-    if rev is None:
-        return ["jj", "show"]
-    return ["jj", "show", rev]
+    cmd = ["jj", "show", "--ignore-working-copy"]
+    if rev is not None:
+        cmd.append(rev)
+    return cmd
 
 
 def run_vcs_diff(selection: VcsSelection) -> tuple[str, str]:
@@ -2789,25 +2930,137 @@ def autodetect_vcs_or_exit(parser: argparse.ArgumentParser) -> Vcs:
     return vcs
 
 
-def main() -> None:
-    """Run the neorev command-line entry point."""
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    resolve_args(args)
+def vcs_root(vcs: Vcs) -> str | None:
+    """Return the repository root for *vcs*, or None when unavailable."""
+    try:
+        if vcs is Vcs.GIT:
+            return run_vcs(["git", "rev-parse", "--show-toplevel"])
+        return run_vcs(["jj", "root", "--ignore-working-copy"])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
 
-    selection: VcsSelection | None = args.vcs_rev
-    diff_source: str | None
-    if selection is not None:
-        diff_text, diff_source = run_vcs_diff(selection)
+
+def git_tracked_dirs(root: str) -> set[Path]:
+    """Return the directories containing git-tracked files under *root*."""
+    listing = run_vcs(["git", "-C", root, "ls-files", "-z"])
+    root_path = Path(root)
+    return {(root_path / name).parent for name in listing.split("\0") if name}
+
+
+def watch_paths(vcs: Vcs, root: str) -> list[str]:
+    """Return existing filesystem paths to watch for *vcs* under *root*."""
+    root_path = Path(root)
+    candidates: list[Path] = []
+    if vcs is Vcs.GIT:
+        candidates.append(root_path)
+        candidates.extend(sorted(git_tracked_dirs(root)))
+        candidates.extend(root_path / ".git" / rel for rel in GIT_WATCH_STATE_PATHS)
     else:
+        candidates.append(root_path / ".jj" / JJ_WATCH_STATE_PATH)
+    unique: dict[str, None] = {}
+    for path in candidates:
+        if path.exists():
+            unique.setdefault(str(path), None)
+    return list(unique)
+
+
+def restart_watcher(old: RepoWatcher | None, vcs: Vcs) -> RepoWatcher:
+    """Close *old* (if any) and start a fresh watcher with current paths."""
+    if old is not None:
+        old.close()
+    root = vcs_root(vcs)
+    paths = watch_paths(vcs, root) if root is not None else []
+    return RepoWatcher(paths)
+
+
+def fetch_watch_diff(selection: VcsSelection) -> tuple[str, str]:
+    """Fetch the diff for *selection*, returning ``("", source)`` on failure."""
+    vcs, rev = selection
+    cmd = jj_diff_command(rev) if vcs is Vcs.JUJUTSU else git_diff_command(rev)
+    source = " ".join(cmd)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return "", source
+    return result.stdout, source
+
+
+def build_watch_state(diff_text: str, output_path: str) -> ReviewState | None:
+    """Build review state for *diff_text*, or None when it has no hunks."""
+    if not diff_text.strip():
+        return None
+    hunks = parse_diff(diff_text)
+    if not hunks:
+        return None
+    global_notes = load_or_resume_review(hunks, output_path, quiet=True)
+    return ReviewState(
+        hunks=hunks,
+        global_notes=global_notes,
+        current_index=ReviewState.initial_index(hunks),
+    )
+
+
+def watch_loop(
+    term: Terminal,
+    args: argparse.Namespace,
+    selection: VcsSelection,
+) -> bool:
+    """Drive watch-mode review; return whether a review file was written."""
+    if args.clear:
+        Path(args.output).unlink(missing_ok=True)
+    vcs = selection[0]
+    watcher = restart_watcher(None, vcs)
+    diff_text, diff_source = fetch_watch_diff(selection)
+    state = build_watch_state(diff_text, args.output)
+    review_written = False
+    try:
+        while True:
+            if state is None:
+                result = term.run_wait_screen(watcher.read_fd)
+            else:
+                delta_cache: dict[int, DeltaStream] = {}
+                result = term.run_review_loop(state, delta_cache, watcher.read_fd)
+                if review_has_content(state.hunks, state.global_notes):
+                    write_review_output(
+                        args.output,
+                        state.hunks,
+                        state.global_notes,
+                        diff_source,
+                        quiet=True,
+                    )
+                    review_written = True
+            if result is LoopResult.QUIT:
+                return review_written
+            new_diff, diff_source = fetch_watch_diff(selection)
+            if new_diff == diff_text and state is not None:
+                continue
+            diff_text = new_diff
+            watcher = restart_watcher(watcher, vcs)
+            state = build_watch_state(diff_text, args.output)
+    finally:
+        watcher.close()
+
+
+def run_watch_session(args: argparse.Namespace, selection: VcsSelection) -> None:
+    """Run watch mode inside the alt screen, handling exit side effects."""
+    with Terminal() as term:
+        term.write(f"{term.ALT_SCREEN_ON}{term.CURSOR_HIDE}")
         try:
-            diff_text = read_diff_from_stdin()
-            diff_source = None
-        except NoDiffOnStdinError:
-            selection = (autodetect_vcs_or_exit(parser), None)
-            diff_text, diff_source = run_vcs_diff(selection)
-            if args.output is None:
-                args.output = default_output_path(*selection)
+            review_written = watch_loop(term, args, selection)
+        finally:
+            term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
+    if review_written:
+        sys.stderr.write(f"Review written to {compact_path(args.output)}\n")
+        if args.clip:
+            copy_output_reference_to_clipboard(args.output)
+
+
+def run_single_session(
+    args: argparse.Namespace,
+    diff_text: str,
+    diff_source: str | None,
+) -> None:
+    """Run a one-shot review session and write its output on exit."""
     hunks = parse_diff_or_exit(diff_text)
 
     if args.clear:
@@ -2816,7 +3069,6 @@ def main() -> None:
     global_notes = load_or_resume_review(hunks, args.output)
 
     delta_cache: dict[int, DeltaStream] = {}
-
     state = ReviewState(
         hunks=hunks,
         global_notes=global_notes,
@@ -2838,6 +3090,57 @@ def main() -> None:
         write_review_output(args.output, hunks, global_notes, diff_source)
         if args.clip:
             copy_output_reference_to_clipboard(args.output)
+
+
+def resolve_diff_origin(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> VcsSelection | str:
+    """
+    Resolve where the diff comes from, from flags or stdin.
+
+    Returns a re-runnable VCS selection, or the piped stdin diff text.
+    """
+    selection: VcsSelection | None = args.vcs_rev
+    if selection is not None:
+        return selection
+    try:
+        return read_diff_from_stdin()
+    except NoDiffOnStdinError:
+        selection = (autodetect_vcs_or_exit(parser), None)
+        if args.output is None:
+            args.output = default_output_path(*selection)
+        return selection
+
+
+def main() -> None:
+    """Run the neorev command-line entry point."""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    resolve_args(args)
+
+    if args.watch and shutil.which("inotifywait") is None:
+        sys.stderr.write("Error: 'inotifywait' not found — required for --watch.\n")
+        exit(os.EX_UNAVAILABLE)
+
+    origin = resolve_diff_origin(args, parser)
+
+    if args.watch:
+        if isinstance(origin, str):
+            parser.print_usage(sys.stderr)
+            sys.stderr.write(
+                "\nError: --watch needs a re-runnable VCS source (-g/-j or "
+                "auto-detected); it cannot watch a piped diff.\n"
+            )
+            exit(os.EX_USAGE)
+        run_watch_session(args, origin)
+        return
+
+    if isinstance(origin, str):
+        diff_text, diff_source = origin, None
+    else:
+        diff_text, diff_source = run_vcs_diff(origin)
+    run_single_session(args, diff_text, diff_source)
 
 
 if __name__ == "__main__":

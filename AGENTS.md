@@ -27,7 +27,7 @@ jj show XXX | ./neorev
 - No verbose comments that paraphrase the code.
 - Split large functions into small, single-responsibility ones when needed.
 - Use `None` as the sentinel for "absent" / "not provided" values. Do not overload empty strings (`""`) or zero integers (`0`) to mean "no value" — those are legitimate values, not absence markers. This applies to function parameters, dataclass fields, return types, and CLI argument storage.
-- **IMPORTANT: Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level). No exceptions.**
+- Never inline raw escape codes, magic strings, thresholds, or unexplained literal values. All such values must be defined as named constants (module-level or class-level).
   - **Exception:** well-known external identifiers (e.g. environment variable names like `"XDG_STATE_HOME"`) that are static, external to this project, and whose variable name already encodes the value may be inlined.
 - Group all module-level constants together at the top of the file, before class and function definitions.
 - Do not add large section-separator comment blocks (e.g. `# ===...` banners). Use class docstrings and natural whitespace to organize code.
