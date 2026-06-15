@@ -97,6 +97,11 @@ WATCH_WAIT_FOOTER_SEGMENTS = [("q", "quit")]
 
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
+DIFF_ADDED_ICON = ""
+DIFF_REMOVED_ICON = ""
+DIFF_RENAMED_ICON = ""
+DIFF_MODIFIED_ICON = ""
+RENAME_ARROW = "→"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = b"  "
 ANSI_ESCAPE_BYTES_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
@@ -196,6 +201,26 @@ class NoteKind(enum.Enum):
         return "global question (agent answers, no code change)"
 
 
+class FileStatus(enum.Enum):
+    """Enumerate how a diff alters a file."""
+
+    MODIFIED = enum.auto()
+    ADDED = enum.auto()
+    DELETED = enum.auto()
+    RENAMED = enum.auto()
+
+    @property
+    def marker(self) -> str:
+        """Return the ANSI-styled Nerd Font icon for this file status."""
+        if self is FileStatus.ADDED:
+            return f"{GREEN}{DIFF_ADDED_ICON}{RESET}"
+        if self is FileStatus.RENAMED:
+            return f"{CYAN}{DIFF_RENAMED_ICON}{RESET}"
+        if self is FileStatus.DELETED:
+            return f"{YELLOW}{DIFF_REMOVED_ICON}{RESET}"
+        return DIFF_MODIFIED_ICON
+
+
 class LineSide(enum.Enum):
     """Enumerate whether a note targets an added or removed line."""
 
@@ -236,6 +261,8 @@ class Hunk:
     body: str
     raw: str
     file_path: str | None = None
+    file_status: FileStatus = FileStatus.MODIFIED
+    old_path: str | None = None
     start_line: int | None = None
     approved: bool = False
     notes: list[HunkNote] = field(default_factory=list)
@@ -246,9 +273,16 @@ class Hunk:
         """Return a compact 'file:line' location string."""
         if self.file_path is None:
             return self.range_line.strip()
-        if self.start_line is None:
+        if self.start_line is None or self.file_status is FileStatus.DELETED:
             return self.file_path
         return f"{self.file_path}:{self.start_line}"
+
+    @property
+    def location_label(self) -> str:
+        """Return the top-bar location, spelling out an 'old → new' rename."""
+        if self.file_status is FileStatus.RENAMED and self.old_path is not None:
+            return f"{self.old_path} {RENAME_ARROW} {self.short_location}"
+        return self.short_location
 
     @property
     def summary_status(self) -> Status | None:
@@ -617,27 +651,36 @@ def format_editor_line_number(dl: DisplayLine) -> str:
     return f"{line_num:>{EDITOR_LINE_NUMBER_WIDTH}}"
 
 
+@dataclass
+class FileHeader:
+    """A parsed diff file-header block and the file change it introduces."""
+
+    text: str
+    path: str | None
+    old_path: str | None
+    status: FileStatus
+
+
 def parse_diff(diff_text: str) -> list[Hunk]:
     """Parse a unified diff into a list of reviewable hunks."""
     hunks: list[Hunk] = []
     lines = diff_text.splitlines(keepends=True)
-    current_file_header: str | None = None
-    current_file_path: str | None = None
+    header: FileHeader | None = None
     i = 0
 
     while i < len(lines):
         line = lines[i]
 
         if line.startswith(("diff --git", "diff ")):
-            current_file_header, current_file_path, i = parse_file_header(
-                lines,
-                i,
-                current_file_path,
-            )
+            header, i = parse_file_header(lines, i, header.path if header else None)
+            if header.status is FileStatus.RENAMED and (
+                i >= len(lines) or not lines[i].startswith("@@")
+            ):
+                hunks.append(make_rename_hunk(header))
             continue
 
         if line.startswith("@@"):
-            hunk, i = parse_hunk_body(lines, i, current_file_header, current_file_path)
+            hunk, i = parse_hunk_body(lines, i, header)
             hunks.append(hunk)
             continue
 
@@ -649,36 +692,78 @@ def parse_diff(diff_text: str) -> list[Hunk]:
 def parse_file_header(
     lines: list[str],
     start: int,
-    current_file_path: str | None,
-) -> tuple[str, str | None, int]:
+    fallback_path: str | None,
+) -> tuple[FileHeader, int]:
     """
     Parse a diff file header block starting at *start*.
 
-    Returns (file_header, file_path, next_line_index).
+    Returns (FileHeader, next_line_index).
     """
     header_lines = [lines[start]]
     i = start + 1
-    file_path = current_file_path
+    source_path: str | None = None
+    dest_path: str | None = None
+    renamed = False
     while (
         i < len(lines)
         and not lines[i].startswith("@@")
         and not lines[i].startswith("diff ")
     ):
-        header_lines.append(lines[i])
-        if lines[i].startswith("+++ "):
-            path = lines[i][4:].strip()
-            path = path.removeprefix("b/")
-            file_path = path
+        line = lines[i]
+        header_lines.append(line)
+        if line.startswith("--- "):
+            source_path = line[4:].strip().removeprefix("a/")
+        elif line.startswith("+++ "):
+            dest_path = line[4:].strip().removeprefix("b/")
+        elif line.startswith("rename from "):
+            renamed = True
+            source_path = line[len("rename from ") :].strip()
+        elif line.startswith("rename to "):
+            renamed = True
+            dest_path = line[len("rename to ") :].strip()
         i += 1
-    file_header = "".join(header_lines).rstrip("\n")
-    return file_header, file_path, i
+    text = "".join(header_lines).rstrip("\n")
+    path, old_path, status = resolve_file_change(
+        source_path, dest_path, fallback_path, renamed=renamed
+    )
+    return FileHeader(text=text, path=path, old_path=old_path, status=status), i
+
+
+def resolve_file_change(
+    source_path: str | None,
+    dest_path: str | None,
+    fallback_path: str | None,
+    *,
+    renamed: bool,
+) -> tuple[str | None, str | None, FileStatus]:
+    """Derive the display path, pre-rename path, and status from header endpoints."""
+    if dest_path == "/dev/null":
+        return source_path, None, FileStatus.DELETED
+    if source_path == "/dev/null":
+        return dest_path, None, FileStatus.ADDED
+    path = dest_path if dest_path is not None else fallback_path
+    if renamed:
+        return path, source_path, FileStatus.RENAMED
+    return path, None, FileStatus.MODIFIED
+
+
+def make_rename_hunk(header: FileHeader) -> Hunk:
+    """Build a body-less hunk for a file rename that changes no content."""
+    return Hunk(
+        file_header=header.text,
+        range_line="",
+        body="",
+        raw=header.text,
+        file_path=header.path,
+        file_status=header.status,
+        old_path=header.old_path,
+    )
 
 
 def parse_hunk_body(
     lines: list[str],
     start: int,
-    file_header: str | None,
-    file_path: str | None,
+    header: FileHeader | None,
 ) -> tuple[Hunk, int]:
     """
     Parse a single @@ hunk starting at *start*.
@@ -700,6 +785,7 @@ def parse_hunk_body(
         i += 1
 
     body = "".join(body_lines).rstrip("\n")
+    file_header = header.text if header is not None else None
     raw = (
         f"{file_header}\n{range_line}\n{body}"
         if file_header
@@ -711,7 +797,9 @@ def parse_hunk_body(
         range_line=range_line,
         body=body,
         raw=raw,
-        file_path=file_path,
+        file_path=header.path if header is not None else None,
+        file_status=header.status if header is not None else FileStatus.MODIFIED,
+        old_path=header.old_path if header is not None else None,
         start_line=start_line,
         display_lines=parse_display_lines(range_line, body),
     )
@@ -1458,7 +1546,7 @@ def build_top_bar(
     bar = (
         f"{BOLD}{WHITE}{BG_BLUE} neorev {RESET}"
         f"{progress_segment}"
-        f" {BOLD}{hunk.short_location}{RESET}"
+        f" {hunk.file_status.marker} {BOLD}{hunk.location_label}{RESET}"
         f"{counters}"
     )
     if term_width is not None:

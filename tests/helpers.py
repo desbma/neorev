@@ -109,6 +109,42 @@ deleted file mode 100644
 -    pass
 """
 
+RENAME_FILE_DIFF = """\
+diff --git a/old.txt b/new.txt
+rename from old.txt
+rename to new.txt
+--- a/old.txt
++++ b/new.txt
+@@ -2,3 +2,3 @@
+ b
+-c
++C
+ d
+"""
+
+PURE_RENAME_DIFF = """\
+diff --git a/old.txt b/new.txt
+rename from old.txt
+rename to new.txt
+"""
+
+TWO_DELETED_FILES_DIFF = """\
+diff --git a/first.py b/first.py
+deleted file mode 100644
+--- a/first.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def first():
+-    pass
+diff --git a/second.py b/second.py
+deleted file mode 100644
+--- a/second.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def second():
+-    pass
+"""
+
 NO_NEWLINE_DIFF = """\
 diff --git a/f.py b/f.py
 --- a/f.py

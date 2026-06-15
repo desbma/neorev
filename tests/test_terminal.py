@@ -15,6 +15,7 @@ from tests.helpers import (
     CENTERED_SNIPPET_LINE_COUNT,
     CENTERED_SNIPPET_TARGET_LINE,
     COMMENT_KEY_QUESTION,
+    DELETE_FILE_DIFF,
     DISPATCH_COMMENT_TEXT,
     DISPATCH_REDRAW_FALSE,
     ESC_ARROW_DOWN,
@@ -36,6 +37,7 @@ from tests.helpers import (
     OUT_OF_BOUNDS_OFFSET,
     OVERFLOW_HUNK_INDEX,
     OVERFLOWING_LINE_COUNT,
+    PURE_RENAME_DIFF,
     RESIZE_WIDTH_DELTA,
     REVIEW_SCREEN_FOOTER_TOKEN,
     REVIEW_SCREEN_INDEX_TOKEN,
@@ -300,6 +302,45 @@ class TestChrome(unittest.TestCase):
         bar = neorev.build_top_bar(hunk, 0, [hunk], global_notes)
         self.assertIn("global", bar)
         self.assertIn("3", bar)
+
+    def test_file_status_markers(self) -> None:
+        """Each file status renders its own Nerd Font diff icon."""
+        cases = [
+            (neorev.FileStatus.ADDED, neorev.DIFF_ADDED_ICON),
+            (neorev.FileStatus.DELETED, neorev.DIFF_REMOVED_ICON),
+            (neorev.FileStatus.RENAMED, neorev.DIFF_RENAMED_ICON),
+            (neorev.FileStatus.MODIFIED, neorev.DIFF_MODIFIED_ICON),
+        ]
+        for file_status, icon in cases:
+            with self.subTest(file_status=file_status):
+                self.assertIn(icon, file_status.marker)
+
+    def test_removed_marker_uses_yellow(self) -> None:
+        """The deleted-file marker uses the yellow indexed color."""
+        self.assertIn(neorev.YELLOW, neorev.FileStatus.DELETED.marker)
+
+    def test_renamed_marker_uses_cyan(self) -> None:
+        """The renamed-file marker uses the cyan indexed color."""
+        self.assertIn(neorev.CYAN, neorev.FileStatus.RENAMED.marker)
+
+    def test_modified_marker_is_neutral(self) -> None:
+        """The modified-file marker carries no color, only the bare icon."""
+        self.assertEqual(neorev.FileStatus.MODIFIED.marker, neorev.DIFF_MODIFIED_ICON)
+
+    def test_top_bar_deleted_file(self) -> None:
+        """The top bar marks a deleted file with the removed icon and no :0 line."""
+        hunk = neorev.parse_diff(DELETE_FILE_DIFF)[0]
+        bar = neorev.build_top_bar(hunk, 0, [hunk], [])
+        self.assertIn(neorev.DIFF_REMOVED_ICON, bar)
+        self.assertIn("old.py", bar)
+        self.assertNotIn(":0", bar)
+
+    def test_top_bar_renamed_file(self) -> None:
+        """The top bar shows an 'old → new' mapping and the renamed icon."""
+        hunk = neorev.parse_diff(PURE_RENAME_DIFF)[0]
+        bar = neorev.build_top_bar(hunk, 0, [hunk], [])
+        self.assertIn(neorev.DIFF_RENAMED_ICON, bar)
+        self.assertIn(f"old.txt {neorev.RENAME_ARROW} new.txt", bar)
 
     def test_hunk_marker_styles(self) -> None:
         """Each status produces a distinct marker icon."""

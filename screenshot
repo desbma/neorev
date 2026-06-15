@@ -33,11 +33,11 @@ cat << EOF > "${TMP_EDITOR}"
 echo 'Fix foo and bar' > \${1%%:*}
 EOF
 chmod +x "${TMP_EDITOR}"
-export EDITOR="${TMP_EDITOR}"
 
 cat << EOF > "${TMP_SCRIPT}"
 #!/bin/bash
-jj show zr | ./neorev ${TMP_REVIEW}
+export EDITOR=${TMP_EDITOR}
+jj show zrvpoqyn | ./neorev -o ${TMP_REVIEW}
 EOF
 chmod +x "${TMP_SCRIPT}"
 

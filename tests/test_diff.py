@@ -11,8 +11,11 @@ from tests.helpers import (
     MULTI_FILE_MULTI_HUNK_DIFF,
     NEW_FILE_DIFF,
     NO_NEWLINE_DIFF,
+    PURE_RENAME_DIFF,
     REMOVED_LINE_NUMBER,
+    RENAME_FILE_DIFF,
     SIMPLE_DIFF,
+    TWO_DELETED_FILES_DIFF,
     TWO_FILE_DIFF,
     TWO_HUNK_DIFF,
     make_hunk,
@@ -88,17 +91,54 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(neorev.parse_diff(BINARY_DIFF), [])
 
     def test_new_file_mode_diff(self) -> None:
-        """A new-file diff parses the file_path and hunk correctly."""
+        """A new-file diff parses the file_path, hunk, and ADDED status."""
         hunks = neorev.parse_diff(NEW_FILE_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].file_path, "new.py")
         self.assertIn("+def hello():", hunks[0].body)
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.ADDED)
 
     def test_delete_file_diff(self) -> None:
-        """A deleted-file diff with +++ /dev/null uses /dev/null as file_path."""
+        """A deleted-file diff resolves to its source path and DELETED status."""
         hunks = neorev.parse_diff(DELETE_FILE_DIFF)
         self.assertEqual(len(hunks), 1)
-        self.assertEqual(hunks[0].file_path, "/dev/null")
+        self.assertEqual(hunks[0].file_path, "old.py")
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.DELETED)
+
+    def test_rename_file_diff(self) -> None:
+        """A renamed-file diff exposes the new path, the old path, and RENAMED."""
+        hunks = neorev.parse_diff(RENAME_FILE_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, "new.txt")
+        self.assertEqual(hunks[0].old_path, "old.txt")
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.RENAMED)
+
+    def test_pure_rename_diff(self) -> None:
+        """A content-free move still yields one RENAMED hunk with both paths."""
+        hunks = neorev.parse_diff(PURE_RENAME_DIFF)
+        self.assertEqual(len(hunks), 1)
+        hunk = hunks[0]
+        self.assertIs(hunk.file_status, neorev.FileStatus.RENAMED)
+        self.assertEqual(hunk.file_path, "new.txt")
+        self.assertEqual(hunk.old_path, "old.txt")
+        self.assertEqual(hunk.body, "")
+
+    def test_rename_location_label(self) -> None:
+        """A rename's location label spells out the old and new paths."""
+        hunk = neorev.parse_diff(PURE_RENAME_DIFF)[0]
+        self.assertEqual(hunk.location_label, f"old.txt {neorev.RENAME_ARROW} new.txt")
+
+    def test_modified_file_status(self) -> None:
+        """An ordinary edit is reported as MODIFIED."""
+        hunks = neorev.parse_diff(SIMPLE_DIFF)
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.MODIFIED)
+
+    def test_deleted_files_have_distinct_paths(self) -> None:
+        """Two deleted files keep their own paths instead of sharing /dev/null."""
+        hunks = neorev.parse_diff(TWO_DELETED_FILES_DIFF)
+        self.assertEqual([h.file_path for h in hunks], ["first.py", "second.py"])
+        for hunk in hunks:
+            self.assertIs(hunk.file_status, neorev.FileStatus.DELETED)
 
     def test_multiple_hunks_across_multiple_files(self) -> None:
         """Parse 3 files with 2 hunks each into 6 hunks."""
@@ -125,10 +165,11 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].start_line, 10)
 
-    def test_file_path_dev_null_not_stripped(self) -> None:
-        """+++ /dev/null keeps the leading slash (not stripped as b/ prefix)."""
-        hunks = neorev.parse_diff(DELETE_FILE_DIFF)
-        self.assertTrue(hunks[0].file_path.startswith("/"))
+    def test_short_location_deleted_omits_line(self) -> None:
+        """A deleted single-hunk file's location is just the path, without :0."""
+        hunk = neorev.parse_diff(DELETE_FILE_DIFF)[0]
+        self.assertEqual(hunk.start_line, 0)
+        self.assertEqual(hunk.short_location, "old.py")
 
 
 class TestLineTargetMapping(unittest.TestCase):

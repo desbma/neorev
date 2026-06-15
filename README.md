@@ -52,6 +52,8 @@ curl https://raw.githubusercontent.com/desbma/neorev/master/neorev -o neorev
 chmod +x ./neorev
 ```
 
+The interface uses [Nerd Font](https://www.nerdfonts.com/) icons (e.g. for file status and note markers), so a patched font is required for them to render correctly.
+
 ## Usage
 
 1. Run `neorev` on a diff:
