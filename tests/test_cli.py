@@ -56,12 +56,12 @@ class TestArgParser(unittest.TestCase):
         """resolve_args fills in a default output path when not provided."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
-        with (
-            patch.object(neorev, "jj_root", return_value="/repo"),
-            patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH),
-        ):
+        with patch.object(
+            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
+        ) as mock:
             neorev.resolve_args(args)
         self.assertEqual(args.output, MOCK_OUTPUT_PATH)
+        mock.assert_called_once_with(None)
 
     def test_resolve_args_keeps_explicit_output(self) -> None:
         """resolve_args preserves an explicitly provided -o value."""
@@ -211,26 +211,16 @@ class TestDefaultOutputPath(unittest.TestCase):
             neorev.resolve_args(args)
         mock.assert_called_once_with("abc123")
 
-    def test_resolve_args_detects_jj_from_directory(self) -> None:
-        """resolve_args detects jj when no flag is given."""
+    def test_resolve_args_fills_output_outside_jj(self) -> None:
+        """resolve_args fills a default output for a piped diff outside a jj repo."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         with (
-            patch.object(neorev, "jj_root", return_value="/repo"),
-            patch.object(
-                neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
-            ) as mock,
+            patch.object(neorev, "jj_root", return_value=None),
+            patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH),
         ):
             neorev.resolve_args(args)
-        mock.assert_called_once_with(None)
-
-    def test_resolve_args_skips_output_outside_jj(self) -> None:
-        """resolve_args leaves output unset when not in a jj repo and no flag given."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args([])
-        with patch.object(neorev, "jj_root", return_value=None):
-            neorev.resolve_args(args)
-        self.assertIsNone(args.output)
+        self.assertEqual(args.output, MOCK_OUTPUT_PATH)
 
     def test_jj_uses_shortest_unambiguous_rev(self) -> None:
         """jj_metadata uses shortest() without a fixed length."""

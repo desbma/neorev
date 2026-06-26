@@ -2725,13 +2725,7 @@ def resolve_args(args: argparse.Namespace) -> None:
     """Fill in *args.output* with the default path when not provided."""
     if args.output is not None:
         return
-    source: JjSource | None = args.source
-    if source is not None:
-        rev = source.rev
-    elif jj_root() is not None:
-        rev = None
-    else:
-        return
+    rev = args.source.rev if args.source is not None else None
     args.output = default_output_path(rev)
 
 
@@ -3068,10 +3062,7 @@ def resolve_diff_origin(
         return read_diff_from_stdin()
     except NoDiffOnStdinError:
         ensure_jj_or_exit(parser)
-        source = JjSource(None)
-        if args.output is None:
-            args.output = default_output_path(source.rev)
-        return source
+        return JjSource(None)
 
 
 def main() -> None:
