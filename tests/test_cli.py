@@ -108,11 +108,10 @@ class TestDefaultOutputPath(unittest.TestCase):
     def make_meta(
         self,
         dirname: str = "proj",
-        workspace: str | None = None,
         rev: str | None = None,
     ) -> neorev.JjMetadata:
         """Build a JjMetadata with test defaults."""
-        return neorev.JjMetadata(dirname=dirname, workspace=workspace, rev=rev)
+        return neorev.JjMetadata(dirname=dirname, rev=rev)
 
     def test_uses_xdg_state_home_env(self) -> None:
         """Respect $XDG_STATE_HOME when set."""
@@ -150,23 +149,8 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(Path(result).name, "review.md")
         self.assertEqual(Path(result).parent.name, "myproj")
 
-    def test_filename_parts_with_workspace_and_rev(self) -> None:
-        """Filename includes workspace and rev when available."""
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
-            patch.object(
-                neorev,
-                "jj_metadata",
-                return_value=self.make_meta(workspace="feat", rev="abc1234"),
-            ),
-        ):
-            result = neorev.default_output_path()
-        self.assertEqual(Path(result).name, "review-feat-abc1234.md")
-        self.assertEqual(Path(result).parent.name, "proj")
-
-    def test_filename_parts_with_rev_only(self) -> None:
-        """Filename includes rev but skips empty workspace."""
+    def test_filename_parts_with_rev(self) -> None:
+        """Filename includes the rev, and never the workspace name."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -231,7 +215,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             calls.append(cmd)
             if "log" in cmd:
                 return "l"
-            return "default: /some/path"
+            return "/some/path"
 
         with patch.object(neorev, "run_jj", side_effect=fake_run_jj):
             meta = neorev.jj_metadata()
@@ -250,7 +234,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             calls.append(cmd)
             if "log" in cmd:
                 return "x"
-            return "default: /some/path"
+            return "/some/path"
 
         with patch.object(neorev, "run_jj", side_effect=fake_run_jj):
             meta = neorev.jj_metadata(rev="myrev")
@@ -259,21 +243,29 @@ class TestDefaultOutputPath(unittest.TestCase):
         r_idx = log_cmd.index("-r")
         self.assertEqual(log_cmd[r_idx + 1], "myrev")
 
-    def test_jj_picks_workspace_matching_cwd(self) -> None:
-        """jj_metadata selects the workspace whose path matches cwd."""
+    def test_jj_metadata_shares_dirname_across_workspaces(self) -> None:
+        """Every workspace of a repo resolves to the same project directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "Projets"
+            default_ws = base / "proj"
+            feature_ws = base / "proj-feature"
+            for workspace in (default_ws, feature_ws):
+                workspace.mkdir(parents=True)
 
-        def fake_run_jj(cmd: list[str]) -> str:
-            """Capture calls and return stub output."""
-            if "log" in cmd:
-                return "abc"
-            return "default: /home/user/proj\nfeature: /home/user/proj-feature"
+            def fake_run_jj(cmd: list[str]) -> str:
+                """Return a stub change id and the repo's workspace roots."""
+                if "log" in cmd:
+                    return "abc"
+                return f"{default_ws}\n{feature_ws}"
 
-        with (
-            patch.object(neorev, "run_jj", side_effect=fake_run_jj),
-            patch.object(Path, "cwd", return_value=Path("/home/user/proj-feature")),
-        ):
-            meta = neorev.jj_metadata()
-        self.assertEqual(meta.workspace, "feature")
+            dirnames = []
+            for cwd in (default_ws, feature_ws, feature_ws / "src"):
+                with (
+                    patch.object(neorev, "run_jj", side_effect=fake_run_jj),
+                    patch.object(Path, "cwd", return_value=cwd),
+                ):
+                    dirnames.append(neorev.jj_metadata().dirname)
+        self.assertEqual(dirnames, ["projets-proj"] * len(dirnames))
 
     def test_jj_metadata_falls_back_on_failure(self) -> None:
         """jj_metadata returns a name-only fallback when jj is unavailable."""
@@ -289,17 +281,65 @@ class TestProjectName(unittest.TestCase):
     """Tests for project_name."""
 
     def test_uses_last_two_components_lowercased(self) -> None:
-        """Return the last 2 path components of cwd, lowercased, joined with '-'."""
-        cwd = Path("/home/user/Projets/NeoRev")
-        with patch.object(Path, "cwd", return_value=cwd):
-            result = neorev.project_name()
+        """Return the last 2 path components, lowercased, joined with '-'."""
+        result = neorev.project_name(Path("/home/user/Projets/NeoRev"))
         self.assertEqual(result, "projets-neorev")
 
     def test_single_component_path(self) -> None:
         """Return just the single component lowercased when path has depth 1."""
-        with patch.object(Path, "cwd", return_value=Path("/root")):
-            result = neorev.project_name()
+        result = neorev.project_name(Path("/root"))
         self.assertEqual(result, "root")
+
+
+class TestSharedWorkspaceRoot(unittest.TestCase):
+    """Tests for shared_workspace_root."""
+
+    def test_sibling_workspaces_share_the_prefix_root(self) -> None:
+        """Sibling workspace roots resolve to the directory they all sit under."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main = Path(tmpdir) / "proj"
+            feature = Path(tmpdir) / "proj-feature"
+            for workspace in (main, feature):
+                workspace.mkdir()
+            result = neorev.shared_workspace_root(feature, [main, feature])
+        self.assertEqual(result, main)
+
+    def test_prefix_cutting_mid_component_backs_up_to_parent(self) -> None:
+        """A common prefix that is not a directory falls back to its parent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            first = base / "proj-a"
+            second = base / "proj-b"
+            for workspace in (first, second):
+                workspace.mkdir()
+            result = neorev.shared_workspace_root(first, [first, second])
+        self.assertEqual(result, base)
+
+    def test_single_workspace_returns_its_root(self) -> None:
+        """A lone workspace root is its own shared root."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main = Path(tmpdir) / "proj"
+            main.mkdir()
+            result = neorev.shared_workspace_root(main, [main])
+        self.assertEqual(result, main)
+
+    def test_deeply_nested_workspace_keeps_its_own_root(self) -> None:
+        """A workspace too far below the shared prefix does not share it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main = Path(tmpdir) / "proj"
+            nested = main / ".worktrees" / "exp"
+            nested.mkdir(parents=True)
+            result = neorev.shared_workspace_root(nested, [main, nested])
+        self.assertEqual(result, nested)
+
+    def test_subdirectory_resolves_to_its_workspace_root(self) -> None:
+        """A cwd below a workspace root is treated as that workspace."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main = Path(tmpdir) / "proj"
+            nested = main / ".worktrees" / "exp"
+            nested.mkdir(parents=True)
+            result = neorev.shared_workspace_root(nested / "src", [main, nested])
+        self.assertEqual(result, nested)
 
 
 class TestJjRoot(unittest.TestCase):

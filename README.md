@@ -118,7 +118,7 @@ Notes :
 
 ## Cleanup
 
-If no path is given, `neorev` stores review files by default in `~/.local/state/neorev/`. To automatically clean up old review files, install the provided systemd user tmpfiles config:
+If no path is given, `neorev` stores review files by default in `~/.local/state/neorev/`, in a per project subdirectory shared by the workspaces of a repository. To automatically clean up old review files, install the provided systemd user tmpfiles config:
 
 ```bash
 mkdir -p ~/.config/user-tmpfiles.d/

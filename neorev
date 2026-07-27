@@ -85,10 +85,10 @@ DEFAULT_OUTPUT_STEM = "review"
 DEFAULT_OUTPUT_EXT = ".md"
 DEFAULT_OUTPUT_SEPARATOR = "-"
 JJ_DEFAULT_REV = "@"
-JJ_DEFAULT_WORKSPACE = "default"
 PROJECT_NAME_COMPONENTS = 2
 PROJECT_NAME_SEPARATOR = "-"
-JJ_WORKSPACE_LIST_FIELDS = 2  # "name: path" → 2 colon-separated fields
+# depth below the common prefix past which workspaces count as unrelated checkouts
+WORKSPACE_SHARE_MAX_DEPTH_DELTA = 2
 
 WATCH_DEBOUNCE_TIMEOUT = 0.5
 JJ_OP_HEADS_REL = "op_heads/heads"
@@ -2608,7 +2608,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="Output file for the review (created or updated); "
-        "defaults to $XDG_STATE_HOME/neorev/<project>/<review-workspace-rev>.md",
+        "defaults to $XDG_STATE_HOME/neorev/<project>/review-<rev>.md",
     )
     parser.add_argument(
         "-x",
@@ -2631,13 +2631,12 @@ class JjMetadata:
     """Project metadata extracted from jujutsu for default output naming."""
 
     dirname: str
-    workspace: str | None = None
     rev: str | None = None
 
 
-def project_name() -> str:
-    """Derive a project name from the last path components of the working directory."""
-    parts = [p for p in Path.cwd().parts if p != os.sep]
+def project_name(path: Path) -> str:
+    """Derive a project name from the last components of *path*."""
+    parts = [p for p in path.parts if p != os.sep]
     tail = parts[-PROJECT_NAME_COMPONENTS:]
     return PROJECT_NAME_SEPARATOR.join(p.lower() for p in tail)
 
@@ -2663,8 +2662,40 @@ def jj_root() -> str | None:
         return None
 
 
+def jj_workspace_roots() -> list[Path]:
+    """Return the root directory of every workspace of the current jj repo."""
+    output = run_jj(
+        [
+            "jj",
+            "workspace",
+            "list",
+            "--ignore-working-copy",
+            "-T",
+            'root ++ "\\n"',
+        ]
+    )
+    return [Path(line) for line in output.splitlines()]
+
+
+def shared_workspace_root(cwd: Path, ws_roots: list[Path]) -> Path:
+    """Return the directory shared by a repo's workspace roots, or *cwd*'s own root."""
+    shared = Path(os.path.commonprefix([str(root) for root in ws_roots]).rstrip(os.sep))
+    # a prefix cutting mid-component is not a real directory; back up to its parent
+    if not shared.is_dir():
+        shared = shared.parent
+    current = max(
+        (root for root in ws_roots if cwd.is_relative_to(root)),
+        key=lambda root: len(root.parts),
+        default=cwd,
+    )
+    if len(current.parts) - len(shared.parts) >= WORKSPACE_SHARE_MAX_DEPTH_DELTA:
+        return current
+    return shared
+
+
 def jj_metadata(rev: str | None = None) -> JjMetadata:
     """Return project metadata from the current jj repo, or a name-only fallback."""
+    cwd = Path.cwd()
     try:
         change_id = run_jj(
             [
@@ -2678,21 +2709,13 @@ def jj_metadata(rev: str | None = None) -> JjMetadata:
                 'self.change_id().shortest() ++ "\\n"',
             ]
         )
-        workspace: str | None = None
-        ws_output = run_jj(["jj", "workspace", "list", "--ignore-working-copy"])
-        cwd = Path.cwd()
-        for line in ws_output.splitlines():
-            parts = line.split(":", 1)
-            if len(parts) < JJ_WORKSPACE_LIST_FIELDS:
-                continue
-            ws_name = parts[0].strip()
-            ws_path = Path(parts[1].strip())
-            if ws_path == cwd and ws_name != JJ_DEFAULT_WORKSPACE:
-                workspace = ws_name
-                break
+        ws_roots = jj_workspace_roots()
     except (FileNotFoundError, subprocess.CalledProcessError):
-        return JjMetadata(dirname=project_name())
-    return JjMetadata(dirname=project_name(), workspace=workspace, rev=change_id)
+        return JjMetadata(dirname=project_name(cwd))
+    return JjMetadata(
+        dirname=project_name(shared_workspace_root(cwd, ws_roots)),
+        rev=change_id,
+    )
 
 
 def compact_path(path: str) -> str:
@@ -2713,8 +2736,6 @@ def default_output_path(rev: str | None = None) -> str:
     state_dir = Path(xdg_state) / NEOREV_STATE_DIR / meta.dirname
 
     parts = [DEFAULT_OUTPUT_STEM]
-    if meta.workspace is not None:
-        parts.append(meta.workspace)
     if meta.rev is not None:
         parts.append(meta.rev)
     filename = DEFAULT_OUTPUT_SEPARATOR.join(parts) + DEFAULT_OUTPUT_EXT
