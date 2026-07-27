@@ -2,9 +2,11 @@
 select = ["ALL"]
 ignore = [
     "COM812",  # missing trailing comma
+    "CPY",     # copyright notice
     "D203",    # incompatible with D211
     "D212",    # incompatible with D213
     "D401",    # imperative docstrings
+    "ISC004",  # unparenthesized implicit string concatenation
     "PLR1722", # sys.exit vs exit
     "PLW1510", # subprocess.run without check
     "PT",      # pytest
