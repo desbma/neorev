@@ -206,24 +206,24 @@ class TestDefaultOutputPath(unittest.TestCase):
             neorev.resolve_args(args)
         self.assertEqual(args.output, MOCK_OUTPUT_PATH)
 
-    def test_jj_uses_shortest_unambiguous_rev(self) -> None:
-        """jj_metadata uses shortest() without a fixed length."""
+    def test_jj_uses_fixed_length_rev(self) -> None:
+        """jj_metadata asks for a change id of a fixed length, not the shortest one."""
         calls: list[list[str]] = []
 
         def fake_run_jj(cmd: list[str]) -> str:
             """Capture calls and return stub output."""
             calls.append(cmd)
             if "log" in cmd:
-                return "l"
+                return "l" * neorev.JJ_REV_LENGTH
             return "/some/path"
 
         with patch.object(neorev, "run_jj", side_effect=fake_run_jj):
             meta = neorev.jj_metadata()
-        self.assertEqual(meta.rev, "l")
+        self.assertEqual(meta.rev, "l" * neorev.JJ_REV_LENGTH)
         log_cmd = calls[0]
         template_arg = log_cmd[-1]
-        self.assertIn("shortest()", template_arg)
-        self.assertNotIn("shortest(8)", template_arg)
+        self.assertIn(f"short({neorev.JJ_REV_LENGTH})", template_arg)
+        self.assertNotIn("shortest", template_arg)
 
     def test_jj_passes_custom_rev_to_log(self) -> None:
         """jj_metadata passes a custom rev to jj log -r."""
