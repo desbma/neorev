@@ -132,10 +132,10 @@ class TestDefaultOutputPath(unittest.TestCase):
             patch.object(Path, "mkdir"),
         ):
             result = neorev.default_output_path()
-        self.assertIn(".local/state/neorev/proj", result)
+        self.assertIn(".local/state/agents/reviews/proj", result)
 
     def test_filename_parts_basic(self) -> None:
-        """Filename is just review.md; dirname becomes a subdirectory."""
+        """Filename is just neorev.md; dirname becomes a subdirectory."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -146,11 +146,11 @@ class TestDefaultOutputPath(unittest.TestCase):
             ),
         ):
             result = neorev.default_output_path()
-        self.assertEqual(Path(result).name, "review.md")
+        self.assertEqual(Path(result).name, "neorev.md")
         self.assertEqual(Path(result).parent.name, "myproj")
 
     def test_filename_parts_with_rev(self) -> None:
-        """Filename includes the rev, and never the workspace name."""
+        """Filename leads with the rev, and never carries the workspace name."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -161,13 +161,13 @@ class TestDefaultOutputPath(unittest.TestCase):
             ),
         ):
             result = neorev.default_output_path()
-        self.assertEqual(Path(result).name, "review-def456.md")
+        self.assertEqual(Path(result).name, "def456-neorev.md")
         self.assertEqual(Path(result).parent.name, "proj")
 
     def test_does_not_create_state_directory(self) -> None:
         """default_output_path must not create the directory itself."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_dir = Path(tmpdir) / "sub" / "neorev" / "proj"
+            state_dir = Path(tmpdir) / "sub" / "agents" / "reviews" / "proj"
             with (
                 patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmpdir) / "sub")}),
                 patch.object(neorev, "jj_metadata", return_value=self.make_meta()),

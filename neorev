@@ -80,8 +80,8 @@ NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
 ALL_CLEAR_MESSAGE = "All chunks approved, nothing to report.\n"
 PREVIEW_INTERPUNCT = " · "
 XDG_STATE_HOME_DEFAULT = ".local/state"
-NEOREV_STATE_DIR = "neorev"
-DEFAULT_OUTPUT_STEM = "review"
+REVIEWS_STATE_DIR = "agents/reviews"
+DEFAULT_OUTPUT_STEM = "neorev"
 DEFAULT_OUTPUT_EXT = ".md"
 DEFAULT_OUTPUT_SEPARATOR = "-"
 JJ_DEFAULT_REV = "@"
@@ -2609,7 +2609,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="Output file for the review (created or updated); "
-        "defaults to $XDG_STATE_HOME/neorev/<project>/review-<rev>.md",
+        "defaults to $XDG_STATE_HOME/agents/reviews/<project>/<rev>-neorev.md",
     )
     parser.add_argument(
         "-x",
@@ -2734,11 +2734,11 @@ def default_output_path(rev: str | None = None) -> str:
         str(Path.home() / XDG_STATE_HOME_DEFAULT),
     )
     meta = jj_metadata(rev)
-    state_dir = Path(xdg_state) / NEOREV_STATE_DIR / meta.dirname
+    state_dir = Path(xdg_state) / REVIEWS_STATE_DIR / meta.dirname
 
     parts = [DEFAULT_OUTPUT_STEM]
     if meta.rev is not None:
-        parts.append(meta.rev)
+        parts.insert(0, meta.rev)
     filename = DEFAULT_OUTPUT_SEPARATOR.join(parts) + DEFAULT_OUTPUT_EXT
     return str(state_dir / filename)
 
