@@ -57,7 +57,7 @@ class FakeWatcher:
 
 
 def fake_restart(old: FakeWatcher | None) -> FakeWatcher:
-    """Replacement for restart_watcher that closes *old* and returns a fake."""
+    """Stand in for restart_watcher by closing *old* and returning a fake."""
     if old is not None:
         old.close()
     return FakeWatcher()
@@ -111,21 +111,21 @@ class TestJjWorkingCopyFlag(unittest.TestCase):
     """The diff command snapshots the working copy; metadata queries skip it."""
 
     def test_jj_diff_command_without_rev(self) -> None:
-        """jj_diff_command omits both the rev and --ignore-working-copy."""
+        """Verify jj_diff_command omits both the rev and --ignore-working-copy."""
         self.assertEqual(
             neorev.jj_diff_command(None),
             ["jj", "show"],
         )
 
     def test_jj_diff_command_with_rev(self) -> None:
-        """jj_diff_command appends the rev and keeps snapshotting enabled."""
+        """Verify jj_diff_command appends the rev and keeps snapshotting enabled."""
         self.assertEqual(
             neorev.jj_diff_command("abc123"),
             ["jj", "show", "abc123"],
         )
 
     def test_jj_root_probes_with_ignore_working_copy(self) -> None:
-        """jj_root probes jj root with --ignore-working-copy."""
+        """Verify jj_root probes jj root with --ignore-working-copy."""
         with patch.object(neorev, "run_jj", return_value="/repo") as mock:
             neorev.jj_root()
         self.assertEqual(mock.call_args[0][0], ["jj", "root", "--ignore-working-copy"])
@@ -135,19 +135,19 @@ class TestWatchArgParsing(unittest.TestCase):
     """The -w/--watch flag toggles watch mode."""
 
     def test_watch_defaults_false(self) -> None:
-        """Without -w, watch is disabled."""
+        """Verify watch is disabled without -w."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-o", "out.md"])
         self.assertFalse(args.watch)
 
     def test_watch_short_flag(self) -> None:
-        """The -w short flag enables watch mode."""
+        """Verify the -w short flag enables watch mode."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-w", "-o", "out.md"])
         self.assertTrue(args.watch)
 
     def test_watch_long_flag(self) -> None:
-        """The --watch long flag enables watch mode."""
+        """Verify the --watch long flag enables watch mode."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--watch"])
         self.assertTrue(args.watch)
@@ -188,7 +188,7 @@ class TestFetchWatchDiff(unittest.TestCase):
     """fetch_watch_diff tolerates empty diffs and command failures."""
 
     def test_returns_stdout_on_success(self) -> None:
-        """A successful command yields its stdout and the source label."""
+        """Verify a successful command yields its stdout and the source label."""
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=SIMPLE_DIFF
         )
@@ -198,7 +198,7 @@ class TestFetchWatchDiff(unittest.TestCase):
         self.assertEqual(source, JJ_WORKING_COPY_SOURCE)
 
     def test_returns_empty_on_failure(self) -> None:
-        """A failed command yields empty text without raising."""
+        """Verify a failed command yields empty text without raising."""
         error = subprocess.CalledProcessError(1, ["jj", "show"])
         with patch("neorev.subprocess.run", side_effect=error):
             text, source = neorev.fetch_watch_diff(neorev.JjSource("abc"))
@@ -210,19 +210,19 @@ class TestBuildWatchState(unittest.TestCase):
     """build_watch_state returns None for empty diffs, a state otherwise."""
 
     def test_empty_string_returns_none(self) -> None:
-        """An empty diff produces no state."""
+        """Verify an empty diff produces no state."""
         self.assertIsNone(neorev.build_watch_state("", UNUSED_OUTPUT_PATH))
 
     def test_whitespace_returns_none(self) -> None:
-        """A whitespace-only diff produces no state."""
+        """Verify a whitespace-only diff produces no state."""
         self.assertIsNone(neorev.build_watch_state("  \n ", UNUSED_OUTPUT_PATH))
 
     def test_text_without_hunks_returns_none(self) -> None:
-        """Text with no parseable hunks produces no state."""
+        """Verify text with no parseable hunks produces no state."""
         self.assertIsNone(neorev.build_watch_state("not a diff", UNUSED_OUTPUT_PATH))
 
     def test_diff_returns_state(self) -> None:
-        """A real diff yields a state positioned at the first hunk."""
+        """Verify a real diff yields a state positioned at the first hunk."""
         with tempfile.TemporaryDirectory() as tmp:
             output = str(Path(tmp) / WATCH_OUTPUT_NAME)
             state = neorev.build_watch_state(SIMPLE_DIFF, output)
@@ -247,7 +247,7 @@ class TestWatchModeGuards(unittest.TestCase):
         return code if isinstance(code, int) else 1
 
     def test_stdin_with_watch_is_usage_error(self) -> None:
-        """Piping a diff with --watch fails with a usage error."""
+        """Verify piping a diff with --watch fails with a usage error."""
         with (
             patch("neorev.shutil.which", return_value=INOTIFYWAIT_FAKE_PATH),
             tempfile.TemporaryDirectory() as tmp,
@@ -259,7 +259,7 @@ class TestWatchModeGuards(unittest.TestCase):
         self.assertEqual(code, os.EX_USAGE)
 
     def test_missing_inotifywait_is_fatal(self) -> None:
-        """--watch without inotifywait exits before fetching any diff."""
+        """Verify --watch without inotifywait exits before fetching any diff."""
         with patch("neorev.shutil.which", return_value=None):
             argv = ["neorev", "-w", "-j", "abc", "-o", "out.md"]
             with patch.object(sys, "stderr", io.StringIO()):
@@ -271,7 +271,7 @@ class TestReadKeyReload(unittest.TestCase):
     """read_key surfaces a watch event as KEY_RELOAD."""
 
     def test_watch_event_returns_reload(self) -> None:
-        """A byte on the watch pipe makes read_key return KEY_RELOAD."""
+        """Verify a byte on the watch pipe makes read_key return KEY_RELOAD."""
         tty_pair = FakeTTY()
         read_fd, write_fd = os.pipe()
         try:
@@ -323,7 +323,7 @@ class TestWatchLoop(unittest.TestCase):
             return clipboard, Path(output).read_text()
 
     def test_all_clear_persisted_and_clipboard_once_on_quit(self) -> None:
-        """All-clear is written every cycle; clipboard copies only on quit."""
+        """Verify all-clear is written every cycle; clipboard copies only on quit."""
         scripts: LoopScript = [
             (approve_all, neorev.LoopResult.RELOAD),
             (noop, neorev.LoopResult.QUIT),
@@ -337,7 +337,7 @@ class TestWatchLoop(unittest.TestCase):
         self.assertTrue(footer.split("-->", 1)[0].strip())
 
     def test_empty_diff_waits_then_reloads(self) -> None:
-        """An initially empty diff shows the wait screen, then reloads."""
+        """Verify an initially empty diff shows the wait screen, then reloads."""
         scripts: LoopScript = [
             (noop, neorev.LoopResult.RELOAD),
             (approve_all, neorev.LoopResult.QUIT),

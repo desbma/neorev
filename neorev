@@ -109,12 +109,23 @@ ANSI_ESCAPE_BYTES_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 HUNK_RANGE_LINE_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@"
 )
+HUNK_RANGE_PREFIX = "@@"
+SECTION_KIND_PREFIX = "REVIEW "
+SECTION_KINDS_PATTERN = r"CHANGE REQUESTED|QUESTION"
+HEADING_TARGET_SEPARATOR = " @ "
 SECTION_HEADER_RE = re.compile(
-    r"\[(CHANGE REQUESTED|QUESTION)\]\s+`(.+?)(?:\s+@\s+(.+?))?`$",
+    rf"\[{SECTION_KIND_PREFIX}(?P<kind>{SECTION_KINDS_PATTERN})\]\s+"
+    rf"`(?:(?P<global>{GLOBAL_TARGET})"
+    rf"|(?P<path>.+){re.escape(HEADING_TARGET_SEPARATOR)}(?P<target>[^`]+))`$",
     re.MULTILINE,
 )
+SECTION_SPLIT_RE = re.compile(
+    rf"^### (?=\[{SECTION_KIND_PREFIX}(?:{SECTION_KINDS_PATTERN})\]\s+`)",
+    re.MULTILINE,
+)
+# The approved-hunk footer, which closes the file and appears nowhere else.
 FOOTER_RE = re.compile(
-    r"^<!-- neorev: approved-hashes=(\S*) -->$",
+    r"^<!-- neorev: approved-hashes=(\S*) -->\s*\Z",
     re.MULTILINE,
 )
 APPROVAL_HASH_BYTES = 8
@@ -125,6 +136,16 @@ ANCHOR_DIGEST_BYTES = 8
 ANCHOR_LENGTH_PREFIX_BYTES = 8
 ANCHOR_COMMENT_TEMPLATE = "<!-- neorev: note-anchor={value} -->"
 ANCHOR_COMMENT_RE = re.compile(r"<!-- neorev: note-anchor=(\S+) -->")
+DIFF_FENCE_CHAR = "`"
+DIFF_FENCE_MIN_LENGTH = 3
+DIFF_FENCE_INFO = "diff"
+BACKTICK_RUN_RE = re.compile(r"`+")
+# A diff block, closed only by a line equal to its own opening fence.
+DIFF_BLOCK_RE = re.compile(
+    rf"^(?P<fence>{DIFF_FENCE_CHAR}{{{DIFF_FENCE_MIN_LENGTH},}}){DIFF_FENCE_INFO}\n"
+    r"(?P<body>.*?)^(?P=fence)$\n?",
+    re.DOTALL | re.MULTILINE,
+)
 LINE_PICKER_FOOTER_SEGMENTS = [
     ("j/k", "move"),
     ("Enter", "select line"),
@@ -135,8 +156,8 @@ LINE_PICKER_FOOTER_SEGMENTS = [
 OUTPUT_PREAMBLE = (
     "# Code Review\n\n"
     "## Instructions\n\n"
-    "- `CHANGE REQUESTED` → apply the requested change.\n"
-    "- `QUESTION` → answer the question; do NOT change code"
+    f"- `{SECTION_KIND_PREFIX}CHANGE REQUESTED` → apply the requested change.\n"
+    f"- `{SECTION_KIND_PREFIX}QUESTION` → answer the question; do NOT change code"
     " unless your answer warrants it.\n"
     "- `global` notes do not apply to a specific part of the diff."
     " They may refer to the change as a whole, or to something"
@@ -175,7 +196,7 @@ class Status(enum.Enum):
 
 
 class NoteKind(enum.Enum):
-    """Enumerate note categories used in reviews — each value is its output label."""
+    """Enumerate note categories used in reviews — each value is its action label."""
 
     FLAG = "CHANGE REQUESTED"
     QUESTION = "QUESTION"
@@ -236,14 +257,6 @@ class DisplayLineKind(enum.Enum):
     REMOVED = "-"
     CONTEXT = " "
     META = "\\"
-
-
-class NoteScope(enum.Enum):
-    """Enumerate where a note is attached in the review model."""
-
-    GLOBAL = enum.auto()
-    HUNK = enum.auto()
-    LINE = enum.auto()
 
 
 class LoopResult(enum.Enum):
@@ -411,7 +424,7 @@ class ApplyResult:
     stale_missing_target: int
 
 
-SavedAnnotationKey = tuple[str | None, str, NoteTarget]
+SavedAnnotationKey = tuple[str, str, NoteTarget]
 SavedAnnotationMap = dict[SavedAnnotationKey, SavedAnnotation]
 
 
@@ -675,12 +688,12 @@ def parse_diff(diff_text: str) -> list[Hunk]:
         if line.startswith(("diff --git", "diff ")):
             header, i = parse_file_header(lines, i, header.path if header else None)
             if header.status is FileStatus.RENAMED and (
-                i >= len(lines) or not lines[i].startswith("@@")
+                i >= len(lines) or not lines[i].startswith(HUNK_RANGE_PREFIX)
             ):
                 hunks.append(make_rename_hunk(header))
             continue
 
-        if line.startswith("@@"):
+        if line.startswith(HUNK_RANGE_PREFIX):
             hunk, i = parse_hunk_body(lines, i, header)
             hunks.append(hunk)
             continue
@@ -707,7 +720,7 @@ def parse_file_header(
     renamed = False
     while (
         i < len(lines)
-        and not lines[i].startswith("@@")
+        and not lines[i].startswith(HUNK_RANGE_PREFIX)
         and not lines[i].startswith("diff ")
     ):
         line = lines[i]
@@ -771,7 +784,7 @@ def parse_hunk_body(
 
     Returns (Hunk, next_line_index).
     """
-    range_line = lines[start].rstrip("\n")
+    range_line = lines[start].rstrip("\r\n")
     match = re.search(r"\+(\d+)", range_line)
     start_line = int(match.group(1)) if match else None
 
@@ -779,7 +792,7 @@ def parse_hunk_body(
     i = start + 1
     while (
         i < len(lines)
-        and not lines[i].startswith("@@")
+        and not lines[i].startswith(HUNK_RANGE_PREFIX)
         and not lines[i].startswith("diff ")
     ):
         body_lines.append(lines[i])
@@ -956,11 +969,10 @@ def format_output(
         write_note_section(out, note.kind, GLOBAL_TARGET, note.text)
 
     for hunk, hnote in all_notes:
-        heading_path = hunk.file_path if hunk.file_path is not None else hunk.range_line
         write_note_section(
             out,
             hnote.kind,
-            f"{heading_path} @ {hnote.target}",
+            f"{hunk_identity_path(hunk)}{HEADING_TARGET_SEPARATOR}{hnote.target}",
             hnote.text,
             extras=HunkNoteExtras(
                 diff_block=format_diff_block(hunk, hnote),
@@ -988,7 +1000,7 @@ def write_note_section(
     extras: HunkNoteExtras | None = None,
 ) -> None:
     """Write a single note section (global or hunk-scoped) to *out*."""
-    out.write(f"\n### [{kind.value}] `{heading}`\n\n")
+    out.write(f"\n### [{SECTION_KIND_PREFIX}{kind.value}] `{heading}`\n\n")
     if extras is not None:
         out.write(ANCHOR_COMMENT_TEMPLATE.format(value=extras.anchor) + "\n\n")
         out.write(extras.diff_block)
@@ -998,8 +1010,18 @@ def write_note_section(
 
 def format_diff_block(hunk: Hunk, note: HunkNote) -> str:
     """Format the fenced diff block for a hunk note section."""
-    trimmed = trim_body_lines(hunk, note)
-    return f"```diff\n{hunk.range_line}\n" + "\n".join(trimmed) + "\n```\n\n"
+    lines = [hunk.range_line, *trim_body_lines(hunk, note)]
+    fence = diff_fence(lines)
+    return f"{fence}{DIFF_FENCE_INFO}\n" + "\n".join(lines) + f"\n{fence}\n\n"
+
+
+def diff_fence(lines: list[str]) -> str:
+    """Return a code fence longer than every backtick run in *lines*."""
+    longest = max(
+        (len(run.group()) for line in lines for run in BACKTICK_RUN_RE.finditer(line)),
+        default=0,
+    )
+    return DIFF_FENCE_CHAR * max(DIFF_FENCE_MIN_LENGTH, longest + 1)
 
 
 def format_footer(hunks: list[Hunk]) -> str:
@@ -1039,6 +1061,11 @@ def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
     if end < len(body_lines):
         trimmed.append("# ...")
     return trimmed
+
+
+def hunk_identity_path(hunk: Hunk) -> str:
+    """Return the string identifying *hunk* in a review file."""
+    return hunk.file_path if hunk.file_path is not None else hunk.range_line
 
 
 def hunk_identity_hash(hunk: Hunk) -> bytes:
@@ -1088,7 +1115,7 @@ def load_previous_review(
 
     Returns a mapping of ``(file_path, range_line, target) → SavedAnnotation``
     for hunk annotations, a list of ``GlobalNote`` for global ones, and
-    the raw approved-bitmap string (None if absent).
+    the approved-hash encoding (None if absent).
     """
     try:
         text = Path(path).read_text()
@@ -1101,14 +1128,16 @@ def load_previous_review(
     annotations: SavedAnnotationMap = {}
     global_notes: list[GlobalNote] = []
 
-    bitmap_match = FOOTER_RE.search(text)
-    bitmap_encoded = bitmap_match.group(1) if bitmap_match else None
+    footer_match = FOOTER_RE.search(text)
+    approved_encoded = None
+    if footer_match is not None:
+        approved_encoded = footer_match.group(1)
+        text = text[: footer_match.start()]
 
-    sections = re.split(r"^### ", text, flags=re.MULTILINE)
-    for section in sections:
+    for section in SECTION_SPLIT_RE.split(text):
         parse_review_section(section, annotations, global_notes)
 
-    return annotations, global_notes, bitmap_encoded
+    return annotations, global_notes, approved_encoded
 
 
 def parse_review_section(
@@ -1117,53 +1146,37 @@ def parse_review_section(
     global_notes: list[GlobalNote],
 ) -> None:
     """Parse one ``### ...`` section and populate *annotations* or *global_notes*."""
-    if not section.strip():
-        return
-
     header_match = SECTION_HEADER_RE.match(section)
-    if not header_match:
+    if header_match is None:
         return
 
-    action_str = header_match.group(1)
-    file_or_global = header_match.group(2).strip()
-    target_str = header_match.group(3)
-    kind = NoteKind(action_str)
-    comment = extract_comment_lines(section)
-    scope = NoteScope.GLOBAL if file_or_global == GLOBAL_TARGET else NoteScope.HUNK
-
-    if scope is NoteScope.GLOBAL:
+    kind = NoteKind(header_match.group("kind"))
+    if header_match.group("global") is not None:
+        comment = section[header_match.end() :].strip()
         if comment:
             global_notes.append(GlobalNote(kind=kind, text=comment))
         return
 
-    range_match = re.search(r"```diff\n(@@[^\n]+)", section)
-    if not range_match:
+    block_match = DIFF_BLOCK_RE.search(section, header_match.end())
+    if block_match is None:
         return
-    range_line = range_match.group(1)
+    range_line = block_match.group("body").partition("\n")[0]
+    if range_line and not range_line.startswith(HUNK_RANGE_PREFIX):
+        return
 
     target: NoteTarget = HunkTarget()
-    if target_str:
-        parsed = parse_note_target(target_str.strip())
-        if parsed is not None:
-            target = parsed
+    parsed = parse_note_target(header_match.group("target"))
+    if parsed is not None:
+        target = parsed
 
-    anchor_match = ANCHOR_COMMENT_RE.search(section)
-    anchor = anchor_match.group(1) if anchor_match else None
-
-    annotations[(file_or_global, range_line, target)] = SavedAnnotation(
-        kind=kind,
-        text=comment,
-        anchor=anchor,
+    anchor_match = ANCHOR_COMMENT_RE.search(
+        section, header_match.end(), block_match.start()
     )
-
-
-def extract_comment_lines(section: str) -> str:
-    """Extract the review message text from a section body."""
-    body = re.sub(r"```diff\n.*?```\n?", "", section, flags=re.DOTALL)
-    body = SECTION_HEADER_RE.sub("", body)
-    body = FOOTER_RE.sub("", body)
-    body = ANCHOR_COMMENT_RE.sub("", body)
-    return body.strip()
+    annotations[(header_match.group("path"), range_line, target)] = SavedAnnotation(
+        kind=kind,
+        text=section[block_match.end() :].strip(),
+        anchor=anchor_match.group(1) if anchor_match else None,
+    )
 
 
 def line_target_exists(hunk: Hunk, target: LineTarget) -> bool:
@@ -1183,9 +1196,9 @@ def apply_previous_review(
     no longer exists in the current hunk, or when its anchor is missing or
     differs from the recomputed value.
     """
-    lookup: dict[tuple[str | None, str], Hunk] = {}
+    lookup: dict[tuple[str, str], Hunk] = {}
     for hunk in hunks:
-        lookup[(hunk.file_path, hunk.range_line)] = hunk
+        lookup[(hunk_identity_path(hunk), hunk.range_line)] = hunk
 
     matched = 0
     stale_unmatched = 0

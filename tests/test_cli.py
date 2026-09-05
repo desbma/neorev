@@ -17,7 +17,7 @@ class TestArgParser(unittest.TestCase):
     """Tests for build_arg_parser and resolve_args."""
 
     def test_output_flag(self) -> None:
-        """The -o/--output flag sets the output path."""
+        """Verify the -o/--output flag sets the output path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-o", "out.md"])
         self.assertEqual(args.output, "out.md")
@@ -25,13 +25,13 @@ class TestArgParser(unittest.TestCase):
         self.assertFalse(args.clear)
 
     def test_output_long_form(self) -> None:
-        """The --output long form sets the output path."""
+        """Verify the --output long form sets the output path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--output", "out.md"])
         self.assertEqual(args.output, "out.md")
 
     def test_clip_flag(self) -> None:
-        """The -x/--clip flag is recognised."""
+        """Verify the -x/--clip flag is recognised."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--clip", "-o", "out.md"])
         self.assertTrue(args.clip)
@@ -39,7 +39,7 @@ class TestArgParser(unittest.TestCase):
         self.assertTrue(args_short.clip)
 
     def test_clear_flag(self) -> None:
-        """The -c/--clear flag is recognised."""
+        """Verify the -c/--clear flag is recognised."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--clear", "-o", "out.md"])
         self.assertTrue(args.clear)
@@ -47,13 +47,13 @@ class TestArgParser(unittest.TestCase):
         self.assertTrue(args_short.clear)
 
     def test_output_defaults_to_none(self) -> None:
-        """Omitting -o leaves output as None for resolve_args to fill."""
+        """Verify omitting -o leaves output as None for resolve_args to fill."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         self.assertIsNone(args.output)
 
     def test_resolve_args_fills_default_output(self) -> None:
-        """resolve_args fills in a default output path when not provided."""
+        """Verify resolve_args fills in a default output path when not provided."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         with patch.object(
@@ -64,39 +64,39 @@ class TestArgParser(unittest.TestCase):
         mock.assert_called_once_with(None)
 
     def test_resolve_args_keeps_explicit_output(self) -> None:
-        """resolve_args preserves an explicitly provided -o value."""
+        """Verify resolve_args preserves an explicitly provided -o value."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-o", "mine.md"])
         neorev.resolve_args(args)
         self.assertEqual(args.output, "mine.md")
 
     def test_jj_with_revision(self) -> None:
-        """The -j flag records a JjSource with the given rev."""
+        """Verify the -j flag records a JjSource with the given rev."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j", "abc123", "-o", "out.md"])
         self.assertEqual(args.source, neorev.JjSource("abc123"))
         self.assertEqual(args.output, "out.md")
 
     def test_jj_without_revision(self) -> None:
-        """The -j flag without a revision records JjSource(None)."""
+        """Verify the -j flag without a revision records JjSource(None)."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j"])
         self.assertEqual(args.source, neorev.JjSource(None))
 
     def test_source_none_when_no_flag_passed(self) -> None:
-        """Without -j, source defaults to None."""
+        """Verify source defaults to None without -j."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         self.assertIsNone(args.source)
 
     def test_long_form_jj_with_revision(self) -> None:
-        """The --jj long form works with a revision."""
+        """Verify the --jj long form works with a revision."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--jj", "v1.0"])
         self.assertEqual(args.source, neorev.JjSource("v1.0"))
 
     def test_long_form_jj_without_revision(self) -> None:
-        """The --jj long form works without a revision."""
+        """Verify the --jj long form works without a revision."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["--jj"])
         self.assertEqual(args.source, neorev.JjSource(None))
@@ -135,7 +135,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertIn(".local/state/agents/reviews/proj", result)
 
     def test_filename_parts_basic(self) -> None:
-        """Filename is just neorev.md; dirname becomes a subdirectory."""
+        """Verify filename is just neorev.md; dirname becomes a subdirectory."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -150,7 +150,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(Path(result).parent.name, "myproj")
 
     def test_filename_parts_with_rev(self) -> None:
-        """Filename leads with the rev, and never carries the workspace name."""
+        """Verify filename leads with the rev, and never carries the workspace name."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
@@ -165,7 +165,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(Path(result).parent.name, "proj")
 
     def test_does_not_create_state_directory(self) -> None:
-        """default_output_path must not create the directory itself."""
+        """Verify default_output_path must not create the directory itself."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state_dir = Path(tmpdir) / "sub" / "agents" / "reviews" / "proj"
             with (
@@ -176,7 +176,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             self.assertFalse(state_dir.is_dir())
 
     def test_resolve_args_detects_jj_from_flag(self) -> None:
-        """resolve_args passes the working-copy rev (None) to default_output_path."""
+        """Verify resolve_args passes working-copy rev (None) to default_output_path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j"])
         with patch.object(
@@ -186,7 +186,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         mock.assert_called_once_with(None)
 
     def test_resolve_args_passes_jj_rev(self) -> None:
-        """resolve_args forwards the jj revision to default_output_path."""
+        """Verify resolve_args forwards the jj revision to default_output_path."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-j", "abc123"])
         with patch.object(
@@ -196,7 +196,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         mock.assert_called_once_with("abc123")
 
     def test_resolve_args_fills_output_outside_jj(self) -> None:
-        """resolve_args fills a default output for a piped diff outside a jj repo."""
+        """Verify resolve_args fills a default output for a piped diff outside jj."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         with (
@@ -207,7 +207,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(args.output, MOCK_OUTPUT_PATH)
 
     def test_jj_uses_fixed_length_rev(self) -> None:
-        """jj_metadata asks for a change id of a fixed length, not the shortest one."""
+        """Verify jj_metadata asks for a fixed-length change id, not the shortest."""
         calls: list[list[str]] = []
 
         def fake_run_jj(cmd: list[str]) -> str:
@@ -226,7 +226,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertNotIn("shortest", template_arg)
 
     def test_jj_passes_custom_rev_to_log(self) -> None:
-        """jj_metadata passes a custom rev to jj log -r."""
+        """Verify jj_metadata passes a custom rev to jj log -r."""
         calls: list[list[str]] = []
 
         def fake_run_jj(cmd: list[str]) -> str:
@@ -244,7 +244,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(log_cmd[r_idx + 1], "myrev")
 
     def test_jj_metadata_shares_dirname_across_workspaces(self) -> None:
-        """Every workspace of a repo resolves to the same project directory."""
+        """Verify every workspace of a repo resolves to the same project directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir) / "Projets"
             default_ws = base / "proj"
@@ -268,7 +268,7 @@ class TestDefaultOutputPath(unittest.TestCase):
         self.assertEqual(dirnames, ["projets-proj"] * len(dirnames))
 
     def test_jj_metadata_falls_back_on_failure(self) -> None:
-        """jj_metadata returns a name-only fallback when jj is unavailable."""
+        """Verify jj_metadata returns a name-only fallback when jj is unavailable."""
         with (
             patch.object(neorev, "run_jj", side_effect=FileNotFoundError),
             patch.object(neorev, "project_name", return_value="proj"),
@@ -295,7 +295,7 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
     """Tests for shared_workspace_root."""
 
     def test_sibling_workspaces_share_the_prefix_root(self) -> None:
-        """Sibling workspace roots resolve to the directory they all sit under."""
+        """Verify sibling workspace roots resolve to the directory they sit under."""
         with tempfile.TemporaryDirectory() as tmpdir:
             main = Path(tmpdir) / "proj"
             feature = Path(tmpdir) / "proj-feature"
@@ -305,7 +305,7 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
         self.assertEqual(result, main)
 
     def test_prefix_cutting_mid_component_backs_up_to_parent(self) -> None:
-        """A common prefix that is not a directory falls back to its parent."""
+        """Verify a common prefix that is not a directory falls back to its parent."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             first = base / "proj-a"
@@ -316,7 +316,7 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
         self.assertEqual(result, base)
 
     def test_single_workspace_returns_its_root(self) -> None:
-        """A lone workspace root is its own shared root."""
+        """Verify a lone workspace root is its own shared root."""
         with tempfile.TemporaryDirectory() as tmpdir:
             main = Path(tmpdir) / "proj"
             main.mkdir()
@@ -324,7 +324,7 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
         self.assertEqual(result, main)
 
     def test_deeply_nested_workspace_keeps_its_own_root(self) -> None:
-        """A workspace too far below the shared prefix does not share it."""
+        """Verify a workspace too far below the shared prefix does not share it."""
         with tempfile.TemporaryDirectory() as tmpdir:
             main = Path(tmpdir) / "proj"
             nested = main / ".worktrees" / "exp"
@@ -333,7 +333,7 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
         self.assertEqual(result, nested)
 
     def test_subdirectory_resolves_to_its_workspace_root(self) -> None:
-        """A cwd below a workspace root is treated as that workspace."""
+        """Verify a cwd below a workspace root is treated as that workspace."""
         with tempfile.TemporaryDirectory() as tmpdir:
             main = Path(tmpdir) / "proj"
             nested = main / ".worktrees" / "exp"

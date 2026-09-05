@@ -49,6 +49,7 @@ WORKFLOW_GLOBAL_NOTE = "Can we add tests for this behavior?"
 WORKFLOW_RESUME_FLAG = "Carry this change request forward"
 WORKFLOW_RESUME_GLOBAL = "Overall: check module boundaries"
 WORKFLOW_PRECEDENCE_QUESTION = "Why is this import needed?"
+WORKFLOW_FENCED_QUESTION = "Why replace the command here?"
 WORKFLOW_STALE_MESSAGE = "no longer match any hunk"
 WORKFLOW_ALL_CLEAR_SUMMARY = "# 1/2 hunks approved."
 GLOBAL_NOTE_CREATED_TEXT = "needs follow-up"
@@ -194,6 +195,55 @@ diff --git a/c.py b/c.py
 +h = 4
 """
 
+FENCED_BODY_DIFF = """\
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1,5 +1,5 @@
+ Run this:
+
+ ```bash
+-old command
++new command
+ ```
+"""
+
+INDENTED_FENCE_BODY_DIFF = """\
+diff --git a/indented.md b/indented.md
+--- a/indented.md
++++ b/indented.md
+@@ -1,4 +1,4 @@
+ 1. Run this:
+
+       ```bash
+-      old command
++      new command
+       ```
+"""
+
+WIDE_FENCE_BODY_DIFF = """\
+diff --git a/nested.md b/nested.md
+--- a/nested.md
++++ b/nested.md
+@@ -1,5 +1,5 @@
+ ````markdown
+ ```python
+-x = 1
++x = 2
+ ```
+ ````
+"""
+
+HEADING_BODY_DIFF = """\
+diff --git a/doc.md b/doc.md
+--- a/doc.md
++++ b/doc.md
+@@ -1,3 +1,3 @@
+ ### Section
+-old
++new
+"""
+
 SIMPLE_DIFF = """\
 diff --git a/hello.py b/hello.py
 --- a/hello.py
@@ -234,6 +284,39 @@ diff --git a/b.py b/b.py
  a = 1
 +b = 2
 """
+
+GLOBAL_PATH_DIFF = """\
+diff --git a/global b/global
+--- a/global
++++ b/global
+@@ -1,2 +1,3 @@
+ x = 1
++y = 2
+"""
+
+SEPARATOR_PATH_DIFF = """\
+diff --git a/d @ r.py b/d @ r.py
+--- a/d @ r.py
++++ b/d @ r.py
+@@ -1,2 +1,3 @@
+ x = 1
++y = 2
+"""
+
+HEADERLESS_DIFF = """\
+@@ -1,2 +1,3 @@
+ x = 1
++y = 2
+"""
+
+CRLF_DIFF = (
+    "diff --git a/crlf.py b/crlf.py\r\n"
+    "--- a/crlf.py\r\n"
+    "+++ b/crlf.py\r\n"
+    "@@ -1,2 +1,3 @@\r\n"
+    " x = 1\r\n"
+    "+y = 2\r\n"
+)
 
 
 def make_hunk(  # noqa: PLR0913
@@ -282,6 +365,60 @@ def make_hunk(  # noqa: PLR0913
     if notes is not None:
         hunk.notes = notes
     return hunk
+
+
+REOPEN_CYCLE_COUNT = 3
+
+# Note texts a reviewer may plausibly type, each exercising a token the review
+# file format also uses for its own structure.
+ROUND_TRIP_NOTE_TEXTS = {
+    "plain": "just fix it",
+    "multiline": "first line\nsecond line\nthird line",
+    "markdown heading": "### Why this?\n\nBecause reasons.",
+    "leading markdown heading": "### heading first",
+    "diff block": "Try instead:\n\n```diff\n-a\n+b\n```\n\nDoes that work?",
+    "only a diff block": "```diff\n-a\n+b\n```",
+    "code block": "Use:\n\n```python\nx = 1\n```",
+    "wide fence": "````\n```\n````",
+    "bare fence line": "```",
+    "range line": "@@ -1,2 +1,3 @@ is the wrong hunk",
+    "anchor comment": "see <!-- neorev: note-anchor=abc -->",
+    "anchor comment on its own line": (
+        "before\n<!-- neorev: note-anchor=abc -->\nafter"
+    ),
+    "section header line": "[QUESTION] `foo.py @ hunk`",
+    "unprefixed section heading": "### [QUESTION] `foo.py @ hunk`",
+    "special characters": "Use `foo()` — see [docs](url), émojis 🎉 and <angle>.",
+    "leading anchor comment": "<!-- neorev: note-anchor=abc -->\n\nreal text",
+    "only an anchor comment": "<!-- neorev: note-anchor=abc -->",
+    "approved-hashes footer line": (
+        "quoting the footer:\n<!-- neorev: approved-hashes=AAAAAAAAAAA= -->\ntail"
+    ),
+}
+
+# Diffs whose hunks stress how a note is keyed back to its hunk on reload.
+HUNK_IDENTITY_DIFFS = {
+    "file named global": GLOBAL_PATH_DIFF,
+    "separator in path": SEPARATOR_PATH_DIFF,
+    "pure rename": PURE_RENAME_DIFF,
+    "no file header": HEADERLESS_DIFF,
+    "crlf line endings": CRLF_DIFF,
+}
+
+
+def reopen_review(
+    diff_text: str,
+    hunks: list[neorev.Hunk],
+    global_notes: list[neorev.GlobalNote],
+    path: str,
+) -> tuple[list[neorev.Hunk], list[neorev.GlobalNote], str]:
+    """Write the review to *path*, then reload it onto a fresh parse of *diff_text*."""
+    output = neorev.format_output(hunks, global_notes)
+    Path(path).write_text(output)
+    annotations, loaded_notes, _ = neorev.load_previous_review(path)
+    reloaded = neorev.parse_diff(diff_text)
+    neorev.apply_previous_review(reloaded, annotations)
+    return reloaded, loaded_notes, output
 
 
 def remove_ansi_escape_sequences(text: str) -> str:

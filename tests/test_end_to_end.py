@@ -7,8 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.helpers import (
+    FENCED_BODY_DIFF,
+    REOPEN_CYCLE_COUNT,
     TWO_HUNK_DIFF,
     WORKFLOW_ALL_CLEAR_SUMMARY,
+    WORKFLOW_FENCED_QUESTION,
     WORKFLOW_FLAG_COMMENT,
     WORKFLOW_GLOBAL_NOTE,
     WORKFLOW_PRECEDENCE_QUESTION,
@@ -24,7 +27,7 @@ class TestMainWorkflow(unittest.TestCase):
     """High-level tests for new review and resume workflows through main()."""
 
     def test_new_review_flow_writes_expected_output(self) -> None:
-        """A scripted review writes annotations and approval hashes."""
+        """Verify a scripted review writes annotations and approval hashes."""
 
         def script(state: neorev.ReviewState) -> None:
             """Apply one flag, one approval, and one global note."""
@@ -49,16 +52,16 @@ class TestMainWorkflow(unittest.TestCase):
         try:
             run_main_with_scripted_terminal(TWO_HUNK_DIFF, output_path, script)
             output = Path(output_path).read_text()
-            self.assertIn("[CHANGE REQUESTED] `hello.py", output)
+            self.assertIn("[REVIEW CHANGE REQUESTED] `hello.py", output)
             self.assertIn(WORKFLOW_FLAG_COMMENT, output)
-            self.assertIn("[QUESTION] `global`", output)
+            self.assertIn("[REVIEW QUESTION] `global`", output)
             self.assertIn(WORKFLOW_GLOBAL_NOTE, output)
             self.assertIn("<!-- neorev: approved-hashes=", output)
         finally:
             os.unlink(output_path)
 
     def test_resume_workflow_applies_annotations_and_global_notes(self) -> None:
-        """Resuming from an existing output restores notes and hash-keyed approvals."""
+        """Verify resuming an existing output restores notes and hash approvals."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         previous_hunks[0].notes = [
             neorev.HunkNote(
@@ -92,8 +95,38 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
+    def test_repeated_resume_over_fenced_diff_keeps_note_intact(self) -> None:
+        """Verify reopening a review of a fenced diff rewrites the same file."""
+
+        def script(state: neorev.ReviewState) -> None:
+            """Ask one question about the whole hunk."""
+            state.hunks[0].upsert_note(
+                neorev.NoteKind.QUESTION,
+                neorev.HunkTarget(),
+                WORKFLOW_FENCED_QUESTION,
+            )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            output_path = f.name
+
+        try:
+            run_main_with_scripted_terminal(FENCED_BODY_DIFF, output_path, script)
+            first = Path(output_path).read_text()
+            for _ in range(REOPEN_CYCLE_COUNT):
+                stderr = run_main_with_scripted_terminal(
+                    FENCED_BODY_DIFF,
+                    output_path,
+                    lambda _state: None,
+                )
+                self.assertIn("Loaded 1 hunk annotation(s)", stderr)
+                self.assertEqual(Path(output_path).read_text(), first)
+            self.assertEqual(first.count(WORKFLOW_FENCED_QUESTION), 1)
+            self.assertEqual(first.count("old command"), 1)
+        finally:
+            os.unlink(output_path)
+
     def test_resume_annotation_precedence_over_hashes(self) -> None:
-        """Explicit annotation status wins when hashes mark the same hunk approved."""
+        """Verify annotation status wins when hashes mark the same hunk approved."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         previous_hunks[0].notes = [
             neorev.HunkNote(
@@ -116,18 +149,18 @@ class TestMainWorkflow(unittest.TestCase):
                 lambda _state: None,
             )
             output = Path(output_path).read_text()
-            self.assertIn("[QUESTION] `hello.py", output)
+            self.assertIn("[REVIEW QUESTION] `hello.py", output)
             self.assertIn(WORKFLOW_PRECEDENCE_QUESTION, output)
         finally:
             os.unlink(output_path)
 
     def test_resume_with_stale_annotation_reports_and_keeps_hashes(self) -> None:
-        """Stale annotations are reported while hash approvals still resume."""
+        """Verify stale annotations are reported while hash approvals still resume."""
         hash_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         hash_hunks[1].approved = True
         hashes = neorev.encode_approved_hashes(hash_hunks)
         stale_output = (
-            "### [CHANGE REQUESTED] `stale.py @ hunk`\n\n"
+            "### [REVIEW CHANGE REQUESTED] `stale.py @ hunk`\n\n"
             "```diff\n"
             "@@ -99,1 +99,1 @@\n"
             "+stale\n"
@@ -154,7 +187,7 @@ class TestMainWorkflow(unittest.TestCase):
             os.unlink(output_path)
 
     def test_auto_detect_jj_uses_jj_show(self) -> None:
-        """When no diff is piped and a jj repo is detected, default to 'jj show @'."""
+        """Verify a detected jj repo with no piped diff defaults to 'jj show'."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
@@ -184,7 +217,7 @@ class TestMainWorkflow(unittest.TestCase):
             os.unlink(output_path)
 
     def test_jj_with_revision_uses_jj_show_rev(self) -> None:
-        """Using -j with a revision runs 'jj show REV' and records it as the source."""
+        """Verify using -j REV runs 'jj show REV' and records it as the source."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
@@ -207,7 +240,7 @@ class TestMainWorkflow(unittest.TestCase):
             os.unlink(output_path)
 
     def test_jj_without_revision_includes_diff_source(self) -> None:
-        """Using -j without a revision still includes 'jj show' as diff source."""
+        """Verify using -j without a revision includes 'jj show' as diff source."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             output_path = f.name
 
@@ -230,7 +263,7 @@ class TestMainWorkflow(unittest.TestCase):
             os.unlink(output_path)
 
     def test_clear_flag_discards_previous_review(self) -> None:
-        """The --clear flag discards a previous review and starts fresh."""
+        """Verify the --clear flag discards a previous review and starts fresh."""
         previous_hunks = neorev.parse_diff(TWO_HUNK_DIFF)
         previous_hunks[0].notes = [
             neorev.HunkNote(
@@ -269,7 +302,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
     """Workflow tests: all-clear review skips output file creation."""
 
     def test_all_approved_skips_file_and_prints_message(self) -> None:
-        """When all hunks are approved with no global notes, no file is written."""
+        """Verify approving all hunks with no global notes writes no file."""
 
         def script(state: neorev.ReviewState) -> None:
             """Approve all hunks."""
@@ -296,7 +329,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
                 os.unlink(output_path)
 
     def test_all_approved_with_global_note_writes_file(self) -> None:
-        """When all hunks are approved but a global note exists, file is written."""
+        """Verify approving all hunks with a global note writes a file."""
 
         def script(state: neorev.ReviewState) -> None:
             """Approve all hunks and add a global note."""
@@ -324,7 +357,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             os.unlink(output_path)
 
     def test_partial_approval_writes_file(self) -> None:
-        """When not all hunks are approved, file is written."""
+        """Verify a file is written when not all hunks are approved."""
 
         def script(state: neorev.ReviewState) -> None:
             """Approve only the first hunk."""
@@ -344,7 +377,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             os.unlink(output_path)
 
     def test_immediate_exit_skips_file(self) -> None:
-        """Exiting without approving or annotating anything writes no output."""
+        """Verify exiting without approving or annotating anything writes no output."""
 
         def script(state: neorev.ReviewState) -> None:
             """Do nothing — simulate an immediate exit."""

@@ -52,33 +52,33 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(hunks[1].file_path, "b.py")
 
     def test_empty_diff(self) -> None:
-        """Parsing an empty string produces no hunks."""
+        """Verify parsing an empty string produces no hunks."""
         self.assertEqual(neorev.parse_diff(""), [])
 
     def test_no_hunks(self) -> None:
-        """A diff header with no @@ lines yields no hunks."""
+        """Verify a diff header with no @@ lines yields no hunks."""
         diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n"
         self.assertEqual(neorev.parse_diff(diff), [])
 
     def test_short_location(self) -> None:
-        """Hunk.short_location returns 'file:line'."""
+        """Verify Hunk.short_location returns 'file:line'."""
         hunk = neorev.parse_diff(SIMPLE_DIFF)[0]
         self.assertEqual(hunk.short_location, "hello.py:1")
 
     def test_short_location_no_file(self) -> None:
-        """short_location falls back to range_line when file_path is absent."""
+        """Verify short_location falls back to range_line when file_path is absent."""
         hunk = make_hunk()
         hunk.file_path = None
         self.assertEqual(hunk.short_location, hunk.range_line.strip())
 
     def test_hunk_raw_includes_header(self) -> None:
-        """The raw field should include the file header and range line."""
+        """Verify the raw field should include the file header and range line."""
         hunk = neorev.parse_diff(SIMPLE_DIFF)[0]
         self.assertIn("diff --git", hunk.raw)
         self.assertIn("@@", hunk.raw)
 
     def test_file_path_strips_b_prefix(self) -> None:
-        """The b/ prefix is stripped from the +++ line."""
+        """Verify the b/ prefix is stripped from the +++ line."""
         diff = (
             "diff --git a/src/x.py b/src/x.py\n"
             "--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1,2 @@\n+line\n"
@@ -87,11 +87,11 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(hunks[0].file_path, "src/x.py")
 
     def test_binary_file_diff(self) -> None:
-        """A binary diff with no @@ lines produces no hunks."""
+        """Verify a binary diff with no @@ lines produces no hunks."""
         self.assertEqual(neorev.parse_diff(BINARY_DIFF), [])
 
     def test_new_file_mode_diff(self) -> None:
-        """A new-file diff parses the file_path, hunk, and ADDED status."""
+        """Verify a new-file diff parses the file_path, hunk, and ADDED status."""
         hunks = neorev.parse_diff(NEW_FILE_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].file_path, "new.py")
@@ -99,14 +99,14 @@ class TestParseDiff(unittest.TestCase):
         self.assertIs(hunks[0].file_status, neorev.FileStatus.ADDED)
 
     def test_delete_file_diff(self) -> None:
-        """A deleted-file diff resolves to its source path and DELETED status."""
+        """Verify a deleted-file diff resolves to its source path and DELETED."""
         hunks = neorev.parse_diff(DELETE_FILE_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].file_path, "old.py")
         self.assertIs(hunks[0].file_status, neorev.FileStatus.DELETED)
 
     def test_rename_file_diff(self) -> None:
-        """A renamed-file diff exposes the new path, the old path, and RENAMED."""
+        """Verify a renamed-file diff exposes the new path, old path, and RENAMED."""
         hunks = neorev.parse_diff(RENAME_FILE_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].file_path, "new.txt")
@@ -114,7 +114,7 @@ class TestParseDiff(unittest.TestCase):
         self.assertIs(hunks[0].file_status, neorev.FileStatus.RENAMED)
 
     def test_pure_rename_diff(self) -> None:
-        """A content-free move still yields one RENAMED hunk with both paths."""
+        """Verify a content-free move still yields one RENAMED hunk with both paths."""
         hunks = neorev.parse_diff(PURE_RENAME_DIFF)
         self.assertEqual(len(hunks), 1)
         hunk = hunks[0]
@@ -124,17 +124,17 @@ class TestParseDiff(unittest.TestCase):
         self.assertEqual(hunk.body, "")
 
     def test_rename_location_label(self) -> None:
-        """A rename's location label spells out the old and new paths."""
+        """Verify a rename's location label spells out the old and new paths."""
         hunk = neorev.parse_diff(PURE_RENAME_DIFF)[0]
         self.assertEqual(hunk.location_label, f"old.txt {neorev.RENAME_ARROW} new.txt")
 
     def test_modified_file_status(self) -> None:
-        """An ordinary edit is reported as MODIFIED."""
+        """Verify an ordinary edit is reported as MODIFIED."""
         hunks = neorev.parse_diff(SIMPLE_DIFF)
         self.assertIs(hunks[0].file_status, neorev.FileStatus.MODIFIED)
 
     def test_deleted_files_have_distinct_paths(self) -> None:
-        """Two deleted files keep their own paths instead of sharing /dev/null."""
+        """Verify two deleted files keep their paths instead of sharing /dev/null."""
         hunks = neorev.parse_diff(TWO_DELETED_FILES_DIFF)
         self.assertEqual([h.file_path for h in hunks], ["first.py", "second.py"])
         for hunk in hunks:
@@ -149,24 +149,24 @@ class TestParseDiff(unittest.TestCase):
             self.assertEqual(files.count(name), HUNKS_PER_FILE)
 
     def test_hunk_no_plus_in_range(self) -> None:
-        """A deletion-only range @@ -1,2 +0,0 @@ yields start_line 0."""
+        """Verify a deletion-only range @@ -1,2 +0,0 @@ yields start_line 0."""
         hunks = neorev.parse_diff(DELETE_FILE_DIFF)
         self.assertEqual(hunks[0].start_line, 0)
 
     def test_no_newline_marker_in_body(self) -> None:
-        """The 'No newline at end of file' marker is kept in the hunk body."""
+        """Verify the 'No newline at end of file' marker is kept in the hunk body."""
         hunks = neorev.parse_diff(NO_NEWLINE_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertIn("No newline at end of file", hunks[0].body)
 
     def test_range_line_with_context_label(self) -> None:
-        """A range line with a context label still parses start_line correctly."""
+        """Verify a range line with a context label still parses start_line."""
         hunks = neorev.parse_diff(CONTEXT_LABEL_DIFF)
         self.assertEqual(len(hunks), 1)
         self.assertEqual(hunks[0].start_line, 10)
 
     def test_short_location_deleted_omits_line(self) -> None:
-        """A deleted single-hunk file's location is just the path, without :0."""
+        """Verify a deleted single-hunk file's location is just the path, without :0."""
         hunk = neorev.parse_diff(DELETE_FILE_DIFF)[0]
         self.assertEqual(hunk.start_line, 0)
         self.assertEqual(hunk.short_location, "old.py")

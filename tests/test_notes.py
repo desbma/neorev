@@ -26,7 +26,7 @@ class TestNoteMutation(unittest.TestCase):
     """Tests for note mutation helpers."""
 
     def test_empty_edit_deletes_note(self) -> None:
-        """Upsert then remove on empty text verifies note is gone."""
+        """Verify removing an upserted note leaves the hunk with none."""
         target = neorev.HunkTarget()
         hunk = make_hunk()
         hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
@@ -95,7 +95,7 @@ class TestNoteAccessHelpers(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_upsert_note_insert(self) -> None:
-        """Upsert into an empty list appends a new note."""
+        """Verify upserting into an empty list appends a new note."""
         target = neorev.HunkTarget()
         hunk = make_hunk()
         hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
@@ -103,7 +103,7 @@ class TestNoteAccessHelpers(unittest.TestCase):
         self.assertEqual(hunk.notes[0].text, UPSERT_NOTE_TEXT)
 
     def test_upsert_note_update(self) -> None:
-        """Upsert on an existing target replaces the note."""
+        """Verify upserting on an existing target replaces the note."""
         target = neorev.HunkTarget()
         hunk = make_hunk()
         hunk.upsert_note(neorev.NoteKind.FLAG, target, UPSERT_NOTE_TEXT)
@@ -126,7 +126,7 @@ class TestNoteAccessHelpers(unittest.TestCase):
         self.assertEqual(len(hunk.notes), 0)
 
     def test_remove_note_absent(self) -> None:
-        """Remove on a missing target leaves the list unchanged."""
+        """Verify removing a missing target leaves the list unchanged."""
         target = neorev.HunkTarget()
         other = neorev.LineTarget(
             side=neorev.LineSide.ADDED, line_number=ADDED_LINE_NUMBER
@@ -182,12 +182,12 @@ class TestHunkStatusHelpers(unittest.TestCase):
         self.assertIsNone(hunk.summary_status)
 
     def test_hunk_is_handled_approved(self) -> None:
-        """An approved hunk is handled."""
+        """Verify an approved hunk is handled."""
         hunk = make_hunk(approved=True)
         self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_handled_with_notes(self) -> None:
-        """A hunk with notes is handled."""
+        """Verify a hunk with notes is handled."""
         hunk = make_hunk(
             notes=[
                 neorev.HunkNote(
@@ -200,12 +200,12 @@ class TestHunkStatusHelpers(unittest.TestCase):
         self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_handled_with_status(self) -> None:
-        """A hunk with a legacy status is handled."""
+        """Verify a hunk with a legacy status is handled."""
         hunk = make_hunk(status=neorev.Status.FLAG)
         self.assertTrue(hunk.is_handled)
 
     def test_hunk_is_not_handled(self) -> None:
-        """A bare hunk with no status, notes, or approval is not handled."""
+        """Verify a bare hunk with no status, notes, or approval is not handled."""
         hunk = make_hunk()
         self.assertFalse(hunk.is_handled)
 
@@ -214,159 +214,159 @@ class TestNotePreviewText(unittest.TestCase):
     """Tests for note_preview_text."""
 
     def test_single_line(self) -> None:
-        """A single line is returned as-is."""
+        """Verify a single line is returned as-is."""
         self.assertEqual(neorev.note_preview_text("hello world"), "hello world")
 
     def test_empty_string(self) -> None:
-        """An empty string returns empty."""
+        """Verify an empty string returns empty."""
         self.assertEqual(neorev.note_preview_text(""), "")
 
     def test_only_whitespace(self) -> None:
-        """Whitespace-only input returns empty."""
+        """Verify whitespace-only input returns empty."""
         self.assertEqual(neorev.note_preview_text("   \n\n  "), "")
 
     def test_newline_adds_interpunct(self) -> None:
-        """Lines without trailing punctuation are joined with interpunct."""
+        """Verify lines without trailing punctuation are joined with interpunct."""
         self.assertEqual(
             neorev.note_preview_text("fix the bug\nalso rename it"),
             "fix the bug · also rename it",
         )
 
     def test_newline_after_period(self) -> None:
-        """A line ending with a period is joined with a plain space."""
+        """Verify a line ending with a period is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("fix the bug.\nalso rename it"),
             "fix the bug. also rename it",
         )
 
     def test_newline_after_exclamation(self) -> None:
-        """A line ending with an exclamation mark is joined with a plain space."""
+        """Verify a line ending with an exclamation mark is joined with a space."""
         self.assertEqual(
             neorev.note_preview_text("done!\nnext step"),
             "done! next step",
         )
 
     def test_newline_after_question_mark(self) -> None:
-        """A line ending with a question mark is joined with a plain space."""
+        """Verify a line ending with a question mark is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("why?\nbecause"),
             "why? because",
         )
 
     def test_newline_after_comma(self) -> None:
-        """A line ending with a comma is joined with a plain space."""
+        """Verify a line ending with a comma is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("first,\nsecond"),
             "first, second",
         )
 
     def test_newline_after_semicolon(self) -> None:
-        """A line ending with a semicolon is joined with a plain space."""
+        """Verify a line ending with a semicolon is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("a;\nb"),
             "a; b",
         )
 
     def test_newline_after_colon(self) -> None:
-        """A line ending with a colon is joined with a plain space."""
+        """Verify a line ending with a colon is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("note:\ndetails"),
             "note: details",
         )
 
     def test_newline_after_ellipsis(self) -> None:
-        """A line ending with an ellipsis is joined with a plain space."""
+        """Verify a line ending with an ellipsis is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("wait…\nmore"),
             "wait… more",
         )
 
     def test_newline_after_closing_paren(self) -> None:
-        """A line ending with a closing parenthesis is joined with a plain space."""
+        """Verify a line ending with a closing parenthesis is joined with a space."""
         self.assertEqual(
             neorev.note_preview_text("(done)\nnext"),
             "(done) next",
         )
 
     def test_newline_after_closing_bracket(self) -> None:
-        """A line ending with a closing bracket is joined with a plain space."""
+        """Verify a line ending with a closing bracket is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("[ref]\nsee"),
             "[ref] see",
         )
 
     def test_newline_after_quote(self) -> None:
-        """A line ending with a quote mark is joined with a plain space."""
+        """Verify a line ending with a quote mark is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text('said "hi"\nthen left'),
             'said "hi" then left',
         )
 
     def test_newline_after_em_dash(self) -> None:
-        """A line ending with an em dash is joined with a plain space."""
+        """Verify a line ending with an em dash is joined with a plain space."""
         self.assertEqual(
             neorev.note_preview_text("wait—\nmore"),
             "wait— more",
         )
 
     def test_consecutive_newlines(self) -> None:
-        """Multiple consecutive newlines produce a single interpunct."""
+        """Verify multiple consecutive newlines produce a single interpunct."""
         self.assertEqual(
             neorev.note_preview_text("a\n\n\nb"),
             "a · b",
         )
 
     def test_consecutive_newlines_after_punctuation(self) -> None:
-        """Multiple consecutive newlines after punctuation produce a single space."""
+        """Verify consecutive newlines after punctuation produce a single space."""
         self.assertEqual(
             neorev.note_preview_text("end.\n\n\nstart"),
             "end. start",
         )
 
     def test_no_double_spaces(self) -> None:
-        """Internal double spaces are collapsed to one."""
+        """Verify internal double spaces are collapsed to one."""
         self.assertEqual(
             neorev.note_preview_text("a  b"),
             "a b",
         )
 
     def test_tabs_collapsed(self) -> None:
-        """Tab characters are collapsed to a single space."""
+        """Verify tab characters are collapsed to a single space."""
         self.assertEqual(
             neorev.note_preview_text("a\t\tb"),
             "a b",
         )
 
     def test_unicode_spaces_collapsed(self) -> None:
-        """Various unicode whitespace chars are collapsed to a single space."""
+        """Verify various unicode whitespace chars are collapsed to a single space."""
         self.assertEqual(
             neorev.note_preview_text("a\u00a0\u2000\u3000b"),
             "a b",
         )
 
     def test_mixed_punctuated_and_unpunctuated_lines(self) -> None:
-        """Mixed lines get interpunct only where needed."""
+        """Verify mixed lines get interpunct only where needed."""
         self.assertEqual(
             neorev.note_preview_text("done.\nnext\nalso this"),
             "done. next · also this",
         )
 
     def test_leading_trailing_whitespace_stripped(self) -> None:
-        """Leading and trailing whitespace is stripped from the result."""
+        """Verify leading and trailing whitespace is stripped from the result."""
         self.assertEqual(
             neorev.note_preview_text("  hello  \n  world  "),
             "hello · world",
         )
 
     def test_trailing_newline(self) -> None:
-        """A trailing newline does not produce a trailing interpunct."""
+        """Verify a trailing newline does not produce a trailing interpunct."""
         self.assertEqual(
             neorev.note_preview_text("hello\n"),
             "hello",
         )
 
     def test_leading_newline(self) -> None:
-        """A leading newline does not produce a leading interpunct."""
+        """Verify a leading newline does not produce a leading interpunct."""
         self.assertEqual(
             neorev.note_preview_text("\nhello"),
             "hello",
@@ -389,12 +389,12 @@ class TestNoteAnchor(unittest.TestCase):
         return str(Path(self.tmpdir.name) / name)
 
     def test_compute_note_anchor_format(self) -> None:
-        """Anchor strings are an 11-character urlsafe base64 digest."""
+        """Verify anchor strings are an 11-character urlsafe base64 digest."""
         anchor = neorev.compute_note_anchor("body", neorev.HunkTarget())
         self.assertRegex(anchor, r"^[A-Za-z0-9_-]{11}$")
 
     def test_compute_note_anchor_changes_with_body(self) -> None:
-        """Different hunk bodies produce different anchors for the same target."""
+        """Verify different bodies produce different anchors for the same target."""
         target = neorev.HunkTarget()
         self.assertNotEqual(
             neorev.compute_note_anchor("body one", target),
@@ -402,7 +402,7 @@ class TestNoteAnchor(unittest.TestCase):
         )
 
     def test_compute_note_anchor_changes_with_target(self) -> None:
-        """Different targets produce different anchors for the same body."""
+        """Verify different targets produce different anchors for the same body."""
         body = ANCHOR_BODY_ORIGINAL
         line_anchor = neorev.compute_note_anchor(
             body,
@@ -412,7 +412,7 @@ class TestNoteAnchor(unittest.TestCase):
         self.assertNotEqual(line_anchor, hunk_anchor)
 
     def test_format_output_contains_anchor_comment(self) -> None:
-        """Freshly written review output contains a note-anchor comment."""
+        """Verify freshly written review output contains a note-anchor comment."""
         hunk = make_hunk(
             file_path="a.py",
             body=ANCHOR_BODY_ORIGINAL,
@@ -424,7 +424,7 @@ class TestNoteAnchor(unittest.TestCase):
         self.assertRegex(output, r"<!-- neorev: note-anchor=[A-Za-z0-9_-]{11} -->")
 
     def test_resume_identical_diff_restores_note(self) -> None:
-        """Resume on identical diff: anchored note is restored."""
+        """Verify an anchored note is restored on resuming an identical diff."""
         hunk = make_hunk(
             file_path="a.py",
             body=ANCHOR_BODY_ORIGINAL,
@@ -447,7 +447,7 @@ class TestNoteAnchor(unittest.TestCase):
         self.assertEqual(fresh.notes[0].text, ANCHOR_NOTE_TEXT)
 
     def test_resume_changed_body_invalidates_note(self) -> None:
-        """Same file/range/target but a changed hunk body drops the note."""
+        """Verify same file/range/target but a changed hunk body drops the note."""
         original = make_hunk(
             file_path="a.py",
             body=ANCHOR_BODY_ORIGINAL,
@@ -470,7 +470,7 @@ class TestNoteAnchor(unittest.TestCase):
         self.assertEqual(changed.notes, [])
 
     def test_resume_missing_line_target_invalidates_note(self) -> None:
-        """A line-target note whose line no longer exists is dropped."""
+        """Verify a line-target note whose line no longer exists is dropped."""
         target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=2)
         original = make_hunk(
             file_path="a.py",
@@ -499,9 +499,9 @@ class TestNoteAnchor(unittest.TestCase):
         self.assertEqual(shrunk.notes, [])
 
     def test_unanchored_review_is_treated_as_anchor_mismatch(self) -> None:
-        """A review file without an anchor is dropped like a hash mismatch."""
+        """Verify a review file without an anchor is dropped like a hash mismatch."""
         unanchored_content = (
-            "### [CHANGE REQUESTED] `a.py @ hunk`\n\n"
+            "### [REVIEW CHANGE REQUESTED] `a.py @ hunk`\n\n"
             "```diff\n"
             f"{ANCHOR_RANGE_LINE}\n"
             "+first\n"
@@ -533,7 +533,7 @@ class TestApprovedHashes(unittest.TestCase):
     """Tests for encode_approved_hashes / decode_approved_hashes round-trip."""
 
     def test_round_trip_mixed(self) -> None:
-        """Encoding then decoding recovers exactly the approved hunks."""
+        """Verify encoding then decoding recovers exactly the approved hunks."""
         hunks = [
             make_hunk(file_path="a.py", body="+line a", status=neorev.Status.APPROVED),
             make_hunk(file_path="b.py", body="+line b"),
@@ -545,7 +545,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertEqual(result, approved_ids)
 
     def test_all_approved(self) -> None:
-        """All-approved set round-trips correctly."""
+        """Verify all-approved set round-trips correctly."""
         hunks = [
             make_hunk(
                 file_path=f"f{i}.py",
@@ -559,19 +559,19 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertEqual(len(result), MANY_APPROVED_COUNT)
 
     def test_none_approved(self) -> None:
-        """No approved hunks produce an empty encoded string."""
+        """Verify no approved hunks produce an empty encoded string."""
         hunks = [make_hunk(file_path="a.py", body="+x")]
         encoded = neorev.encode_approved_hashes(hunks)
         result = neorev.decode_approved_hashes(encoded)
         self.assertEqual(result, set())
 
     def test_empty_hunks(self) -> None:
-        """Empty hunk list encodes and decodes to empty set."""
+        """Verify empty hunk list encodes and decodes to empty set."""
         encoded = neorev.encode_approved_hashes([])
         self.assertEqual(neorev.decode_approved_hashes(encoded), set())
 
     def test_single_approved(self) -> None:
-        """Single approved hunk round-trips."""
+        """Verify single approved hunk round-trips."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
         encoded = neorev.encode_approved_hashes(hunks)
         result = neorev.decode_approved_hashes(encoded)
@@ -579,7 +579,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertIn(neorev.hunk_identity_hash(hunks[0]), result)
 
     def test_changed_body_invalidates_approval(self) -> None:
-        """A hunk whose body changed does not match the saved hash."""
+        """Verify a hunk whose body changed does not match the saved hash."""
         original = make_hunk(
             file_path="f.py",
             body="+old line",
@@ -591,7 +591,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertNotIn(neorev.hunk_identity_hash(modified), result)
 
     def test_changed_file_path_invalidates_approval(self) -> None:
-        """A hunk whose file path changed does not match the saved hash."""
+        """Verify a hunk whose file path changed does not match the saved hash."""
         original = make_hunk(
             file_path="old.py",
             body="+same",
@@ -603,7 +603,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertNotIn(neorev.hunk_identity_hash(moved), result)
 
     def test_changed_range_line_invalidates_approval(self) -> None:
-        """A hunk whose range line changed does not match the saved hash."""
+        """Verify a hunk whose range line changed does not match the saved hash."""
         original = make_hunk(
             file_path="f.py",
             body="+same",
@@ -620,11 +620,11 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertNotIn(neorev.hunk_identity_hash(shifted), result)
 
     def test_invalid_base64(self) -> None:
-        """Invalid base64 returns empty set."""
+        """Verify invalid base64 returns empty set."""
         self.assertEqual(neorev.decode_approved_hashes("!!!bad"), set())
 
     def test_truncated_hash_bytes(self) -> None:
-        """Non-multiple-of-digest-size base64 returns empty set."""
+        """Verify non-multiple-of-digest-size base64 returns empty set."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
         encoded = neorev.encode_approved_hashes(hunks)
         raw = base64.b64decode(encoded)
@@ -632,7 +632,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertEqual(neorev.decode_approved_hashes(truncated), set())
 
     def test_shifted_hash_bytes(self) -> None:
-        """Prepending a byte shifts all hashes, invalidating every entry."""
+        """Verify prepending a byte shifts all hashes, invalidating every entry."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
         encoded = neorev.encode_approved_hashes(hunks)
         raw = base64.b64decode(encoded)
@@ -641,7 +641,7 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertNotIn(neorev.hunk_identity_hash(hunks[0]), result)
 
     def test_extra_hash_bytes_appended(self) -> None:
-        """Extra digest-sized bytes add a spurious hash; originals survive."""
+        """Verify extra digest-sized bytes add a spurious hash; originals survive."""
         hunks = [make_hunk(status=neorev.Status.APPROVED)]
         encoded = neorev.encode_approved_hashes(hunks)
         raw = base64.b64decode(encoded)
@@ -652,11 +652,11 @@ class TestApprovedHashes(unittest.TestCase):
         self.assertIn(neorev.hunk_identity_hash(hunks[0]), result)
 
     def test_empty_string_returns_empty_set(self) -> None:
-        """An empty encoded string decodes to an empty set."""
+        """Verify an empty encoded string decodes to an empty set."""
         self.assertEqual(neorev.decode_approved_hashes(""), set())
 
     def test_identity_hash_deterministic(self) -> None:
-        """The same hunk always produces the same identity hash."""
+        """Verify the same hunk always produces the same identity hash."""
         hunk = make_hunk(file_path="f.py", body="+x")
         self.assertEqual(
             neorev.hunk_identity_hash(hunk),
@@ -664,7 +664,7 @@ class TestApprovedHashes(unittest.TestCase):
         )
 
     def test_identity_hash_differs_for_different_hunks(self) -> None:
-        """Two hunks with different content produce different hashes."""
+        """Verify two hunks with different content produce different hashes."""
         h1 = make_hunk(file_path="f.py", body="+a")
         h2 = make_hunk(file_path="f.py", body="+b")
         self.assertNotEqual(
@@ -677,7 +677,7 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
     """Tests for build_managed_note_refs."""
 
     def test_line_notes_appear_in_refs(self) -> None:
-        """Line notes on the current hunk appear in managed note refs."""
+        """Verify line notes on the current hunk appear in managed note refs."""
         line_target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=42)
         line_note = neorev.HunkNote(
             kind=neorev.NoteKind.FLAG,
@@ -693,7 +693,7 @@ class TestBuildManagedNoteRefs(unittest.TestCase):
         self.assertIn("+42", refs[0].scope_label)
 
     def test_line_notes_from_all_hunks_appear(self) -> None:
-        """Line notes from non-current hunks also appear in managed note refs."""
+        """Verify line notes from non-current hunks also appear in managed note refs."""
         line_target = neorev.LineTarget(side=neorev.LineSide.ADDED, line_number=10)
         note_other = neorev.HunkNote(
             kind=neorev.NoteKind.QUESTION,
@@ -717,29 +717,29 @@ class TestNavigation(unittest.TestCase):
         self.state = neorev.ReviewState(hunks=self.hunks, global_notes=[])
 
     def test_navigate_down(self) -> None:
-        """'j' moves to the next hunk."""
+        """Verify 'j' moves to the next hunk."""
         self.assertTrue(self.state.navigate("j"))
         self.assertEqual(self.state.current_index, 1)
 
     def test_navigate_up(self) -> None:
-        """'k' moves to the previous hunk."""
+        """Verify 'k' moves to the previous hunk."""
         self.state.current_index = 2
         self.assertTrue(self.state.navigate("k"))
         self.assertEqual(self.state.current_index, 1)
 
     def test_navigate_down_at_end(self) -> None:
-        """'j' at the last hunk does nothing."""
+        """Verify 'j' at the last hunk does nothing."""
         self.state.current_index = 2
         self.assertFalse(self.state.navigate("j"))
         self.assertEqual(self.state.current_index, 2)
 
     def test_navigate_up_at_start(self) -> None:
-        """'k' at the first hunk does nothing."""
+        """Verify 'k' at the first hunk does nothing."""
         self.assertFalse(self.state.navigate("k"))
         self.assertEqual(self.state.current_index, 0)
 
     def test_arrow_keys(self) -> None:
-        """Arrow key names work like j/k."""
+        """Verify arrow key names work like j/k."""
         with self.subTest(key="down"):
             self.state.current_index = 0
             self.state.navigate("down")
@@ -750,7 +750,7 @@ class TestNavigation(unittest.TestCase):
             self.assertEqual(self.state.current_index, 0)
 
     def test_approve_toggle(self) -> None:
-        """Approving then re-approving toggles the approved flag."""
+        """Verify approving then re-approving toggles the approved flag."""
         self.state.approve()
         self.assertTrue(self.hunks[0].approved)
         self.state.current_index = 0
@@ -758,7 +758,7 @@ class TestNavigation(unittest.TestCase):
         self.assertFalse(self.hunks[0].approved)
 
     def test_approve_ignores_hunk_with_hunk_note(self) -> None:
-        """Approving a hunk that has a hunk-level note has no effect."""
+        """Verify approving a hunk that has a hunk-level note has no effect."""
         self.hunks[0].notes = [
             neorev.HunkNote(
                 kind=neorev.NoteKind.FLAG,
@@ -771,7 +771,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(len(self.hunks[0].notes), 1)
 
     def test_approve_ignores_hunk_with_line_note(self) -> None:
-        """Approving a hunk that has a line-level note has no effect."""
+        """Verify approving a hunk that has a line-level note has no effect."""
         self.hunks[0].notes = [
             neorev.HunkNote(
                 kind=neorev.NoteKind.QUESTION,
@@ -784,20 +784,20 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(len(self.hunks[0].notes), 1)
 
     def test_approve_advances_to_next_unhandled(self) -> None:
-        """After approval, cursor moves to the next unhandled hunk."""
+        """Verify after approval, cursor moves to the next unhandled hunk."""
         self.hunks[1].approved = True
         self.state.approve()
         self.assertEqual(self.state.current_index, 2)
 
     def test_approve_resets_scroll_offset(self) -> None:
-        """Approving a hunk and advancing resets the scroll position."""
+        """Verify approving a hunk and advancing resets the scroll position."""
         self.state.scroll_offset = 42
         self.state.approve()
         self.assertEqual(self.state.current_index, 1)
         self.assertEqual(self.state.scroll_offset, 0)
 
     def test_approve_without_advance_keeps_scroll_offset(self) -> None:
-        """Un-approving (toggle off) does not move, so scroll is preserved."""
+        """Verify un-approving (toggle off) does not move, so scroll is preserved."""
         self.hunks[0].approved = True
         self.state.scroll_offset = 17
         self.state.approve()
@@ -806,7 +806,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(self.state.scroll_offset, 17)
 
     def test_approve_file(self) -> None:
-        """Approve-file approves all hunks with the same file_path."""
+        """Verify approve-file approves all hunks with the same file_path."""
         for h in self.hunks:
             h.file_path = "same.py"
         self.state.approve_file()
@@ -814,7 +814,7 @@ class TestNavigation(unittest.TestCase):
             self.assertTrue(h.approved)
 
     def test_approve_file_resets_scroll_offset(self) -> None:
-        """Approve-file advances to the next unhandled hunk and resets scroll."""
+        """Verify approve-file advances to the next unhandled hunk and resets scroll."""
         self.hunks[0].file_path = "a.py"
         self.hunks[1].file_path = "a.py"
         self.hunks[2].file_path = "b.py"
@@ -824,7 +824,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(self.state.scroll_offset, 0)
 
     def test_approve_file_skips_other_files(self) -> None:
-        """Approve-file only touches hunks matching the current file."""
+        """Verify approve-file only touches hunks matching the current file."""
         self.hunks[0].file_path = "a.py"
         self.hunks[1].file_path = "b.py"
         self.hunks[2].file_path = "a.py"
@@ -834,7 +834,7 @@ class TestNavigation(unittest.TestCase):
         self.assertTrue(self.hunks[2].approved)
 
     def test_approve_file_skips_hunks_with_notes(self) -> None:
-        """Approve-file only approves hunks that have no notes."""
+        """Verify approve-file only approves hunks that have no notes."""
         for h in self.hunks:
             h.file_path = "same.py"
         self.hunks[1].notes = [
@@ -859,39 +859,39 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(len(self.hunks[2].notes), 1)
 
     def test_find_next_unhandled_wraps(self) -> None:
-        """find_next_unhandled wraps around the list."""
+        """Verify find_next_unhandled wraps around the list."""
         self.hunks[1].approved = True
         self.hunks[2].approved = True
         self.state.current_index = 2
         self.assertEqual(self.state.find_next_unhandled(), 0)
 
     def test_find_next_unhandled_all_handled(self) -> None:
-        """When all hunks are handled, returns current index."""
+        """Verify current index is returned when all hunks are handled."""
         for h in self.hunks:
             h.approved = True
         self.state.current_index = 1
         self.assertEqual(self.state.find_next_unhandled(), 1)
 
     def test_find_initial_hunk_index(self) -> None:
-        """initial_index returns the first unhandled hunk."""
+        """Verify initial_index returns the first unhandled hunk."""
         self.hunks[0].approved = True
         self.assertEqual(neorev.ReviewState.initial_index(self.hunks), 1)
 
     def test_find_initial_all_handled(self) -> None:
-        """When all hunks are handled, returns 0."""
+        """Verify 0 is returned when all hunks are handled."""
         for h in self.hunks:
             h.approved = True
         self.assertEqual(neorev.ReviewState.initial_index(self.hunks), 0)
 
     def test_navigate_single_hunk(self) -> None:
-        """With a single hunk, both j and k return False."""
+        """Verify with a single hunk, both j and k return False."""
         state = neorev.ReviewState(hunks=[make_hunk()], global_notes=[])
         self.assertFalse(state.navigate("j"))
         self.assertFalse(state.navigate("k"))
         self.assertEqual(state.current_index, 0)
 
     def test_approve_already_flagged_hunk_has_no_effect(self) -> None:
-        """Approving a flagged hunk has no effect — notes protect the hunk."""
+        """Verify approving a flagged hunk has no effect — notes protect the hunk."""
         self.hunks[0].notes = [
             neorev.HunkNote(
                 kind=neorev.NoteKind.FLAG, target=neorev.HunkTarget(), text="fix this"
@@ -902,7 +902,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(len(self.hunks[0].notes), 1)
 
     def test_approve_file_idempotent_on_approved(self) -> None:
-        """Approve-file on already-approved hunks keeps them approved."""
+        """Verify approve-file on already-approved hunks keeps them approved."""
         for h in self.hunks:
             h.file_path = "same.py"
             h.approved = True
@@ -911,7 +911,7 @@ class TestNavigation(unittest.TestCase):
             self.assertTrue(h.approved)
 
     def test_approve_file_advances_to_other_file(self) -> None:
-        """After approve-file, cursor moves to next unhandled hunk in another file."""
+        """Verify after approve-file, cursor moves to next hunk in another file."""
         self.hunks[0].file_path = "a.py"
         self.hunks[1].file_path = "a.py"
         self.hunks[2].file_path = "b.py"
@@ -919,7 +919,7 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(self.state.current_index, 2)
 
     def test_find_next_unhandled_single_unhandled(self) -> None:
-        """With one unhandled hunk, it is always found regardless of position."""
+        """Verify with one unhandled hunk, it is always found regardless of position."""
         self.hunks[0].approved = True
         self.hunks[1].approved = True
         for start in range(3):
