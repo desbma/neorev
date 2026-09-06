@@ -480,11 +480,7 @@ class TestProgressMarkersTinyWidth(unittest.TestCase):
 
     def test_very_narrow_returns_empty(self) -> None:
         """Verify extremely narrow terminals produce an empty marker line."""
-        hunks = [
-            neorev.Hunk(
-                file_header="", range_line="", body="", raw="", file_path="f.py"
-            )
-        ]
+        hunks = [neorev.Hunk(range_line="", body="", raw="", file_path="f.py")]
         # prefix_width=2, so available < MARKER_WIDTH
         too_narrow = neorev.MARKER_WIDTH + 1
         result = neorev.build_progress_markers(hunks, 0, too_narrow)
@@ -492,11 +488,7 @@ class TestProgressMarkersTinyWidth(unittest.TestCase):
 
     def test_marker_width_boundary(self) -> None:
         """Verify widths exactly fitting one marker still produce output."""
-        hunks = [
-            neorev.Hunk(
-                file_header="", range_line="", body="", raw="", file_path="f.py"
-            )
-        ]
+        hunks = [neorev.Hunk(range_line="", body="", raw="", file_path="f.py")]
         min_working_width = neorev.MARKER_WIDTH + 2  # prefix_width = 2
         result = neorev.build_progress_markers(hunks, 0, min_working_width)
         self.assertNotEqual(result, "")
@@ -1601,16 +1593,7 @@ class TestLinePickerScrollFollowsCursor(unittest.TestCase):
         """Verify moving the cursor down keeps it within the visible viewport."""
         body = "\n".join(f"+line {i}" for i in range(LINE_PICKER_MANY_LINES))
         range_line = f"@@ -0,0 +1,{LINE_PICKER_MANY_LINES} @@"
-        raw = f"diff --git a/test.py b/test.py\n{range_line}\n{body}"
-        hunk = neorev.Hunk(
-            file_header="diff --git a/test.py b/test.py",
-            range_line=range_line,
-            body=body,
-            raw=raw,
-            file_path="test.py",
-            start_line=1,
-            display_lines=neorev.parse_display_lines(range_line, body),
-        )
+        hunk = make_hunk(range_line=range_line, body=body)
         state = neorev.ReviewState(hunks=[hunk], global_notes=[])
         selectable = [dl for dl in hunk.display_lines if dl.target is not None]
         delta_output = neorev.render_through_delta(hunk.raw, width=self.term.width)

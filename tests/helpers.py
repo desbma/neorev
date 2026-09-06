@@ -29,6 +29,12 @@ sys.modules["neorev"] = neorev
 NEOREV_LOADER.exec_module(neorev)
 
 ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Fixtures spell out range lines loosely; only their start offsets are read back.
+FIXTURE_RANGE_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,\d+)? \+(?P<new>\d+)(?:,\d+)? @@")
+FIXTURE_DIFF_HEADER = "diff --git a/f b/f\n--- a/f\n+++ b/f\n"
+ADDED_LINE_PREFIX = "+"
+REMOVED_LINE_PREFIX = "-"
+META_LINE_PREFIX = "\\"
 TERM_WIDTH = 80
 TERM_HEIGHT = 24
 TERM_PIXEL_SIZE = 0  # pixel dimensions unused by tests
@@ -117,7 +123,7 @@ diff --git a/new.py b/new.py
 new file mode 100644
 --- /dev/null
 +++ b/new.py
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,2 @@
 +def hello():
 +    pass
 """
@@ -182,7 +188,7 @@ CONTEXT_LABEL_DIFF = """\
 diff --git a/f.py b/f.py
 --- a/f.py
 +++ b/f.py
-@@ -10,3 +10,4 @@ def foo():
+@@ -10 +10,2 @@ def foo():
      pass
 +    return 0
 """
@@ -191,28 +197,28 @@ MULTI_FILE_MULTI_HUNK_DIFF = """\
 diff --git a/a.py b/a.py
 --- a/a.py
 +++ b/a.py
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  x = 1
 +y = 2
-@@ -10,2 +11,3 @@
+@@ -10 +11,2 @@
  z = 3
 +w = 4
 diff --git a/b.py b/b.py
 --- a/b.py
 +++ b/b.py
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  a = 1
 +b = 2
-@@ -20,2 +21,3 @@
+@@ -20 +21,2 @@
  c = 3
 +d = 4
 diff --git a/c.py b/c.py
 --- a/c.py
 +++ b/c.py
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  e = 1
 +f = 2
-@@ -30,2 +31,3 @@
+@@ -30 +31,2 @@
  g = 3
 +h = 4
 """
@@ -234,7 +240,7 @@ INDENTED_FENCE_BODY_DIFF = """\
 diff --git a/indented.md b/indented.md
 --- a/indented.md
 +++ b/indented.md
-@@ -1,4 +1,4 @@
+@@ -1,5 +1,5 @@
  1. Run this:
 
        ```bash
@@ -260,7 +266,7 @@ HEADING_BODY_DIFF = """\
 diff --git a/doc.md b/doc.md
 --- a/doc.md
 +++ b/doc.md
-@@ -1,3 +1,3 @@
+@@ -1,2 +1,2 @@
  ### Section
 -old
 +new
@@ -286,23 +292,22 @@ diff --git a/hello.py b/hello.py
 +import os
 
  def main():
-@@ -10,3 +11,4 @@
+@@ -10 +11,2 @@
      pass
 +    return 0
-
 """
 
 TWO_FILE_DIFF = """\
 diff --git a/a.py b/a.py
 --- a/a.py
 +++ b/a.py
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  x = 1
 +y = 2
 diff --git a/b.py b/b.py
 --- a/b.py
 +++ b/b.py
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  a = 1
 +b = 2
 """
@@ -311,7 +316,7 @@ GLOBAL_PATH_DIFF = """\
 diff --git a/global b/global
 --- a/global
 +++ b/global
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  x = 1
 +y = 2
 """
@@ -320,13 +325,7 @@ SEPARATOR_PATH_DIFF = """\
 diff --git a/d @ r.py b/d @ r.py
 --- a/d @ r.py
 +++ b/d @ r.py
-@@ -1,2 +1,3 @@
- x = 1
-+y = 2
-"""
-
-HEADERLESS_DIFF = """\
-@@ -1,2 +1,3 @@
+@@ -1 +1,2 @@
  x = 1
 +y = 2
 """
@@ -335,10 +334,105 @@ CRLF_DIFF = (
     "diff --git a/crlf.py b/crlf.py\r\n"
     "--- a/crlf.py\r\n"
     "+++ b/crlf.py\r\n"
-    "@@ -1,2 +1,3 @@\r\n"
+    "@@ -1 +1,2 @@\r\n"
     " x = 1\r\n"
     "+y = 2\r\n"
 )
+
+# GNU 'diff -u' output: file markers with no 'diff --git' line before them.
+NO_GIT_HEADER_DIFF = """\
+--- old/a.txt
++++ new/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++two modified
+ three
+"""
+
+# GNU 'diff -ur' output: file markers carrying a tab-separated timestamp.
+TIMESTAMPED_DIFF = (
+    "diff -ur old/a.txt new/a.txt\n"
+    "--- old/a.txt\t2026-01-01 00:00:00.000000000 +0000\n"
+    "+++ new/a.txt\t2026-01-01 00:00:00.000000000 +0000\n"
+    "@@ -1,3 +1,3 @@\n"
+    " one\n"
+    "-two\n"
+    "+two modified\n"
+    " three\n"
+)
+
+# Git quotes a path holding non-ASCII bytes, escaping them octally.
+QUOTED_PATH_NAME = "caf\\303\\251 menu.txt"
+QUOTED_PATH_DIFF = (
+    f'diff --git "a/{QUOTED_PATH_NAME}" "b/{QUOTED_PATH_NAME}"\n'
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    f'+++ "b/{QUOTED_PATH_NAME}"\n'
+    "@@ -0,0 +1 @@\n"
+    "+starter\n"
+)
+
+# A diff whose text carries a blank line past the end of its last hunk.
+TRAILING_BLANK_DIFF = """\
+diff --git a/f.py b/f.py
+--- a/f.py
++++ b/f.py
+@@ -1 +1 @@
+-old
++new
+
+"""
+
+# Emptying a tracked file: both markers name it, and the target side is empty.
+EMPTIED_FILE_DIFF = """\
+diff --git a/f.py b/f.py
+--- a/f.py
++++ b/f.py
+@@ -1 +0,0 @@
+-content
+"""
+
+# An edit to a file whose own name spells out git's rename extended header.
+RENAME_PHRASE_PATH = "rename from x"
+RENAME_PHRASE_DIFF = (
+    f"diff --git a/{RENAME_PHRASE_PATH} b/{RENAME_PHRASE_PATH}\n"
+    f"--- a/{RENAME_PHRASE_PATH}\n"
+    f"+++ b/{RENAME_PHRASE_PATH}\n"
+    "@@ -1 +1 @@\n"
+    "-old\n"
+    "+new\n"
+)
+
+# 'difflib.unified_diff' called without filenames: markers present, names empty.
+UNNAMED_PATH_DIFF = "--- \n+++ \n@@ -1 +1 @@\n-old\n+new\n"
+
+# GNU diff's standalone binary notice, carrying no target marker.
+STANDALONE_BINARY_DIFF = "Binary file image.bin has changed\n"
+
+
+def hunk_line_counts(body: str) -> tuple[int, int]:
+    """Count the source and target lines *body* holds."""
+    source = target = 0
+    for line in body.splitlines():
+        if line.startswith(META_LINE_PREFIX):
+            continue
+        source += not line.startswith(ADDED_LINE_PREFIX)
+        target += not line.startswith(REMOVED_LINE_PREFIX)
+    return source, target
+
+
+def parse_display_lines(range_line: str, body: str) -> list[neorev.DisplayLine]:
+    """Build the display lines of a hunk fixture, fixing up its range counts."""
+    match = FIXTURE_RANGE_RE.match(range_line)
+    if match is None:
+        return []
+    source, target = hunk_line_counts(body)
+    diff = (
+        f"{FIXTURE_DIFF_HEADER}"
+        f"@@ -{match['old']},{source} +{match['new']},{target} @@\n{body}\n"
+    )
+    return neorev.parse_diff(diff)[0].display_lines
 
 
 def make_hunk(  # noqa: PLR0913
@@ -356,13 +450,12 @@ def make_hunk(  # noqa: PLR0913
     if not range_line:
         range_line = f"@@ -1,3 +{start_line},4 @@"
     hunk = neorev.Hunk(
-        file_header=f"diff --git a/{file_path} b/{file_path}",
         range_line=range_line,
         body=body,
         raw=f"diff --git a/{file_path} b/{file_path}\n{range_line}\n{body}",
         file_path=file_path,
         start_line=start_line,
-        display_lines=neorev.parse_display_lines(range_line, body),
+        display_lines=parse_display_lines(range_line, body),
     )
     if status == neorev.Status.APPROVED:
         hunk.approved = True
@@ -423,7 +516,6 @@ HUNK_IDENTITY_DIFFS = {
     "file named global": GLOBAL_PATH_DIFF,
     "separator in path": SEPARATOR_PATH_DIFF,
     "pure rename": PURE_RENAME_DIFF,
-    "no file header": HEADERLESS_DIFF,
     "crlf line endings": CRLF_DIFF,
 }
 

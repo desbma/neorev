@@ -6,19 +6,27 @@ from tests.helpers import (
     BINARY_DIFF,
     CONTEXT_LABEL_DIFF,
     DELETE_FILE_DIFF,
+    EMPTIED_FILE_DIFF,
     HUNKS_PER_FILE,
     MULTI_FILE_HUNK_COUNT,
     MULTI_FILE_MULTI_HUNK_DIFF,
     NEW_FILE_DIFF,
+    NO_GIT_HEADER_DIFF,
     NO_NEWLINE_DIFF,
     PURE_RENAME_DIFF,
+    QUOTED_PATH_DIFF,
     REMOVED_LINE_NUMBER,
     RENAME_FILE_DIFF,
+    RENAME_PHRASE_DIFF,
+    RENAME_PHRASE_PATH,
     SIMPLE_DIFF,
+    STANDALONE_BINARY_DIFF,
+    TIMESTAMPED_DIFF,
+    TRAILING_BLANK_DIFF,
     TWO_DELETED_FILES_DIFF,
     TWO_FILE_DIFF,
     TWO_HUNK_DIFF,
-    make_hunk,
+    UNNAMED_PATH_DIFF,
     neorev,
 )
 
@@ -65,26 +73,59 @@ class TestParseDiff(unittest.TestCase):
         hunk = neorev.parse_diff(SIMPLE_DIFF)[0]
         self.assertEqual(hunk.short_location, "hello.py:1")
 
-    def test_short_location_no_file(self) -> None:
-        """Verify short_location falls back to range_line when file_path is absent."""
-        hunk = make_hunk()
-        hunk.file_path = None
-        self.assertEqual(hunk.short_location, hunk.range_line.strip())
-
     def test_hunk_raw_includes_header(self) -> None:
         """Verify the raw field should include the file header and range line."""
         hunk = neorev.parse_diff(SIMPLE_DIFF)[0]
         self.assertIn("diff --git", hunk.raw)
         self.assertIn("@@", hunk.raw)
 
-    def test_file_path_strips_b_prefix(self) -> None:
-        """Verify the b/ prefix is stripped from the +++ line."""
-        diff = (
-            "diff --git a/src/x.py b/src/x.py\n"
-            "--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1,2 @@\n+line\n"
-        )
-        hunks = neorev.parse_diff(diff)
-        self.assertEqual(hunks[0].file_path, "src/x.py")
+    def test_diff_without_git_header(self) -> None:
+        """Verify 'diff -u' output keeps its file path despite having no diff line."""
+        hunks = neorev.parse_diff(NO_GIT_HEADER_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, "new/a.txt")
+
+    def test_file_path_excludes_timestamp(self) -> None:
+        """Verify a tab-separated timestamp stays out of the file path."""
+        hunks = neorev.parse_diff(TIMESTAMPED_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, "new/a.txt")
+
+    def test_quoted_path_diff(self) -> None:
+        """Verify a git-quoted path parses and keeps its quotes minus the b/ prefix."""
+        hunks = neorev.parse_diff(QUOTED_PATH_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, '"caf\\303\\251 menu.txt"')
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.ADDED)
+
+    def test_trailing_blank_line(self) -> None:
+        """Verify a blank line past the last hunk is dropped rather than parsed."""
+        hunks = neorev.parse_diff(TRAILING_BLANK_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].body, "-old\n+new")
+
+    def test_emptied_file_is_modified(self) -> None:
+        """Verify emptying a tracked file reports it as modified, not deleted."""
+        hunks = neorev.parse_diff(EMPTIED_FILE_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, "f.py")
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.MODIFIED)
+
+    def test_path_containing_rename_phrase(self) -> None:
+        """Verify a path spelling out 'rename from ' is not taken for a rename."""
+        hunks = neorev.parse_diff(RENAME_PHRASE_DIFF)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(hunks[0].file_path, RENAME_PHRASE_PATH)
+        self.assertIsNone(hunks[0].old_path)
+        self.assertIs(hunks[0].file_status, neorev.FileStatus.MODIFIED)
+
+    def test_unnamed_paths_yield_no_hunks(self) -> None:
+        """Verify a diff whose file markers carry no name produces no hunks."""
+        self.assertEqual(neorev.parse_diff(UNNAMED_PATH_DIFF), [])
+
+    def test_standalone_binary_diff(self) -> None:
+        """Verify the target-less binary notice produces no hunks instead of raising."""
+        self.assertEqual(neorev.parse_diff(STANDALONE_BINARY_DIFF), [])
 
     def test_binary_file_diff(self) -> None:
         """Verify a binary diff with no @@ lines produces no hunks."""
@@ -173,10 +214,10 @@ class TestParseDiff(unittest.TestCase):
 
 
 class TestLineTargetMapping(unittest.TestCase):
-    """Tests for parse_display_lines line-target mapping."""
+    """Tests for parse_diff line-target mapping."""
 
     def test_added_line_target(self) -> None:
-        """Verify parse_display_lines creates a LineTarget('+', N) for added lines."""
+        """Verify parse_diff creates a LineTarget('+', N) for added lines."""
         hunks = neorev.parse_diff(SIMPLE_DIFF)
         hunk = hunks[0]
         added = [
@@ -190,7 +231,7 @@ class TestLineTargetMapping(unittest.TestCase):
             self.assertEqual(target.side, neorev.LineSide.ADDED)
 
     def test_removed_line_target(self) -> None:
-        """Verify parse_display_lines creates a LineTarget('-', N) for removed lines."""
+        """Verify parse_diff creates a LineTarget('-', N) for removed lines."""
         diff = (
             "diff --git a/f.py b/f.py\n"
             "--- a/f.py\n+++ b/f.py\n"

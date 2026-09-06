@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --python-preference only-system --script
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["rich>=15,<16"]
+# dependencies = ["rich>=15,<16", "unidiff>=1,<2"]
 # ///
 """neorev — human review for agent diffs."""
 
@@ -31,6 +31,7 @@ from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import unidiff
 from rich.cells import split_graphemes
 from rich.console import Console
 from rich.segment import Segment
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from typing import IO, Self
 
     from rich.style import Style
+    from unidiff.patch import Line
 
 CSI = "\033["
 BOLD = f"{CSI}1m"
@@ -119,10 +121,13 @@ DIFF_MODIFIED_ICON = ""
 RENAME_ARROW = "→"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = b"  "
-HUNK_RANGE_LINE_RE = re.compile(
-    r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@"
-)
 HUNK_RANGE_PREFIX = "@@"
+SINGLE_LINE_RANGE_LENGTH = 1
+DIFF_SOURCE_PREFIX = "a/"
+DIFF_TARGET_PREFIX = "b/"
+DIFF_QUOTE = '"'
+DEV_NULL = "/dev/null"
+RENAME_MARKER = "rename from "
 SECTION_KIND_PREFIX = "REVIEW "
 SECTION_KINDS_PATTERN = r"CHANGE REQUESTED|QUESTION"
 HEADING_TARGET_SEPARATOR = " @ "
@@ -183,6 +188,10 @@ OUTPUT_PREAMBLE = (
 
 class NoDiffOnStdinError(Exception):
     """Raised when stdin is a TTY and no diff data is available."""
+
+
+class MissingLineNumberError(Exception):
+    """Raised when an added or removed diff line carries no line number."""
 
 
 @dataclass(frozen=True)
@@ -283,11 +292,10 @@ class LoopResult(enum.Enum):
 class Hunk:
     """A single diff hunk with optional review annotation."""
 
-    file_header: str | None
     range_line: str
     body: str
     raw: str
-    file_path: str | None = None
+    file_path: str
     file_status: FileStatus = FileStatus.MODIFIED
     old_path: str | None = None
     start_line: int | None = None
@@ -298,8 +306,6 @@ class Hunk:
     @property
     def short_location(self) -> str:
         """Return a compact 'file:line' location string."""
-        if self.file_path is None:
-            return self.range_line.strip()
         if self.start_line is None or self.file_status is FileStatus.DELETED:
             return self.file_path
         return f"{self.file_path}:{self.start_line}"
@@ -678,12 +684,11 @@ def format_editor_line_number(dl: DisplayLine) -> str:
     return f"{line_num:>{EDITOR_LINE_NUMBER_WIDTH}}"
 
 
-@dataclass
-class FileHeader:
-    """A parsed diff file-header block and the file change it introduces."""
+@dataclass(frozen=True)
+class FileChange:
+    """The paths and status a diff file header describes."""
 
-    text: str
-    path: str | None
+    path: str
     old_path: str | None
     status: FileStatus
 
@@ -691,202 +696,113 @@ class FileHeader:
 def parse_diff(diff_text: str) -> list[Hunk]:
     """Parse a unified diff into a list of reviewable hunks."""
     hunks: list[Hunk] = []
-    lines = diff_text.splitlines(keepends=True)
-    header: FileHeader | None = None
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-
-        if line.startswith(("diff --git", "diff ")):
-            header, i = parse_file_header(lines, i, header.path if header else None)
-            if header.status is FileStatus.RENAMED and (
-                i >= len(lines) or not lines[i].startswith(HUNK_RANGE_PREFIX)
-            ):
-                hunks.append(make_rename_hunk(header))
+    for patched_file in unidiff.PatchSet(diff_text.replace("\r\n", "\n")):
+        change = resolve_file_change(patched_file)
+        if not change.path:
             continue
-
-        if line.startswith(HUNK_RANGE_PREFIX):
-            hunk, i = parse_hunk_body(lines, i, header)
-            hunks.append(hunk)
+        file_header = file_header_text(patched_file)
+        if not patched_file:
+            if change.status is FileStatus.RENAMED:
+                hunks.append(rename_hunk(file_header, change))
             continue
-
-        i += 1
-
+        hunks.extend(
+            build_hunk(patch_hunk, file_header, change) for patch_hunk in patched_file
+        )
     return hunks
 
 
-def parse_file_header(
-    lines: list[str],
-    start: int,
-    fallback_path: str | None,
-) -> tuple[FileHeader, int]:
-    """
-    Parse a diff file header block starting at *start*.
-
-    Returns (FileHeader, next_line_index).
-    """
-    header_lines = [lines[start]]
-    i = start + 1
-    source_path: str | None = None
-    dest_path: str | None = None
-    renamed = False
-    while (
-        i < len(lines)
-        and not lines[i].startswith(HUNK_RANGE_PREFIX)
-        and not lines[i].startswith("diff ")
-    ):
-        line = lines[i]
-        header_lines.append(line)
-        if line.startswith("--- "):
-            source_path = line[4:].strip().removeprefix("a/")
-        elif line.startswith("+++ "):
-            dest_path = line[4:].strip().removeprefix("b/")
-        elif line.startswith("rename from "):
-            renamed = True
-            source_path = line[len("rename from ") :].strip()
-        elif line.startswith("rename to "):
-            renamed = True
-            dest_path = line[len("rename to ") :].strip()
-        i += 1
-    text = "".join(header_lines).rstrip("\n")
-    path, old_path, status = resolve_file_change(
-        source_path, dest_path, fallback_path, renamed=renamed
-    )
-    return FileHeader(text=text, path=path, old_path=old_path, status=status), i
+def resolve_file_change(patched_file: unidiff.PatchedFile) -> FileChange:
+    """Derive the display path, pre-rename path and status of a parsed file."""
+    source = strip_diff_prefix(patched_file.source_file or "", DIFF_SOURCE_PREFIX)
+    target = strip_diff_prefix(patched_file.target_file or "", DIFF_TARGET_PREFIX)
+    if patched_file.target_file == DEV_NULL:
+        return FileChange(path=source, old_path=None, status=FileStatus.DELETED)
+    if patched_file.source_file == DEV_NULL:
+        return FileChange(path=target, old_path=None, status=FileStatus.ADDED)
+    info = patched_file.patch_info
+    if info is not None and any(line.startswith(RENAME_MARKER) for line in info):
+        return FileChange(path=target, old_path=source, status=FileStatus.RENAMED)
+    return FileChange(path=target, old_path=None, status=FileStatus.MODIFIED)
 
 
-def resolve_file_change(
-    source_path: str | None,
-    dest_path: str | None,
-    fallback_path: str | None,
-    *,
-    renamed: bool,
-) -> tuple[str | None, str | None, FileStatus]:
-    """Derive the display path, pre-rename path, and status from header endpoints."""
-    if dest_path == "/dev/null":
-        return source_path, None, FileStatus.DELETED
-    if source_path == "/dev/null":
-        return dest_path, None, FileStatus.ADDED
-    path = dest_path if dest_path is not None else fallback_path
-    if renamed:
-        return path, source_path, FileStatus.RENAMED
-    return path, None, FileStatus.MODIFIED
+def strip_diff_prefix(path: str, prefix: str) -> str:
+    """Strip a diff-side prefix from *path*, reaching inside git's quoting."""
+    if path.startswith(DIFF_QUOTE) and path.endswith(DIFF_QUOTE):
+        return f"{DIFF_QUOTE}{path[1:-1].removeprefix(prefix)}{DIFF_QUOTE}"
+    return path.removeprefix(prefix)
 
 
-def make_rename_hunk(header: FileHeader) -> Hunk:
-    """Build a body-less hunk for a file rename that changes no content."""
+def file_header_text(patched_file: unidiff.PatchedFile) -> str:
+    """Return the file-header block preceding the hunks of *patched_file*."""
+    hunk_text = "".join(str(patch_hunk) for patch_hunk in patched_file)
+    return str(patched_file).removesuffix(hunk_text).rstrip("\n")
+
+
+def build_hunk(
+    patch_hunk: unidiff.Hunk,
+    file_header: str,
+    change: FileChange,
+) -> Hunk:
+    """Build a reviewable hunk from one parsed diff hunk."""
+    lines = [line for line in patch_hunk if line.line_type]
+    range_line = hunk_range_line(patch_hunk)
+    body = "".join(str(line) for line in lines).rstrip("\n")
     return Hunk(
-        file_header=header.text,
-        range_line="",
-        body="",
-        raw=header.text,
-        file_path=header.path,
-        file_status=header.status,
-        old_path=header.old_path,
-    )
-
-
-def parse_hunk_body(
-    lines: list[str],
-    start: int,
-    header: FileHeader | None,
-) -> tuple[Hunk, int]:
-    """
-    Parse a single @@ hunk starting at *start*.
-
-    Returns (Hunk, next_line_index).
-    """
-    range_line = lines[start].rstrip("\r\n")
-    match = re.search(r"\+(\d+)", range_line)
-    start_line = int(match.group(1)) if match else None
-
-    body_lines: list[str] = []
-    i = start + 1
-    while (
-        i < len(lines)
-        and not lines[i].startswith(HUNK_RANGE_PREFIX)
-        and not lines[i].startswith("diff ")
-    ):
-        body_lines.append(lines[i])
-        i += 1
-
-    body = "".join(body_lines).rstrip("\n")
-    file_header = header.text if header is not None else None
-    raw = (
-        f"{file_header}\n{range_line}\n{body}"
-        if file_header
-        else f"{range_line}\n{body}"
-    )
-
-    hunk = Hunk(
-        file_header=file_header,
         range_line=range_line,
         body=body,
-        raw=raw,
-        file_path=header.path if header is not None else None,
-        file_status=header.status if header is not None else FileStatus.MODIFIED,
-        old_path=header.old_path if header is not None else None,
-        start_line=start_line,
-        display_lines=parse_display_lines(range_line, body),
+        raw=f"{file_header}\n{range_line}\n{body}",
+        file_path=change.path,
+        file_status=change.status,
+        old_path=change.old_path,
+        start_line=patch_hunk.target_start,
+        display_lines=[display_line(line) for line in lines],
     )
-    return hunk, i
 
 
-def parse_display_lines(range_line: str, body: str) -> list[DisplayLine]:
-    """Parse a hunk body into structured display rows with line numbers."""
-    match = HUNK_RANGE_LINE_RE.match(range_line)
-    if not match:
-        return []
-    old_num = int(match.group("old_start"))
-    new_num = int(match.group("new_start"))
+def rename_hunk(file_header: str, change: FileChange) -> Hunk:
+    """Build a body-less hunk for a file rename that changes no content."""
+    return Hunk(
+        range_line="",
+        body="",
+        raw=file_header,
+        file_path=change.path,
+        file_status=change.status,
+        old_path=change.old_path,
+    )
 
-    result: list[DisplayLine] = []
-    for line in body.splitlines():
-        if not line:
-            continue
-        try:
-            line_kind = DisplayLineKind(line[0])
-        except ValueError:
-            line_kind = DisplayLineKind.CONTEXT
 
-        if line_kind is DisplayLineKind.META:
-            result.append(
-                DisplayLine(
-                    kind=line_kind,
-                    text=line,
-                    old_line_number=None,
-                    new_line_number=None,
-                    target=None,
-                )
-            )
-            continue
+def hunk_range_line(patch_hunk: unidiff.Hunk) -> str:
+    """Render the range line of *patch_hunk* in git's unified-diff form."""
+    source = format_range(patch_hunk.source_start, patch_hunk.source_length)
+    target = format_range(patch_hunk.target_start, patch_hunk.target_length)
+    suffix = f" {patch_hunk.section_header}" if patch_hunk.section_header else ""
+    return f"{HUNK_RANGE_PREFIX} -{source} +{target} {HUNK_RANGE_PREFIX}{suffix}"
 
-        text = line[1:] if len(line) > 1 else ""
-        target: LineTarget | None = None
-        if line_kind is DisplayLineKind.ADDED:
-            target = LineTarget(side=LineSide.ADDED, line_number=new_num)
-        elif line_kind is DisplayLineKind.REMOVED:
-            target = LineTarget(side=LineSide.REMOVED, line_number=old_num)
 
-        result.append(
-            DisplayLine(
-                kind=line_kind,
-                text=text,
-                old_line_number=(
-                    old_num if line_kind is not DisplayLineKind.ADDED else None
-                ),
-                new_line_number=(
-                    new_num if line_kind is not DisplayLineKind.REMOVED else None
-                ),
-                target=target,
-            )
-        )
-        if line_kind is not DisplayLineKind.ADDED:
-            old_num += 1
-        if line_kind is not DisplayLineKind.REMOVED:
-            new_num += 1
-    return result
+def format_range(start: int, length: int) -> str:
+    """Render one side of a range line, omitting the count when it is one."""
+    return str(start) if length == SINGLE_LINE_RANGE_LENGTH else f"{start},{length}"
+
+
+def display_line(line: Line) -> DisplayLine:
+    """Map one parsed diff line onto its structured display row."""
+    kind = DisplayLineKind(line.line_type)
+    target: LineTarget | None = None
+    if kind is DisplayLineKind.ADDED:
+        if line.target_line_no is None:
+            raise MissingLineNumberError
+        target = LineTarget(side=LineSide.ADDED, line_number=line.target_line_no)
+    elif kind is DisplayLineKind.REMOVED:
+        if line.source_line_no is None:
+            raise MissingLineNumberError
+        target = LineTarget(side=LineSide.REMOVED, line_number=line.source_line_no)
+    return DisplayLine(
+        kind=kind,
+        text=(str(line) if kind is DisplayLineKind.META else line.value).rstrip("\n"),
+        old_line_number=line.source_line_no,
+        new_line_number=line.target_line_no,
+        target=target,
+    )
 
 
 def parse_note_target(text: str) -> NoteTarget | None:
@@ -985,7 +901,7 @@ def format_output(
         write_note_section(
             out,
             hnote.kind,
-            f"{hunk_identity_path(hunk)}{HEADING_TARGET_SEPARATOR}{hnote.target}",
+            f"{hunk.file_path}{HEADING_TARGET_SEPARATOR}{hnote.target}",
             hnote.text,
             extras=HunkNoteExtras(
                 diff_block=format_diff_block(hunk, hnote),
@@ -1076,14 +992,9 @@ def trim_body_lines(hunk: Hunk, note: HunkNote) -> list[str]:
     return trimmed
 
 
-def hunk_identity_path(hunk: Hunk) -> str:
-    """Return the string identifying *hunk* in a review file."""
-    return hunk.file_path if hunk.file_path is not None else hunk.range_line
-
-
 def hunk_identity_hash(hunk: Hunk) -> bytes:
     """Return a fixed-size identity digest for *hunk* based on its content."""
-    parts = (hunk.file_path or "", hunk.range_line, hunk.body)
+    parts = (hunk.file_path, hunk.range_line, hunk.body)
     payload = b"".join(
         len(encoded).to_bytes(ANCHOR_LENGTH_PREFIX_BYTES, "big") + encoded
         for encoded in (part.encode("utf-8") for part in parts)
@@ -1211,7 +1122,7 @@ def apply_previous_review(
     """
     lookup: dict[tuple[str, str], Hunk] = {}
     for hunk in hunks:
-        lookup[(hunk_identity_path(hunk), hunk.range_line)] = hunk
+        lookup[(hunk.file_path, hunk.range_line)] = hunk
 
     matched = 0
     stale_unmatched = 0
@@ -2748,8 +2659,12 @@ def read_diff_from_stdin() -> str:
 
 
 def parse_diff_or_exit(diff_text: str) -> list[Hunk]:
-    """Parse *diff_text* into hunks, exiting if none are found."""
-    hunks = parse_diff(diff_text)
+    """Parse *diff_text* into hunks, exiting if it is malformed or holds none."""
+    try:
+        hunks = parse_diff(diff_text)
+    except unidiff.UnidiffParseError as exc:
+        sys.stderr.write(f"Malformed diff: {exc}\n")
+        exit(os.EX_DATAERR)
     if not hunks:
         sys.stderr.write("No hunks found in diff.\n")
         exit(os.EX_DATAERR)

@@ -56,7 +56,7 @@ python3 -m unittest tests.test_diff.TestParseDiff.test_single_hunk
 Code and tests must pass all three (`ty` needs the third-party dependencies importable):
 
 ```sh
-uvx --with rich ty check neorev tests
+uvx --with rich --with unidiff ty check neorev tests
 ruff check neorev tests
 ruff format --check neorev tests
 ```
