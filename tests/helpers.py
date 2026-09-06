@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import importlib.machinery
+import importlib.util
 import io
 import os
 import select
@@ -16,7 +17,14 @@ from unittest.mock import patch
 
 # neorev is a script without .py extension; import it as a module.
 NEOREV_PATH = str(Path(__file__).resolve().parents[1] / "neorev")
-neorev = importlib.machinery.SourceFileLoader("neorev", NEOREV_PATH).load_module()
+NEOREV_LOADER = importlib.machinery.SourceFileLoader("neorev", NEOREV_PATH)
+neorev = importlib.util.module_from_spec(
+    importlib.machinery.ModuleSpec("neorev", NEOREV_LOADER, origin=NEOREV_PATH)
+)
+# Must precede exec_module: dataclass creation and mock.patch("neorev.<name>")
+# targets both resolve the module through sys.modules.
+sys.modules["neorev"] = neorev
+NEOREV_LOADER.exec_module(neorev)
 
 TERM_WIDTH = 80
 TERM_HEIGHT = 24
