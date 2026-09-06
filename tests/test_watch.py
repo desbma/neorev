@@ -1,21 +1,27 @@
 """Tests for watch mode and jujutsu working-copy snapshot behavior."""
 
+import argparse
+import asyncio
+import contextlib
 import io
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Self
 from unittest.mock import MagicMock, patch
 
 from tests.helpers import (
+    FAKE_EDITOR,
     SIMPLE_DIFF,
-    FakeTTY,
+    TWO_HUNK_DIFF,
+    ReviewDriver,
+    ReviewTestCase,
     neorev,
+    review_session,
 )
 
 WATCH_OUTPUT_NAME = "review.md"
@@ -24,105 +30,55 @@ APPROVED_HASHES_TOKEN = "approved-hashes="
 ALL_CLEAR_TOKEN = "all clear"
 INOTIFYWAIT_FAKE_PATH = "/usr/bin/inotifywait"
 JJ_WORKING_COPY_SOURCE = "jj show"
-
-LoopAction = Callable[[neorev.ReviewState | None], None]
-LoopScript = list[tuple[LoopAction, neorev.LoopResult]]
-
-
-def approve_all(state: neorev.ReviewState | None) -> None:
-    """Approve every hunk in *state* (used as a scripted loop action)."""
-    if state is not None:
-        for hunk in state.hunks:
-            hunk.approved = True
-
-
-def noop(_state: neorev.ReviewState | None) -> None:
-    """Leave the review state untouched."""
+APPROVE_KEY = "a"
+QUIT_KEY = "q"
+FLAG_KEY = "f"
+CANCEL_KEY = "escape"
+DEBOUNCE_TIMEOUT = 0.01
+DEBOUNCE_SETTLE = 0.2
+# Long enough for a watcher that ignores the shutdown to spawn inotifywait.
+SPAWN_TIMEOUT = 0.5
+PROBE_TIMEOUT = 5.0
 
 
-class FakeWatcher:
-    """Stand-in for RepoWatcher exposing a real pipe read end."""
-
-    def __init__(self) -> None:
-        """Open a pipe so callers have a valid read fd to select on."""
-        self.read_fd, self.write_fd = os.pipe()
-        self.closed = False
-
-    def close(self) -> None:
-        """Close both pipe ends exactly once."""
-        if not self.closed:
-            os.close(self.read_fd)
-            os.close(self.write_fd)
-            self.closed = True
+@contextlib.asynccontextmanager
+async def watch_review(diff_text: str) -> AsyncIterator[tuple[ReviewDriver, Path]]:
+    """Run a watched review over *diff_text*, yielding its driver and output path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp) / WATCH_OUTPUT_NAME
+        async with review_session(
+            diff_text,
+            output_path=str(output),
+            watch=neorev.JjSource(None),
+        ) as review:
+            yield review, output
 
 
-def fake_restart(old: FakeWatcher | None) -> FakeWatcher:
-    """Stand in for restart_watcher by closing *old* and returning a fake."""
-    if old is not None:
-        old.close()
-    return FakeWatcher()
+async def reload_with(review: ReviewDriver, diff_text: str) -> None:
+    """Reload *review* as if the repository now produced *diff_text*."""
+    with patch.object(
+        neorev,
+        "fetch_watch_diff",
+        return_value=(diff_text, JJ_WORKING_COPY_SOURCE),
+    ):
+        review.app.reload()
+    await review.settle()
 
 
-class WatchScriptTerminal:
-    """Terminal stub driving watch_loop with scripted loop results."""
-
-    ALT_SCREEN_ON = ""
-    ALT_SCREEN_OFF = ""
-    CURSOR_HIDE = ""
-    CURSOR_SHOW = ""
-
-    def __init__(self, scripts: LoopScript) -> None:
-        """Store the scripted (action, result) steps to replay."""
-        self.scripts = list(scripts)
-        self.review_calls = 0
-        self.wait_calls = 0
-
-    def __enter__(self) -> Self:
-        """Return self for context-managed use."""
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        """Exit context manager without extra cleanup."""
-
-    def write(self, _data: bytes | str) -> None:
-        """Accept writes performed by the session without rendering."""
-
-    def run_review_loop(
-        self,
-        state: neorev.ReviewState,
-        _delta_cache: dict[int, neorev.DeltaStream],
-        _watch_read_fd: int | None = None,
-    ) -> neorev.LoopResult:
-        """Apply the next scripted action and return its loop result."""
-        self.review_calls += 1
-        action, result = self.scripts.pop(0)
-        action(state)
-        return result
-
-    def run_wait_screen(self, _watch_read_fd: int) -> neorev.LoopResult:
-        """Apply the next scripted action for the empty-diff wait screen."""
-        self.wait_calls += 1
-        action, result = self.scripts.pop(0)
-        action(None)
-        return result
+def watch_session_args(output: str) -> argparse.Namespace:
+    """Parse the command line of a watch session writing its review to *output*."""
+    return neorev.build_arg_parser().parse_args(["-w", "-x", "-o", output])
 
 
 class TestJjWorkingCopyFlag(unittest.TestCase):
     """The diff command snapshots the working copy; metadata queries skip it."""
 
-    def test_jj_diff_command_without_rev(self) -> None:
-        """Verify jj_diff_command omits both the rev and --ignore-working-copy."""
-        self.assertEqual(
-            neorev.jj_diff_command(None),
-            ["jj", "show"],
-        )
-
-    def test_jj_diff_command_with_rev(self) -> None:
-        """Verify jj_diff_command appends the rev and keeps snapshotting enabled."""
-        self.assertEqual(
-            neorev.jj_diff_command("abc123"),
-            ["jj", "show", "abc123"],
-        )
+    def test_jj_diff_command_spellings(self) -> None:
+        """Verify jj_diff_command appends the rev and never stops snapshotting."""
+        cases = [(None, ["jj", "show"]), ("abc123", ["jj", "show", "abc123"])]
+        for rev, expected in cases:
+            with self.subTest(rev=rev):
+                self.assertEqual(neorev.jj_diff_command(rev), expected)
 
     def test_jj_root_probes_with_ignore_working_copy(self) -> None:
         """Verify jj_root probes jj root with --ignore-working-copy."""
@@ -134,23 +90,13 @@ class TestJjWorkingCopyFlag(unittest.TestCase):
 class TestWatchArgParsing(unittest.TestCase):
     """The -w/--watch flag toggles watch mode."""
 
-    def test_watch_defaults_false(self) -> None:
-        """Verify watch is disabled without -w."""
+    def test_watch_flags(self) -> None:
+        """Verify both spellings enable watch mode and omitting them leaves it off."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-o", "out.md"])
-        self.assertFalse(args.watch)
-
-    def test_watch_short_flag(self) -> None:
-        """Verify the -w short flag enables watch mode."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-w", "-o", "out.md"])
-        self.assertTrue(args.watch)
-
-    def test_watch_long_flag(self) -> None:
-        """Verify the --watch long flag enables watch mode."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--watch"])
-        self.assertTrue(args.watch)
+        cases = [(["-o", "out.md"], False), (["-w"], True), (["--watch"], True)]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertIs(parser.parse_args(argv).watch, expected)
 
 
 class TestWatchPaths(unittest.TestCase):
@@ -207,29 +153,22 @@ class TestFetchWatchDiff(unittest.TestCase):
 
 
 class TestBuildWatchState(unittest.TestCase):
-    """build_watch_state returns None for empty diffs, a state otherwise."""
+    """Tests for build_watch_state."""
 
-    def test_empty_string_returns_none(self) -> None:
-        """Verify an empty diff produces no state."""
-        self.assertIsNone(neorev.build_watch_state("", UNUSED_OUTPUT_PATH))
-
-    def test_whitespace_returns_none(self) -> None:
-        """Verify a whitespace-only diff produces no state."""
-        self.assertIsNone(neorev.build_watch_state("  \n ", UNUSED_OUTPUT_PATH))
-
-    def test_text_without_hunks_returns_none(self) -> None:
-        """Verify text with no parseable hunks produces no state."""
-        self.assertIsNone(neorev.build_watch_state("not a diff", UNUSED_OUTPUT_PATH))
+    def test_hunkless_inputs_wait_for_changes(self) -> None:
+        """Verify diff text holding no parseable hunk produces an empty state."""
+        for diff_text in ("", "  \n ", "not a diff"):
+            with self.subTest(diff_text=diff_text):
+                state = neorev.build_watch_state(diff_text, UNUSED_OUTPUT_PATH)
+                self.assertTrue(state.is_empty)
 
     def test_diff_returns_state(self) -> None:
         """Verify a real diff yields a state positioned at the first hunk."""
         with tempfile.TemporaryDirectory() as tmp:
             output = str(Path(tmp) / WATCH_OUTPUT_NAME)
             state = neorev.build_watch_state(SIMPLE_DIFF, output)
-        self.assertIsNotNone(state)
-        if state is not None:
-            self.assertEqual(state.current_index, 0)
-            self.assertEqual(len(state.hunks), 1)
+        self.assertEqual(state.current_index, 0)
+        self.assertEqual(len(state.hunks), 1)
 
 
 class TestWatchModeGuards(unittest.TestCase):
@@ -238,6 +177,7 @@ class TestWatchModeGuards(unittest.TestCase):
     def run_main(self, argv: list[str], stdin_text: str) -> int:
         """Run main() with *argv* and piped *stdin_text*; return the exit code."""
         with (
+            patch.dict(os.environ, {"EDITOR": FAKE_EDITOR}),
             patch.object(sys, "argv", argv),
             patch.object(sys, "stdin", io.StringIO(stdin_text)),
             self.assertRaises(SystemExit) as ctx,
@@ -266,112 +206,201 @@ class TestWatchModeGuards(unittest.TestCase):
                 code = self.run_main(argv, "")
         self.assertEqual(code, os.EX_UNAVAILABLE)
 
-
-class TestReadKeyReload(unittest.TestCase):
-    """read_key surfaces a watch event as KEY_RELOAD."""
-
-    def test_watch_event_returns_reload(self) -> None:
-        """Verify a byte on the watch pipe makes read_key return KEY_RELOAD."""
-        tty_pair = FakeTTY()
-        read_fd, write_fd = os.pipe()
-        try:
-            term = tty_pair.make_terminal()
-            os.write(write_fd, b"\x01")
-            with patch.object(neorev, "WATCH_DEBOUNCE_TIMEOUT", 0.01):
-                key = term.read_key(watch_read_fd=read_fd)
-            self.assertEqual(key, neorev.Terminal.KEY_RELOAD)
-            term.close()
-        finally:
-            os.close(read_fd)
-            os.close(write_fd)
-            tty_pair.close()
+    def test_missing_editor_is_fatal(self) -> None:
+        """Verify an unset $EDITOR stops the review before it starts."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["neorev", "-o", "out.md"]),
+            patch.object(sys, "stdin", io.StringIO(SIMPLE_DIFF)),
+            patch.object(sys, "stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            neorev.main()
+        self.assertEqual(ctx.exception.code, os.EX_USAGE)
 
 
-class TestWatchLoop(unittest.TestCase):
-    """watch_loop persistence, reload, and clipboard behavior."""
+class TestWatchReload(ReviewTestCase):
+    """Tests for rebuilding the review after a repository change."""
 
-    def make_args(self, output: str) -> Namespace:
-        """Build a watch-mode argument namespace targeting *output*."""
-        return Namespace(
-            output=output,
-            clip=True,
-            watch=True,
-            clear=False,
-            source=neorev.JjSource(None),
-        )
+    async def test_reload_replaces_the_hunks(self) -> None:
+        """Verify a new diff replaces the hunks under review."""
+        async with watch_review(SIMPLE_DIFF) as (review, _):
+            await reload_with(review, TWO_HUNK_DIFF)
+            self.assertEqual(len(review.state.hunks), 2)
 
-    def run_session(
-        self, scripts: LoopScript, fetch_results: list[tuple[str, str]]
-    ) -> tuple[MagicMock, str]:
-        """Run run_watch_session with stubs; return (clipboard mock, output path)."""
+    async def test_reload_saves_the_review_so_far(self) -> None:
+        """Verify the review is written out before the diff is fetched again."""
+        async with watch_review(SIMPLE_DIFF) as (review, output):
+            await review.press(APPROVE_KEY)
+            await reload_with(review, TWO_HUNK_DIFF)
+            written = output.read_text()
+            self.assertIn(ALL_CLEAR_TOKEN, written)
+            self.assertIn(APPROVED_HASHES_TOKEN, written)
+
+    async def test_unchanged_diff_keeps_the_review(self) -> None:
+        """Verify a repository change that leaves the diff alone keeps the state."""
+        async with watch_review(SIMPLE_DIFF) as (review, _):
+            await review.press(APPROVE_KEY)
+            await reload_with(review, SIMPLE_DIFF)
+            self.assertTrue(review.state.hunks[0].approved)
+
+    async def test_empty_diff_waits_then_reloads(self) -> None:
+        """Verify an empty diff waits, then takes the hunks a later change brings."""
+        async with watch_review("") as (review, _):
+            self.assertTrue(review.state.is_empty)
+            await reload_with(review, SIMPLE_DIFF)
+            self.assertEqual(len(review.state.hunks), 1)
+            self.assertTrue(review.app.query_one(neorev.Diff).display)
+
+    async def test_reload_waits_for_an_open_modal(self) -> None:
+        """Verify a change under an open picker is held back until it closes."""
+        fetched = asyncio.Event()
+
+        def fetch(source: neorev.JjSource) -> tuple[str, str]:  # noqa: ARG001
+            """Record the diff being fetched again, and hand back a longer one."""
+            fetched.set()
+            return TWO_HUNK_DIFF, JJ_WORKING_COPY_SOURCE
+
+        async with watch_review(SIMPLE_DIFF) as (review, _):
+            with (
+                patch.object(neorev, "WATCH_DEBOUNCE_TIMEOUT", DEBOUNCE_TIMEOUT),
+                patch.object(neorev, "fetch_watch_diff", fetch),
+            ):
+                await review.press(FLAG_KEY)
+                review.app.reload()
+                self.assertEqual(len(review.state.hunks), 1)
+                self.assertFalse(fetched.is_set())
+
+                await review.press(CANCEL_KEY)
+                await asyncio.wait_for(fetched.wait(), DEBOUNCE_SETTLE)
+                await review.settle()
+            self.assertEqual(len(review.state.hunks), 2)
+
+    async def test_delta_output_from_before_a_reload_is_dropped(self) -> None:
+        """Verify delta output still in flight when the diff empties is ignored."""
+        async with watch_review(SIMPLE_DIFF) as (review, _):
+            stale = review.app.delta_generation
+            await reload_with(review, "")
+            self.assertTrue(review.state.is_empty)
+            review.app.absorb_delta_lines(0, stale, [b"stale line"])
+            review.app.mark_delta_complete(0, stale)
+            self.assertEqual(review.app.delta_cache, {})
+            self.assertEqual(review.app.delta_complete, set())
+
+    async def test_events_are_coalesced_into_one_reload(self) -> None:
+        """Verify a burst of repository events triggers a single reload."""
+        async with watch_review(SIMPLE_DIFF) as (review, _):
+            reload_mock = MagicMock()
+            with (
+                patch.object(neorev, "WATCH_DEBOUNCE_TIMEOUT", DEBOUNCE_TIMEOUT),
+                patch.object(review.app, "reload", reload_mock),
+            ):
+                review.app.schedule_reload()
+                review.app.schedule_reload()
+                review.app.schedule_reload()
+                await review.pilot.pause()
+                await asyncio.sleep(DEBOUNCE_SETTLE)
+                await review.pilot.pause()
+            self.assertEqual(reload_mock.call_count, 1)
+
+
+class TestWatcherShutdown(ReviewTestCase):
+    """Tests for stopping the watcher when the review is left."""
+
+    async def test_quitting_during_the_probe_starts_no_watcher(self) -> None:
+        """Verify a quit while jj_root is probing leaves no inotifywait behind."""
+        release = threading.Event()
+        spawned = threading.Event()
+        probe_started = threading.Event()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".jj" / "repo" / "op_heads" / "heads").mkdir(parents=True)
+
+            def slow_root() -> str:
+                """Report the probe starting, then hold it open until it is released."""
+                probe_started.set()
+                release.wait(PROBE_TIMEOUT)
+                return tmp
+
+            def popen(*args: object, **kwargs: object) -> MagicMock:  # noqa: ARG001
+                """Record that the watcher reached the point of spawning."""
+                spawned.set()
+                return MagicMock()
+
+            state = neorev.ReviewState(hunks=[], global_notes=[])
+            session = neorev.Session(
+                output_path=str(Path(tmp) / WATCH_OUTPUT_NAME),
+                diff_source=None,
+                diff_text="",
+                watch=neorev.JjSource(None),
+            )
+            app = neorev.ReviewApp(state, session)
+            with (
+                patch.object(neorev, "jj_root", slow_root),
+                patch.object(neorev.subprocess, "Popen", popen),
+            ):
+                try:
+                    async with app.run_test():
+                        started = await asyncio.to_thread(
+                            probe_started.wait,
+                            PROBE_TIMEOUT,
+                        )
+                        self.assertTrue(started)
+                finally:
+                    release.set()
+                self.assertFalse(await asyncio.to_thread(spawned.wait, SPAWN_TIMEOUT))
+
+
+class TestWatchSessionExit(unittest.TestCase):
+    """Tests for watch-session output and clipboard handling on exit."""
+
+    def test_review_written_and_copied_on_quit(self) -> None:
+        """Verify quitting a watch session writes the file and fills the clipboard."""
         clipboard = MagicMock()
         with tempfile.TemporaryDirectory() as tmp:
             output = str(Path(tmp) / WATCH_OUTPUT_NAME)
-            args = self.make_args(output)
+            args = watch_session_args(output)
+
+            def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
+                """Approve every hunk instead of starting the UI."""
+                for hunk in app.state.hunks:
+                    hunk.approved = True
+
             with (
+                patch.object(neorev.ReviewApp, "run", run),
                 patch.object(
                     neorev,
-                    "Terminal",
-                    side_effect=lambda: WatchScriptTerminal(scripts),
+                    "fetch_watch_diff",
+                    return_value=(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
                 ),
-                patch.object(neorev, "restart_watcher", side_effect=fake_restart),
-                patch.object(neorev, "fetch_watch_diff", side_effect=fetch_results),
-                patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
-                patch.object(sys, "stderr", io.StringIO()),
-            ):
-                neorev.run_watch_session(args, neorev.JjSource(None))
-            return clipboard, Path(output).read_text()
-
-    def test_all_clear_persisted_and_clipboard_once_on_quit(self) -> None:
-        """Verify all-clear is written every cycle; clipboard copies only on quit."""
-        scripts: LoopScript = [
-            (approve_all, neorev.LoopResult.RELOAD),
-            (noop, neorev.LoopResult.QUIT),
-        ]
-        fetch_results = [(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE)] * 3
-        clipboard, content = self.run_session(scripts, fetch_results)
-        self.assertEqual(clipboard.call_count, 1)
-        self.assertIn(ALL_CLEAR_TOKEN, content)
-        self.assertIn(APPROVED_HASHES_TOKEN, content)
-        footer = content.split(APPROVED_HASHES_TOKEN, 1)[1]
-        self.assertTrue(footer.split("-->", 1)[0].strip())
-
-    def test_empty_diff_waits_then_reloads(self) -> None:
-        """Verify an initially empty diff shows the wait screen, then reloads."""
-        scripts: LoopScript = [
-            (noop, neorev.LoopResult.RELOAD),
-            (approve_all, neorev.LoopResult.QUIT),
-        ]
-        fetch_results = [
-            ("", JJ_WORKING_COPY_SOURCE),
-            (SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
-        ]
-        term_holder: list[WatchScriptTerminal] = []
-
-        clipboard = MagicMock()
-        with tempfile.TemporaryDirectory() as tmp:
-            output = str(Path(tmp) / WATCH_OUTPUT_NAME)
-            args = self.make_args(output)
-
-            def make_term() -> WatchScriptTerminal:
-                """Build the scripted terminal and capture it for assertions."""
-                term = WatchScriptTerminal(scripts)
-                term_holder.append(term)
-                return term
-
-            with (
-                patch.object(neorev, "Terminal", side_effect=make_term),
-                patch.object(neorev, "restart_watcher", side_effect=fake_restart),
-                patch.object(neorev, "fetch_watch_diff", side_effect=fetch_results),
                 patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
                 patch.object(sys, "stderr", io.StringIO()),
             ):
                 neorev.run_watch_session(args, neorev.JjSource(None))
             content = Path(output).read_text()
-
-        self.assertEqual(term_holder[0].wait_calls, 1)
-        self.assertEqual(term_holder[0].review_calls, 1)
+        self.assertEqual(clipboard.call_count, 1)
         self.assertIn(ALL_CLEAR_TOKEN, content)
+        self.assertIn(APPROVED_HASHES_TOKEN, content)
+
+    def test_untouched_review_writes_nothing(self) -> None:
+        """Verify quitting without reviewing anything leaves no file behind."""
+        clipboard = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(Path(tmp) / WATCH_OUTPUT_NAME)
+            args = watch_session_args(output)
+            with (
+                patch.object(neorev.ReviewApp, "run", MagicMock()),
+                patch.object(
+                    neorev,
+                    "fetch_watch_diff",
+                    return_value=(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
+                ),
+                patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
+                patch.object(sys, "stderr", io.StringIO()),
+            ):
+                neorev.run_watch_session(args, neorev.JjSource(None))
+            self.assertFalse(Path(output).exists())
+        self.assertEqual(clipboard.call_count, 0)
 
 
 if __name__ == "__main__":

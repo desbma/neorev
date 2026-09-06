@@ -1,14 +1,19 @@
 """End-to-end tests for neorev."""
 
+import contextlib
+import io
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from tests.helpers import (
+    FAKE_EDITOR,
     FENCED_BODY_DIFF,
     REOPEN_CYCLE_COUNT,
+    SIMPLE_DIFF,
     TWO_HUNK_DIFF,
     WORKFLOW_ALL_CLEAR_SUMMARY,
     WORKFLOW_FENCED_QUESTION,
@@ -19,8 +24,12 @@ from tests.helpers import (
     WORKFLOW_RESUME_GLOBAL,
     WORKFLOW_STALE_MESSAGE,
     neorev,
-    run_main_with_scripted_terminal,
+    run_main_with_scripted_app,
 )
+
+MISMATCH_DETAIL = "hello.py:1: 2 rows for 4 diff lines"
+MISMATCH_NOTE_TEXT = "taken before the rows stopped lining up"
+MISMATCH_OUTPUT_NAME = "review.md"
 
 
 class TestMainWorkflow(unittest.TestCase):
@@ -50,7 +59,7 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            run_main_with_scripted_terminal(TWO_HUNK_DIFF, output_path, script)
+            run_main_with_scripted_app(TWO_HUNK_DIFF, output_path, script)
             output = Path(output_path).read_text()
             self.assertIn("[REVIEW CHANGE REQUESTED] `hello.py", output)
             self.assertIn(WORKFLOW_FLAG_COMMENT, output)
@@ -83,7 +92,7 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            stderr = run_main_with_scripted_terminal(
+            stderr = run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 lambda _state: None,
@@ -110,10 +119,10 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            run_main_with_scripted_terminal(FENCED_BODY_DIFF, output_path, script)
+            run_main_with_scripted_app(FENCED_BODY_DIFF, output_path, script)
             first = Path(output_path).read_text()
             for _ in range(REOPEN_CYCLE_COUNT):
-                stderr = run_main_with_scripted_terminal(
+                stderr = run_main_with_scripted_app(
                     FENCED_BODY_DIFF,
                     output_path,
                     lambda _state: None,
@@ -143,7 +152,7 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            run_main_with_scripted_terminal(
+            run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 lambda _state: None,
@@ -174,7 +183,7 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            stderr = run_main_with_scripted_terminal(
+            stderr = run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 lambda _state: None,
@@ -205,7 +214,7 @@ class TestMainWorkflow(unittest.TestCase):
                     return_value=TWO_HUNK_DIFF,
                 ) as fetch_mock,
             ):
-                run_main_with_scripted_terminal(
+                run_main_with_scripted_app(
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
@@ -227,7 +236,7 @@ class TestMainWorkflow(unittest.TestCase):
                 "fetch_diff_from_jj",
                 return_value=TWO_HUNK_DIFF,
             ) as fetch_mock:
-                run_main_with_scripted_terminal(
+                run_main_with_scripted_app(
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
@@ -250,7 +259,7 @@ class TestMainWorkflow(unittest.TestCase):
                 "fetch_diff_from_jj",
                 return_value=TWO_HUNK_DIFF,
             ):
-                run_main_with_scripted_terminal(
+                run_main_with_scripted_app(
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
@@ -285,7 +294,7 @@ class TestMainWorkflow(unittest.TestCase):
             output_path = f.name
 
         try:
-            stderr = run_main_with_scripted_terminal(
+            stderr = run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 lambda _state: None,
@@ -296,6 +305,43 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             if Path(output_path).exists():
                 os.unlink(output_path)
+
+
+class TestDeltaMismatchExit(unittest.TestCase):
+    """Tests for the exit of a session whose delta output did not line up."""
+
+    def test_mismatch_is_reported_on_stderr(self) -> None:
+        """Verify the session writes the review, names the hunk and exits non-zero."""
+        stderr = io.StringIO()
+
+        def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
+            """Flag a hunk, then leave the review the way a mismatched one does."""
+            app.state.hunks[0].notes.append(
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG,
+                    target=neorev.HunkTarget(),
+                    text=MISMATCH_NOTE_TEXT,
+                )
+            )
+            app.delta_mismatch = MISMATCH_DETAIL
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = str(Path(tmp) / MISMATCH_OUTPUT_NAME)
+            argv = ["neorev", "-o", output_path]
+            with (
+                patch.object(neorev.ReviewApp, "run", run),
+                patch.dict(os.environ, {"EDITOR": FAKE_EDITOR}),
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "stdin", io.StringIO(SIMPLE_DIFF)),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                neorev.main()
+            written = Path(output_path).read_text()
+        self.assertEqual(caught.exception.code, os.EX_SOFTWARE)
+        self.assertIn(neorev.DELTA_MISMATCH_MESSAGE, stderr.getvalue())
+        self.assertIn(MISMATCH_DETAIL, stderr.getvalue())
+        self.assertIn(MISMATCH_NOTE_TEXT, written)
 
 
 class TestAllClearSkipsFile(unittest.TestCase):
@@ -314,7 +360,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
 
         os.unlink(output_path)
         try:
-            stderr = run_main_with_scripted_terminal(
+            stderr = run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 script,
@@ -343,7 +389,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             output_path = f.name
 
         try:
-            stderr = run_main_with_scripted_terminal(
+            stderr = run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 script,
@@ -367,7 +413,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
             output_path = f.name
 
         try:
-            run_main_with_scripted_terminal(
+            run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 script,
@@ -387,7 +433,7 @@ class TestAllClearSkipsFile(unittest.TestCase):
 
         os.unlink(output_path)
         try:
-            run_main_with_scripted_terminal(
+            run_main_with_scripted_app(
                 TWO_HUNK_DIFF,
                 output_path,
                 script,

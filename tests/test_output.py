@@ -322,22 +322,22 @@ class TestReviewIsAllClear(unittest.TestCase):
     def test_all_approved_no_globals(self) -> None:
         """Return True when every hunk is approved and no global notes exist."""
         hunks = [
-            make_hunk(approved=True),
-            make_hunk(approved=True),
+            make_hunk(status=neorev.Status.APPROVED),
+            make_hunk(status=neorev.Status.APPROVED),
         ]
         self.assertTrue(neorev.review_is_all_clear(hunks, []))
 
     def test_unapproved_hunk(self) -> None:
         """Return False when at least one hunk is not approved."""
         hunks = [
-            make_hunk(approved=True),
+            make_hunk(status=neorev.Status.APPROVED),
             make_hunk(),
         ]
         self.assertFalse(neorev.review_is_all_clear(hunks, []))
 
     def test_all_approved_with_global_notes(self) -> None:
         """Return False when there are global notes even if all hunks are approved."""
-        hunks = [make_hunk(approved=True)]
+        hunks = [make_hunk(status=neorev.Status.APPROVED)]
         notes = [neorev.GlobalNote(kind=neorev.NoteKind.FLAG, text="concern")]
         self.assertFalse(neorev.review_is_all_clear(hunks, notes))
 
@@ -357,12 +357,13 @@ class TestReviewHasContent(unittest.TestCase):
 
     def test_one_approved(self) -> None:
         """Return True when at least one hunk is approved."""
-        hunks = [make_hunk(approved=True), make_hunk()]
+        hunks = [make_hunk(status=neorev.Status.APPROVED), make_hunk()]
         self.assertTrue(neorev.review_has_content(hunks, []))
 
     def test_all_approved(self) -> None:
         """Return True when all hunks are approved."""
-        hunks = [make_hunk(approved=True), make_hunk(approved=True)]
+        approved = neorev.Status.APPROVED
+        hunks = [make_hunk(status=approved), make_hunk(status=approved)]
         self.assertTrue(neorev.review_has_content(hunks, []))
 
     def test_hunk_with_notes(self) -> None:

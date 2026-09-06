@@ -22,7 +22,7 @@ send_keys() {
   for k in "$@"
   do
     tmux send-keys -t "${TMUX_SESSION}" "${k}"
-    sleep 0.1
+    sleep 0.4
   done
 }
 
@@ -46,7 +46,7 @@ ${TERMCMD} --working-directory "${PWD}" --class "${WINDOW_CLASS}" -e tmux new-se
 sleep 0.5s
 wid="$(xdotool search --class "${WINDOW_CLASS}")"
 
-send_keys g c a a a a a a a a a a f Enter j a a a a a f h a a a a a a a a a a a f h f Enter j a a a a C-d f j j j j j j j j j j j j j j j Enter c j j j
+send_keys g c a a a a a a a a a a f Enter j a a a a a f h a a a a a a a a a a a f h f Enter j a a a a C-d f j j j j j j j j j j j j j j j Enter c k k k j j j j j j
 
 maim -u -i "${wid}" "${OUTPUT}"
 

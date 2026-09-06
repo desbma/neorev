@@ -90,13 +90,13 @@ a             Approve hunk (no comment needed)
 A             Approve all hunks in current file
 c             Add question (hunk or line target, opens $EDITOR)
 f             Add flag / request change (hunk or line target, opens $EDITOR)
-gc            Add global question (not tied to a specific hunk, opens $EDITOR)
-gf            Add global flag / request change (not tied to a specific hunk, opens
-              $EDITOR)
+g             Add a global note, not tied to a specific hunk (then c or f)
 m             Manage notes (edit / delete)
 q / Ctrl-C    Quit and write output to file
 ?             Show help
 ```
+
+`$EDITOR` must be set: it is what you write annotations with.
 
 3. Send the output to the agent
 

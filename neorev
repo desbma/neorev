@@ -1,85 +1,85 @@
 #!/usr/bin/env -S uv run --python-preference only-system --script
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["rich>=15,<16", "unidiff>=1,<2"]
+# # textual ships features in patch releases, so its version is pinned exactly
+# dependencies = ["rich>=15,<16", "textual==8.2.8", "unidiff>=1,<2"]
 # ///
 """neorev — human review for agent diffs."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
 import enum
 import hashlib
+import io
 import os
 import re
-import select
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import termios
-import textwrap
-import threading
-import tty
 from collections import Counter
-from contextlib import closing, contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from io import StringIO
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import unidiff
-from rich.cells import split_graphemes
 from rich.console import Console
-from rich.segment import Segment
 from rich.text import Text
+from textual import work
+from textual.app import App
+from textual.binding import Binding, BindingType
+from textual.drivers.linux_driver import LinuxDriver
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Footer, HelpPanel, Label, OptionList, RichLog, Static
+from textual.widgets._footer import FooterKey
+from textual.widgets.option_list import Option
+from textual.worker import get_current_worker
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from typing import IO, Self
+    from typing import IO
 
     from rich.style import Style
+    from textual.app import ComposeResult, RenderResult
+    from textual.events import Resize
+    from textual.timer import Timer
     from unidiff.patch import Line
 
-CSI = "\033["
-BOLD = f"{CSI}1m"
-DIM = f"{CSI}2m"
-RESET = f"{CSI}0m"
-GREEN = f"{CSI}32m"
-RED = f"{CSI}31m"
-YELLOW = f"{CSI}33m"
-CYAN = f"{CSI}36m"
-BG_BLUE = f"{CSI}44m"
-BG_CHROME = f"{CSI}40m"
-BLACK = f"{CSI}30m"
-WHITE = f"{CSI}37m"
-BG_CYAN = f"{CSI}46m"
-BG_YELLOW_BLACK = f"{CSI}43;30m"
-REVERSE = f"{CSI}7m"
-ERASE_TO_LINE_END = f"{CSI}0K"
+ERASE_TO_LINE_END = "\033[0K"
 
 CONSOLE = Console()
 STYLE_PROBE_CHAR = " "
 
+STYLE_APPROVED = "green"
+STYLE_FLAG = "red"
+STYLE_QUESTION = "yellow"
+STYLE_RENAMED = "cyan"
+STYLE_BOLD = "bold"
+STYLE_DIM = "dim"
+STYLE_BRAND = "bold white on blue"
+STYLE_PROGRESS_FILL = "black on cyan"
+STYLE_NO_FILL = "on default"
+STYLE_PICK_QUESTION = "reverse"
+STYLE_PICK_FLAG = "black on yellow"
+BRAND_LABEL = " neorev "
+
 HUNK_BODY_MAX_LINES = 10
 HUNK_BODY_CONTEXT_LINES = HUNK_BODY_MAX_LINES // 2
-DRAIN_READ_SIZE = 256
-ESC_SEQUENCE_TIMEOUT = 0.05
-CHROME_ROWS = 3  # top bar + markers + footer
-MIN_VISIBLE_ROWS = 3
 MARKER_WIDTH = 3  # each marker is 3 visible chars (e.g. "[✓]" or " · ")
 ARROW_WIDTH = 2  # "◀ " or " ▶"
-SCROLL_INDICATOR_ROWS = 2  # up + down indicators
-MIN_TERMINAL_WIDTH = 20
-MIN_TERMINAL_HEIGHT = CHROME_ROWS + MIN_VISIBLE_ROWS
-TRUNCATION_ELLIPSIS = "…"
-RESIZE_DEBOUNCE_TIMEOUT = 0.05
-SELECT_IMMEDIATE = 0
+MARKER_UNHANDLED = "·"
+MARKER_APPROVED = "✓"
+MARKER_FLAG = "✗"
+MARKER_QUESTION = "?"
+MARKER_CURRENT_OPEN = "["
+MARKER_CURRENT_CLOSE = "]"
 GLOBAL_TARGET = "global"
-LINE_PICKER_SELECT_KEY = "\r"
 EDITOR_CONTEXT_RADIUS = 3
 EDITOR_HUNK_CONTEXT_MAX = 15
 EDITOR_TARGET_MARKER = "►"
@@ -88,13 +88,8 @@ EDITOR_LINE_NUMBER_WIDTH = 4
 EDITOR_LINE_NUMBER_BLANK = " " * EDITOR_LINE_NUMBER_WIDTH
 
 NOTE_TARGET_HUNK = "hunk"
-NOTE_PANEL_CURSOR = "▶"
-NOTE_PANEL_CHROME_ROWS = 2  # header + footer
-NOTE_PANEL_MIN_HEIGHT = 3  # chrome + at least 1 note row
-NOTE_PANEL_DIFF_CHROME_ROWS = 2  # top bar + progress markers (no footer)
-NOTE_PANEL_MAX_FRACTION = 3  # panel takes at most 1/N of terminal height
 ALL_CLEAR_MESSAGE = "All chunks approved, nothing to report.\n"
-PREVIEW_INTERPUNCT = " · "
+DELTA_MISMATCH_MESSAGE = "Unexpected delta output, check your delta git configuration"
 XDG_STATE_HOME_DEFAULT = ".local/state"
 REVIEWS_STATE_DIR = "agents/reviews"
 DEFAULT_OUTPUT_STEM = "neorev"
@@ -108,9 +103,10 @@ PROJECT_NAME_SEPARATOR = "-"
 WORKSPACE_SHARE_MAX_DEPTH_DELTA = 2
 
 WATCH_DEBOUNCE_TIMEOUT = 0.5
+WATCH_EVENTS = "close_write,create,delete,move"
+WATCH_WORKER_GROUP = "watch"
 JJ_OP_HEADS_REL = "op_heads/heads"
 EMPTY_DIFF_WAIT_MESSAGE = "Empty diff, waiting for changes…"
-WATCH_WAIT_FOOTER_SEGMENTS = [("q", "quit")]
 
 QUESTION_ICON = "󰠗"
 FLAG_ICON = "󰅽"
@@ -120,7 +116,7 @@ DIFF_RENAMED_ICON = ""
 DIFF_MODIFIED_ICON = ""
 RENAME_ARROW = "→"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
-MARGIN_EMPTY = b"  "
+MARGIN_EMPTY = " " * MARGIN_WIDTH
 HUNK_RANGE_PREFIX = "@@"
 SINGLE_LINE_RANGE_LENGTH = 1
 DIFF_SOURCE_PREFIX = "a/"
@@ -147,8 +143,19 @@ FOOTER_RE = re.compile(
     re.MULTILINE,
 )
 APPROVAL_HASH_BYTES = 8
-DELTA_STREAM_READ_SIZE = 8192
-DELTA_VIEWPORT_LINE_BUFFER = 20
+DELTA_COMMAND = [
+    "delta",
+    "--file-style",
+    "omit",
+    "--hunk-header-style",
+    "omit",
+    "--paging",
+    "never",
+]
+DELTA_TIMEOUT = 5
+DELTA_READ_SIZE = 8192
+DELTA_WORKER_GROUP = "delta"
+PAINT_WORKER_GROUP = "paint"
 ANCHOR_PAYLOAD_VERSION = "v1"
 ANCHOR_DIGEST_BYTES = 8
 ANCHOR_LENGTH_PREFIX_BYTES = 8
@@ -164,12 +171,70 @@ DIFF_BLOCK_RE = re.compile(
     r"(?P<body>.*?)^(?P=fence)$\n?",
     re.DOTALL | re.MULTILINE,
 )
-LINE_PICKER_FOOTER_SEGMENTS = [
-    ("j/k", "move"),
-    ("Enter", "select line"),
-    ("h", "whole hunk"),
-    ("Esc", "cancel"),
-]
+TTY_DEVICE = "/dev/tty"
+# Alternate scroll mode, which makes a terminal reporting no mouse send the
+# wheel as arrow keys.
+ALTERNATE_SCROLL_OFF = "\033[?1007l"
+ALTERNATE_SCROLL_ON = "\033[?1007h"
+EMPTY_ID = "empty"
+KEY_SEPARATOR = "/"
+GLOBAL_NOTE_PROMPT = "Global note"
+# Textual theme drawing every colour from the terminal's own palette.
+APP_THEME = "ansi-dark"
+REVIEW_CSS = """
+TopBar, Markers {
+    height: 1;
+}
+TopBar, Markers, Footer, FooterKey, FooterKey > .footer-key--description {
+    background: ansi_black;
+}
+FooterKey > .footer-key--key {
+    color: ansi_default;
+    text-style: dim;
+}
+Diff, PickerList, NotesScreen OptionList {
+    scrollbar-background: ansi_black;
+    scrollbar-color: ansi_default;
+    scrollbar-color-hover: ansi_default;
+    scrollbar-color-active: ansi_default;
+}
+Diff {
+    height: 1fr;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+#empty {
+    display: none;
+    height: 1fr;
+    content-align: center middle;
+}
+LinePicker OptionList {
+    height: 1fr;
+    overflow-y: scroll;
+}
+/* Blank the block cursor of the list: the pick style paints the line itself. */
+LinePicker OptionList > .option-list--option-highlighted {
+    color: ansi_default;
+    background: ansi_default;
+}
+NotesScreen {
+    align: center middle;
+}
+NotesScreen OptionList {
+    width: 80%;
+    height: 70%;
+    border: round $primary;
+    overflow-y: scroll;
+}
+GlobalNoteKind {
+    align: center middle;
+}
+GlobalNoteKind Label {
+    padding: 1 2;
+    border: round $primary;
+    background: $surface;
+}
+"""
 
 OUTPUT_PREAMBLE = (
     "# Code Review\n\n"
@@ -207,14 +272,6 @@ class Status(enum.Enum):
     APPROVED = enum.auto()
     FLAG = enum.auto()
     QUESTION = enum.auto()
-
-    def __str__(self) -> str:
-        """Return the ANSI-styled status label for UI chrome."""
-        if self is Status.APPROVED:
-            return f"{GREEN}✓ approved{RESET}"
-        if self is Status.FLAG:
-            return f"{RED}✗ change requested{RESET}"
-        return f"{YELLOW}? question{RESET}"
 
 
 class NoteKind(enum.Enum):
@@ -254,15 +311,15 @@ class FileStatus(enum.Enum):
     RENAMED = enum.auto()
 
     @property
-    def marker(self) -> str:
-        """Return the ANSI-styled Nerd Font icon for this file status."""
+    def marker(self) -> Text:
+        """Return the styled Nerd Font icon for this file status."""
         if self is FileStatus.ADDED:
-            return f"{GREEN}{DIFF_ADDED_ICON}{RESET}"
+            return Text().append(DIFF_ADDED_ICON, style=STYLE_APPROVED)
         if self is FileStatus.RENAMED:
-            return f"{CYAN}{DIFF_RENAMED_ICON}{RESET}"
+            return Text().append(DIFF_RENAMED_ICON, style=STYLE_RENAMED)
         if self is FileStatus.DELETED:
-            return f"{YELLOW}{DIFF_REMOVED_ICON}{RESET}"
-        return DIFF_MODIFIED_ICON
+            return Text().append(DIFF_REMOVED_ICON, style=STYLE_QUESTION)
+        return Text(DIFF_MODIFIED_ICON)
 
 
 class LineSide(enum.Enum):
@@ -279,13 +336,6 @@ class DisplayLineKind(enum.Enum):
     REMOVED = "-"
     CONTEXT = " "
     META = "\\"
-
-
-class LoopResult(enum.Enum):
-    """Reason the interactive review loop returned to its caller."""
-
-    QUIT = enum.auto()
-    RELOAD = enum.auto()
 
 
 @dataclass
@@ -318,6 +368,11 @@ class Hunk:
         return self.short_location
 
     @property
+    def selectable_lines(self) -> list[DisplayLine]:
+        """Return the display lines a line-scoped note can target."""
+        return [dl for dl in self.display_lines if dl.target is not None]
+
+    @property
     def summary_status(self) -> Status | None:
         """Return a summary status for chrome/markers."""
         if self.approved:
@@ -333,6 +388,25 @@ class Hunk:
     def is_handled(self) -> bool:
         """Return whether the hunk has been reviewed."""
         return self.approved or bool(self.notes)
+
+    def marker(self, *, is_current: bool) -> Text:
+        """Return the styled marker of the hunk (3 visible chars)."""
+        icon, style = MARKER_UNHANDLED, STYLE_DIM
+        status = self.summary_status
+        if status is Status.APPROVED:
+            icon, style = MARKER_APPROVED, STYLE_APPROVED
+        elif status is Status.FLAG:
+            icon, style = MARKER_FLAG, STYLE_FLAG
+        elif status is Status.QUESTION:
+            icon, style = MARKER_QUESTION, STYLE_QUESTION
+        if not is_current:
+            return Text(" ").append(icon, style=style).append(" ")
+        return (
+            Text()
+            .append(MARKER_CURRENT_OPEN, style=STYLE_BOLD)
+            .append(icon, style=style)
+            .append(MARKER_CURRENT_CLOSE, style=STYLE_BOLD)
+        )
 
     def get_note(self, target: NoteTarget) -> HunkNote | None:
         """Find a note matching *target*, or None."""
@@ -353,27 +427,24 @@ class Hunk:
                 del self.notes[i]
                 return
 
-    def build_hunk_context(self, scroll_offset: int) -> list[str]:
-        """Build a diff snippet for the editor starting from *scroll_offset*."""
-        start = max(0, scroll_offset)
-        end = min(len(self.display_lines), start + EDITOR_HUNK_CONTEXT_MAX)
-        lines: list[str] = []
-        for dl in self.display_lines[start:end]:
-            line_num = format_editor_line_number(dl)
-            lines.append(f"# {EDITOR_CONTEXT_PAD} {line_num} {dl.kind.value} {dl.text}")
-        return lines
-
-    def build_line_context(self, target: LineTarget) -> list[str]:
-        """Build context lines around *target* for the editor comment template."""
-        target_idx = next(
-            (i for i, dl in enumerate(self.display_lines) if dl.target == target),
-            None,
-        )
-        if target_idx is None:
-            return []
-
-        start = max(0, target_idx - EDITOR_CONTEXT_RADIUS)
-        end = min(len(self.display_lines), target_idx + EDITOR_CONTEXT_RADIUS + 1)
+    def build_editor_context(
+        self,
+        target: NoteTarget,
+        scroll_offset: int,
+    ) -> list[str]:
+        """Build the diff snippet the editor shows above a note on *target*."""
+        if isinstance(target, LineTarget):
+            target_idx = next(
+                (i for i, dl in enumerate(self.display_lines) if dl.target == target),
+                None,
+            )
+            if target_idx is None:
+                return []
+            start = max(0, target_idx - EDITOR_CONTEXT_RADIUS)
+            end = min(len(self.display_lines), target_idx + EDITOR_CONTEXT_RADIUS + 1)
+        else:
+            start = max(0, scroll_offset)
+            end = min(len(self.display_lines), start + EDITOR_HUNK_CONTEXT_MAX)
 
         lines: list[str] = []
         for dl in self.display_lines[start:end]:
@@ -465,7 +536,16 @@ class ReviewState:
     hunks: list[Hunk]
     global_notes: list[GlobalNote]
     current_index: int = 0
-    scroll_offset: int = 0
+
+    @property
+    def is_empty(self) -> bool:
+        """Return whether the reviewed diff holds no hunk at all."""
+        return not self.hunks
+
+    @property
+    def current_hunk(self) -> Hunk:
+        """Return the hunk the review is on."""
+        return self.hunks[self.current_index]
 
     def find_next_unhandled(self) -> int:
         """Find the next hunk with no review, wrapping around."""
@@ -481,15 +561,13 @@ class ReviewState:
         """Return the index of the first unhandled hunk, or 0."""
         return next((i for i, h in enumerate(hunks) if not h.is_handled), 0)
 
-    def navigate(self, key: str) -> bool:
-        """Handle navigation keys (j/k/arrows), returning True if index changed."""
-        if key in ("j", "down") and self.current_index < len(self.hunks) - 1:
-            self.current_index += 1
-            return True
-        if key in ("k", "up") and self.current_index > 0:
-            self.current_index -= 1
-            return True
-        return False
+    def move(self, delta: int) -> bool:
+        """Shift the current hunk by *delta*, returning True if the index changed."""
+        target = min(max(self.current_index + delta, 0), len(self.hunks) - 1)
+        if target == self.current_index:
+            return False
+        self.current_index = target
+        return True
 
     def approve(self) -> None:
         """Toggle approval on the current hunk, ignoring hunks that have notes."""
@@ -509,169 +587,66 @@ class ReviewState:
         self.advance_to_next_unhandled()
 
     def advance_to_next_unhandled(self) -> None:
-        """Move to the next unhandled hunk, resetting scroll on change."""
-        new_index = self.find_next_unhandled()
-        if new_index != self.current_index:
-            self.current_index = new_index
-            self.scroll_offset = 0
+        """Move to the next unhandled hunk."""
+        self.current_index = self.find_next_unhandled()
 
-    def managed_note_refs(self) -> list[ManagedNoteRef]:
-        """Build a flat list of note references for the manage-notes panel."""
-        refs: list[ManagedNoteRef] = []
-        for hunk in self.hunks:
-            for note in hunk.notes:
-                label = f"{hunk.short_location} @ {note.target}"
-                refs.append(
-                    ManagedNoteRef(scope_label=label, text=note.text, kind=note.kind)
-                )
-        refs.extend(
-            ManagedNoteRef(scope_label=GLOBAL_TARGET, text=gnote.text, kind=gnote.kind)
-            for gnote in self.global_notes
-        )
-        return refs
+    def adopt(self, other: ReviewState) -> None:
+        """Take over the hunks, notes and position of *other*."""
+        self.hunks = other.hunks
+        self.global_notes = other.global_notes
+        self.current_index = other.current_index
 
-    def find_note_by_ref(
-        self,
-        ref: ManagedNoteRef,
-    ) -> tuple[Hunk, HunkNote] | GlobalNote | None:
-        """Locate the note described by *ref*."""
-        for hunk in self.hunks:
-            for note in hunk.notes:
-                label = f"{hunk.short_location} @ {note.target}"
-                if (
-                    label == ref.scope_label
-                    and note.text == ref.text
-                    and note.kind == ref.kind
-                ):
-                    return hunk, note
-
-        for gnote in self.global_notes:
-            if (
-                gnote.text == ref.text
-                and gnote.kind == ref.kind
-                and ref.scope_label == GLOBAL_TARGET
-            ):
-                return gnote
-
-        return None
+    def all_notes(self) -> list[tuple[Hunk, HunkNote] | GlobalNote]:
+        """List every note of the review, hunk-scoped ones first."""
+        notes: list[tuple[Hunk, HunkNote] | GlobalNote] = [
+            (hunk, note) for hunk in self.hunks for note in hunk.notes
+        ]
+        notes.extend(self.global_notes)
+        return notes
 
 
-@dataclass(frozen=True)
-class DiffViewport:
-    """Describes which diff lines are visible in the current terminal viewport."""
-
-    scroll_offset: int
-    visible_line_count: int
-    total_lines: int
-    can_scroll_up: bool
-    can_scroll_down: bool
-    lines_above: int
-    lines_below: int
-
-
-@dataclass(frozen=True)
-class ManagedNoteRef:
-    """A reference to one note for the manage-notes panel."""
-
-    scope_label: str
-    text: str
-    kind: NoteKind
-
-
-@dataclass
-class NotePanelState:
-    """Cursor and scroll state for the manage-notes panel."""
-
-    cursor: int = 0
-    scroll_offset: int = 0
-
-
-class DeltaStream:
-    """Streams delta output incrementally, caching lines for reuse."""
-
-    def __init__(self, raw: str, width: int) -> None:
-        """Spawn a delta process on *raw* and prepare for incremental reads."""
-        self.lines: list[bytes] = []
-        self.buf: bytes = b""
-        self.exhausted: bool = False
-        self.leading_stripped: bool = False
-        self.process: subprocess.Popen[bytes] = subprocess.Popen(
-            [
-                "delta",
-                "--width",
-                str(width),
-                "--file-style",
-                "omit",
-                "--hunk-header-style",
-                "omit",
-                "--paging",
-                "never",
-            ],
-            stdin=subprocess.PIPE,
+@contextmanager
+def delta_output(raw: str) -> Iterator[IO[bytes]]:
+    """Spawn ``delta`` on *raw* and yield its output stream, reaping it on exit."""
+    with tempfile.TemporaryFile() as source:
+        source.write(raw.encode())
+        source.seek(0)
+        with subprocess.Popen(
+            DELTA_COMMAND,
+            stdin=source,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-        )
-        self.feeder: threading.Thread = threading.Thread(
-            target=feed_pipe,
-            args=(self.process.stdin, raw.encode()),
-            daemon=True,
-        )
-        self.feeder.start()
-
-    def ensure_lines(self, count: int) -> None:
-        """Read from the pipe until at least *count* lines are cached or stream ends."""
-        while len(self.lines) < count and not self.exhausted:
-            self.read_chunk()
-
-    def read_all(self) -> list[bytes]:
-        """Drain all remaining output and return every cached line."""
-        while not self.exhausted:
-            self.read_chunk()
-        return self.lines
-
-    def read_chunk(self) -> None:
-        """Read one chunk from stdout and append complete lines to the cache."""
-        if self.process.stdout is None:
-            self.exhausted = True
-            return
-        chunk = self.process.stdout.read(DELTA_STREAM_READ_SIZE)
-        if not chunk:
-            if self.buf:
-                self.lines.append(self.buf)
-                self.buf = b""
-            self.exhausted = True
-            self.process.stdout.close()
-            self.process.wait()
-            if self.lines and self.lines[-1] == b"":
-                self.lines.pop()
-            return
-        self.buf += chunk
-        parts = self.buf.split(b"\n")
-        self.buf = parts[-1]
-        self.lines.extend(parts[:-1])
-        if not self.leading_stripped and self.lines and self.lines[0] == b"":
-            self.lines.pop(0)
-            self.leading_stripped = True
-
-    def get_output(self, line_count: int) -> bytes:
-        """Read at least *line_count* lines, then join every cached line as bytes."""
-        self.ensure_lines(line_count)
-        return b"\n".join(self.lines)
-
-    def kill(self) -> None:
-        """Terminate the delta process and join the feeder thread."""
-        if self.process.poll() is None:
-            self.process.kill()
-            if self.process.stdout is not None:
-                self.process.stdout.close()
-            self.process.wait()
-        self.feeder.join()
+        ) as process:
+            assert process.stdout is not None  # noqa: S101
+            try:
+                yield process.stdout
+            finally:
+                if process.poll() is None:
+                    process.kill()
 
 
-def feed_pipe(pipe: IO[bytes], data: bytes) -> None:
-    """Write *data* into *pipe* and close it, swallowing broken-pipe errors."""
-    with closing(pipe), suppress(BrokenPipeError):
-        pipe.write(data)
+@contextmanager
+def inotify_events(
+    paths: list[str],
+) -> Iterator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
+    """Watch *paths*, yielding the watcher and its events, reaping it on exit."""
+    read_fd, write_fd = os.pipe()
+    with (
+        os.fdopen(read_fd, "rb") as events,
+        os.fdopen(write_fd, "wb") as sink,
+        subprocess.Popen(
+            ["inotifywait", "-m", "-q", "-e", WATCH_EVENTS, "--", *paths],
+            stdin=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=subprocess.DEVNULL,
+        ) as process,
+    ):
+        sink.close()
+        try:
+            yield process, events
+        finally:
+            if process.poll() is None:
+                process.terminate()
 
 
 def format_editor_line_number(dl: DisplayLine) -> str:
@@ -810,43 +785,38 @@ def parse_note_target(text: str) -> NoteTarget | None:
     text = text.strip()
     if text == NOTE_TARGET_HUNK:
         return HunkTarget()
-    if text:
-        try:
-            side = LineSide(text[0])
-        except ValueError:
-            return None
-        try:
-            line_number = int(text[1:])
-            return LineTarget(side=side, line_number=line_number)
-        except ValueError:
-            return None
-    return None
+    try:
+        return LineTarget(side=LineSide(text[0]), line_number=int(text[1:]))
+    except (IndexError, ValueError):
+        return None
 
 
-def render_through_delta(diff_text: str, width: int = 120) -> bytes:
-    """Pipe *diff_text* through ``delta`` and return raw bytes (with ANSI)."""
+def render_through_delta(diff_text: str) -> list[bytes]:
+    """Pipe *diff_text* through ``delta`` and return its output lines (with ANSI)."""
     try:
         result = subprocess.run(
-            [
-                "delta",
-                "--width",
-                str(width),
-                "--file-style",
-                "omit",
-                "--hunk-header-style",
-                "omit",
-                "--paging",
-                "never",
-            ],
+            DELTA_COMMAND,
             input=diff_text.encode(),
             capture_output=True,
-            timeout=5,
+            timeout=DELTA_TIMEOUT,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
+            return split_delta_output(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return diff_text.encode()
+    return diff_text.encode().split(b"\n")
+
+
+def split_delta_output(output: bytes) -> list[bytes]:
+    """Split ``delta`` *output* into rows, dropping the blank lines framing it."""
+    # Only a newline starts a row: bytes.splitlines would also break a row on a
+    # bare carriage return, moving every row below it away from the line it draws.
+    lines = output.split(b"\n")
+    if lines and not lines[-1]:
+        lines = lines[:-1]
+    if lines and not lines[0]:
+        lines = lines[1:]
+    return lines
 
 
 def compute_note_anchor(hunk_body: str, target: NoteTarget) -> str:
@@ -878,7 +848,7 @@ def format_output(
     When *diff_source* is provided it is included in the header so the
     agent knows how to retrieve the reviewed diff.
     """
-    out = StringIO()
+    out = io.StringIO()
     all_notes = [(hunk, note) for hunk in hunks for note in hunk.notes]
 
     if not all_notes and not global_notes:
@@ -922,7 +892,7 @@ class HunkNoteExtras:
 
 
 def write_note_section(
-    out: StringIO,
+    out: io.StringIO,
     kind: NoteKind,
     heading: str,
     text: str,
@@ -1183,34 +1153,6 @@ def read_comment_file(path: str) -> str:
     return "".join(lines).strip()
 
 
-@contextmanager
-def duplicated_fd(fd: int) -> Iterator[int]:
-    """Yield a duplicate of *fd* and close it automatically."""
-    dup_fd = os.dup(fd)
-    try:
-        yield dup_fd
-    finally:
-        os.close(dup_fd)
-
-
-@contextmanager
-def nonblocking_pipe() -> Iterator[tuple[int, int]]:
-    """Yield a non-blocking pipe pair and close both ends automatically."""
-    read_fd, write_fd = os.pipe()
-    try:
-        os.set_blocking(read_fd, False)
-        os.set_blocking(write_fd, False)
-        yield read_fd, write_fd
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
-
-
-def visible_width(text: str) -> int:
-    """Return the terminal column count of *text* (ignoring ANSI escapes)."""
-    return Text.from_ansi(text).cell_len
-
-
 def erase_fill_style(line: str) -> Style | None:
     """Return the style active at *line*'s erase-to-end-of-line sequence, if any."""
     prefix, separator, _ = line.partition(ERASE_TO_LINE_END)
@@ -1220,214 +1162,81 @@ def erase_fill_style(line: str) -> Style | None:
     return probed.get_style_at_offset(CONSOLE, -1)
 
 
-def render_ansi_text(
-    text: Text, width: int | None = None, pad_style: Style | None = None
-) -> str:
-    """Render *text* as an ANSI string, padded to *width* with *pad_style*."""
-    segments = list(text.render(CONSOLE))
-    if width is not None:
-        fill = (
-            pad_style
-            if pad_style is not None
-            else next((s.style for s in reversed(segments) if s.text), None)
-        )
-        segments = Segment.adjust_line_length(segments, width, style=fill)
-    return "".join(s.style.render(s.text) if s.style else s.text for s in segments)
+def build_margin_markers(hunk: Hunk) -> list[str]:
+    """Build the note-icon margin prefix of each display line of *hunk*, if any."""
+    if not any(isinstance(note.target, LineTarget) for note in hunk.notes):
+        return []
+    markers: list[str] = []
+    for dl in hunk.display_lines:
+        note = hunk.get_note(dl.target) if dl.target is not None else None
+        markers.append(f"{note.kind.icon} " if note is not None else MARGIN_EMPTY)
+    return markers
 
 
-def fold_offsets(text: str, width: int) -> list[int]:
-    """Return the offsets at which *text* must be split to fit *width* columns."""
-    offsets: list[int] = []
-    used = 0
-    spans, _ = split_graphemes(text)
-    for start, _, grapheme_width in spans:
-        if used + grapheme_width > width:
-            offsets.append(start)
-            used = 0
-        used += grapheme_width
-    return offsets
+def background_start(text: Text) -> int:
+    """Return the offset of the first character *text* paints a background under."""
+    return min(
+        (
+            span.start
+            for span in text.spans
+            if CONSOLE.get_style(span.style).bgcolor is not None
+        ),
+        default=len(text),
+    )
 
 
-def wrap_ansi_line_to_rows(line: bytes, term_width: int) -> list[bytes]:
-    """Split one ANSI-colored line into terminal-width display rows."""
+def diff_line_text(line: bytes, margin: str = "") -> Text:
+    """Build the renderable of one ``delta`` output *line*, prefixed with *margin*."""
     decoded = line.decode("utf-8", errors="replace")
-    text = Text.from_ansi(decoded)
+    body = Text.from_ansi(decoded)
+    text = Text(margin).append_text(body)
+    text.justify = "left"
     fill = erase_fill_style(decoded)
-    return [
-        render_ansi_text(row, term_width, fill).encode("utf-8", errors="replace")
-        for row in text.divide(fold_offsets(text.plain, term_width))
-    ]
+    if fill is not None:
+        text.style = fill
+        text.stylize(STYLE_NO_FILL, 0, len(margin) + background_start(body))
+    return text
 
 
-def build_margin_markers(
-    hunk: Hunk,
-    selected_target: LineTarget | None = None,
-) -> tuple[list[bytes] | None, int | None]:
-    """
-    Build margin marker bytes and optional highlight index.
-
-    Returns ``(None, None)`` when the hunk has no line notes and no
-    *selected_target*.  When *selected_target* is given the markers are
-    always built so the line picker can display them.
-    """
-    has_line_notes = any(isinstance(n.target, LineTarget) for n in hunk.notes)
-    if not has_line_notes and selected_target is None:
-        return None, None
-
-    markers: list[bytes] = []
-    highlight_index: int | None = None
-    for i, dl in enumerate(hunk.display_lines):
-        if selected_target is not None and dl.target == selected_target:
-            highlight_index = i
-            markers.append(MARGIN_EMPTY)
-        elif dl.target and (note := hunk.get_note(dl.target)):
-            markers.append(f"{note.kind.icon} ".encode())
-        else:
-            markers.append(MARGIN_EMPTY)
-    return markers, highlight_index
+def pad_to_width(text: Text, width: int) -> Text:
+    """Pad *text* with blanks up to *width* columns, in the style it carries."""
+    text.pad_right(max(0, width - text.cell_len))
+    return text
 
 
-def initial_line_picker_cursor(
-    selectable: list[DisplayLine],
-    hunk: Hunk,
-    scroll_offset: int,
-) -> int:
-    """Return the selectable index of the first line at or after *scroll_offset*."""
-    for cursor, dl in enumerate(selectable):
-        idx = next((i for i, d in enumerate(hunk.display_lines) if d is dl), None)
-        if idx is not None and idx >= scroll_offset:
-            return cursor
-    return 0
+def initial_picker_line(hunk: Hunk, scroll_offset: int) -> int:
+    """Return the display index of the first selectable line at or below the scroll."""
+    selectable = [i for i, dl in enumerate(hunk.display_lines) if dl.target is not None]
+    if not selectable:
+        return 0
+    return next((i for i in selectable if i >= scroll_offset), selectable[0])
 
 
-def build_display_lines(
-    delta_output: bytes,
-    term_width: int,
-    margin_markers: list[bytes] | None = None,
-    highlight_index: int | None = None,
-    highlight_escape: bytes = REVERSE.encode(),
-) -> list[bytes]:
-    """Return physical terminal rows for rendered diff output."""
-    raw_lines = delta_output.split(b"\n")
-
-    # Delta output ends with a trailing newline and may start with a leading
-    # blank line; strip both to avoid visual gaps in the chrome.
-    if raw_lines and raw_lines[-1] == b"":
-        raw_lines = raw_lines[:-1]
-    if raw_lines and raw_lines[0] == b"":
-        raw_lines = raw_lines[1:]
-
-    wrap_width = term_width - MARGIN_WIDTH if margin_markers else term_width
-
-    display_lines: list[bytes] = []
-    for i, line in enumerate(raw_lines):
-        highlighted = highlight_index is not None and i == highlight_index
-        source = (
-            Text.from_ansi(line.decode("utf-8", errors="replace")).plain.encode()
-            if highlighted
-            else line
-        )
-        for j, segment in enumerate(wrap_ansi_line_to_rows(source, wrap_width)):
-            row = segment
-            if margin_markers:
-                margin = margin_markers[i] if i < len(margin_markers) else MARGIN_EMPTY
-                row = (margin if j == 0 else MARGIN_EMPTY) + row
-            if highlighted:
-                row = highlight_escape + row + RESET.encode()
-            display_lines.append(row)
-
-    return display_lines or [b""]
-
-
-def compute_diff_viewport(
-    total_lines: int,
-    term_height: int,
-    scroll_offset: int,
-) -> DiffViewport:
-    """
-    Compute which diff lines are visible given the terminal geometry.
-
-    The fixed chrome occupies ``CHROME_ROWS`` rows (top bar + markers + footer).
-    Scroll indicators are reserved only when actually needed.
-    """
-    max_avail = term_height - CHROME_ROWS
-
-    if total_lines <= max_avail:
-        scroll_offset = 0
-        can_scroll_up = False
-        can_scroll_down = False
-        visible_count = total_lines
-    else:
-        max_offset = max(0, total_lines - (max_avail - SCROLL_INDICATOR_ROWS))
-        scroll_offset = min(scroll_offset, max_offset)
-
-        can_scroll_up = scroll_offset > 0
-        rows_with_both = max_avail - (1 if can_scroll_up else 0) - 1
-        available_rows = max(rows_with_both, MIN_VISIBLE_ROWS)
-        visible_count = min(available_rows, total_lines - scroll_offset)
-        can_scroll_down = scroll_offset + visible_count < total_lines
-        if not can_scroll_down:
-            rows_without_down = max_avail - (1 if can_scroll_up else 0)
-            available_rows = max(rows_without_down, MIN_VISIBLE_ROWS)
-            visible_count = min(available_rows, total_lines - scroll_offset)
-
-    lines_above = scroll_offset
-    lines_below = total_lines - scroll_offset - visible_count
-
-    return DiffViewport(
-        scroll_offset=scroll_offset,
-        visible_line_count=visible_count,
-        total_lines=total_lines,
-        can_scroll_up=can_scroll_up,
-        can_scroll_down=can_scroll_down,
-        lines_above=lines_above,
-        lines_below=lines_below,
-    )
-
-
-def chrome_line(text: str, term_width: int) -> str:
-    """Wrap *text* with the chrome background, padded to *term_width*."""
-    bg_text = BG_CHROME + text.replace(RESET, RESET + BG_CHROME)
-    pad = max(0, term_width - visible_width(text))
-    return bg_text + " " * pad + RESET
-
-
-def build_progress_hunk_segment(
-    current_index: int,
-    hunks: list[Hunk],
-) -> str:
+def build_progress_hunk_segment(state: ReviewState) -> Text:
     """Build the 'Hunk N/M' segment with a progress fill."""
-    total = len(hunks)
-    handled = sum(1 for h in hunks if h.is_handled)
-    label = f" Hunk {current_index + 1}/{total} "
+    total = len(state.hunks)
+    handled = sum(1 for hunk in state.hunks if hunk.is_handled)
+    label = f" Hunk {state.current_index + 1}/{total} "
     filled = len(label) * handled // total
-    filled_part = label[:filled]
-    unfilled_part = label[filled:]
-    return f"│{BLACK}{BG_CYAN}{filled_part}{RESET}{unfilled_part}│"
+    segment = Text("│")
+    segment.append(label[:filled], style=STYLE_PROGRESS_FILL)
+    segment.append(label[filled:])
+    segment.append("│")
+    return segment
 
 
-def build_top_bar(
-    hunk: Hunk,
-    current_index: int,
-    hunks: list[Hunk],
-    global_notes: list[GlobalNote],
-    term_width: int | None = None,
-) -> str:
-    """Build the top status bar string for the current hunk."""
-    counters = build_top_bar_counters(hunks, global_notes)
-    progress_segment = build_progress_hunk_segment(current_index, hunks)
-
-    bar = (
-        f"{BOLD}{WHITE}{BG_BLUE} neorev {RESET}"
-        f"{progress_segment}"
-        f" {hunk.file_status.marker} {BOLD}{hunk.location_label}{RESET}"
-        f"{counters}"
-    )
-    if term_width is not None:
-        styled = Text.from_ansi(bar)
-        if styled.cell_len > term_width:
-            styled.truncate(term_width, overflow="ellipsis")
-            bar = render_ansi_text(styled)
+def build_top_bar(state: ReviewState, term_width: int) -> Text:
+    """Build the top status bar for the current hunk."""
+    hunk = state.current_hunk
+    bar = Text().append(BRAND_LABEL, style=STYLE_BRAND)
+    bar.append_text(build_progress_hunk_segment(state))
+    bar.append(" ")
+    bar.append_text(hunk.file_status.marker)
+    bar.append(" ")
+    bar.append(hunk.location_label, style=STYLE_BOLD)
+    bar.append(build_top_bar_counters(state.hunks, state.global_notes))
+    if bar.cell_len > term_width:
+        bar.truncate(term_width, overflow="ellipsis")
     return bar
 
 
@@ -1451,1008 +1260,802 @@ def build_top_bar_counters(
     return "  │ " + " │ ".join(parts)
 
 
-def hunk_marker(hunk: Hunk, *, is_current: bool) -> str:
-    """Return the ANSI-styled marker for a single hunk (3 visible chars)."""
-    icon = "·"
-    color = DIM
-    status = hunk.summary_status
-    if status == Status.APPROVED:
-        icon, color = "✓", GREEN
-    elif status == Status.FLAG:
-        icon, color = "✗", RED
-    elif status == Status.QUESTION:
-        icon, color = "?", YELLOW
-    if is_current:
-        return f"{BOLD}[{color}{icon}{RESET}{BOLD}]{RESET}"
-    return f" {color}{icon}{RESET} "
+def marker_window(state: ReviewState, available: int) -> tuple[int, int]:
+    """Return the hunk range the marker line shows within *available* columns."""
+    total = len(state.hunks)
+    if available // MARKER_WIDTH >= total:
+        return 0, total
+
+    slots = max(1, (available - ARROW_WIDTH * 2) // MARKER_WIDTH)
+    start = max(0, min(state.current_index - slots // 2, total - slots))
+    # One-sided overflow leaves room for one arrow only, hence more markers.
+    if start == 0 or start + slots == total:
+        slots = max(1, (available - ARROW_WIDTH) // MARKER_WIDTH)
+        start = max(0, min(state.current_index - slots // 2, total - slots))
+    return start, start + slots
 
 
-def build_progress_markers(
-    hunks: list[Hunk],
-    current_index: int,
-    term_width: int,
-) -> str:
+def build_progress_markers(state: ReviewState, term_width: int) -> Text:
     """Build the hunk progress marker line, with overflow arrows."""
-    total = len(hunks)
     prefix = "  "
-    prefix_width = 2
-    available = term_width - prefix_width
+    available = term_width - len(prefix)
     if available < MARKER_WIDTH:
-        return ""
-    max_markers = available // MARKER_WIDTH
+        return Text()
+    start, end = marker_window(state, available)
 
-    if max_markers >= total:
-        markers = [
-            hunk_marker(hunks[i], is_current=i == current_index) for i in range(total)
-        ]
-        return prefix + "".join(markers)
-
-    slots = (available - ARROW_WIDTH * 2) // MARKER_WIDTH
-    slots = max(slots, 1)
-
-    half = slots // 2
-    start = current_index - half
-    end = start + slots
-
-    if start < 0:
-        start, end = 0, slots
-    if end > total:
-        end = total
-        start = max(0, end - slots)
-
-    need_left = start > 0
-    need_right = end < total
-
-    if not need_left or not need_right:
-        extra = (
-            available - (ARROW_WIDTH if need_left or need_right else 0)
-        ) // MARKER_WIDTH
-        extra = max(extra, 1)
-        if extra > slots:
-            slots = min(extra, total)
-            half = slots // 2
-            start = current_index - half
-            end = start + slots
-            if start < 0:
-                start, end = 0, slots
-            if end > total:
-                end = total
-                start = max(0, end - slots)
-            need_left = start > 0
-            need_right = end < total
-
-    markers = [
-        hunk_marker(hunks[i], is_current=i == current_index) for i in range(start, end)
-    ]
-    left = f"{DIM}◀ {RESET}" if need_left else ""
-    right = f"{DIM} ▶{RESET}" if need_right else ""
-    return prefix + left + "".join(markers) + right
+    line = Text(prefix)
+    if start > 0:
+        line.append("◀ ", style=STYLE_DIM)
+    for index in range(start, end):
+        line.append_text(
+            state.hunks[index].marker(is_current=index == state.current_index)
+        )
+    if end < len(state.hunks):
+        line.append(" ▶", style=STYLE_DIM)
+    return line
 
 
-def build_keyhint_footer(
-    segments: list[tuple[str, str]], term_width: int, *, ellipsis: bool = False
+def note_option_text(entry: tuple[Hunk, HunkNote] | GlobalNote) -> Text:
+    """Build the note list prompt naming and quoting one note."""
+    if isinstance(entry, GlobalNote):
+        scope, note = GLOBAL_TARGET, entry
+    else:
+        hunk, note = entry
+        scope = f"{hunk.short_location}{HEADING_TARGET_SEPARATOR}{note.target}"
+    prompt = Text(f"{note.kind.icon} ")
+    prompt.append(scope, style=STYLE_DIM)
+    prompt.append(f"\n{note.text}")
+    return prompt
+
+
+def edit_comment_in_editor(
+    existing: str,
+    location: str,
+    context_lines: list[str] | None = None,
 ) -> str:
-    """Build a key-hints footer from *segments*, truncated to *term_width*."""
-    parts: list[str] = []
-    used = 0
-    truncated = False
-    for i, (key, label) in enumerate(segments):
-        sep = "  " if i > 0 else ""
-        segment = f"{sep}{DIM}{key}{RESET} {label}"
-        segment_width = visible_width(segment)
-        if used + segment_width > term_width:
-            truncated = True
-            break
-        parts.append(segment)
-        used += segment_width
-    if ellipsis and truncated and used < term_width:
-        padding = term_width - used - len(TRUNCATION_ELLIPSIS)
-        if padding >= 0:
-            parts.append(f"{' ' * padding}{DIM}{TRUNCATION_ELLIPSIS}{RESET}")
-    return "".join(parts)
-
-
-NOTE_PANEL_FOOTER_SEGMENTS = [
-    ("j/k", "navigate"),
-    ("e/Enter", "edit"),
-    ("d", "delete"),
-    ("Esc", "back"),
-]
-
-MAIN_FOOTER_SEGMENTS = [
-    ("j/k", "navigate"),
-    ("a/A", "approve hunk/file"),
-    ("c/f", "question/flag"),
-    ("gc/gf", "global"),
-    ("m", "manage notes"),
-    ("q", "quit & save"),
-    ("?", "help"),
-]
-
-
-def build_note_panel_header(note_count: int, term_width: int) -> str:
-    """Build the separator header line for the note panel."""
-    label = f" Notes ({note_count}) " if note_count else " Notes "
-    fill_width = max(0, term_width - len(label) - 1)
-    return f"─{label}{'─' * fill_width}"
-
-
-def ends_with_separator(s: str) -> bool:
-    """Return whether *s* ends with a non-alphanumeric, non-whitespace character."""
-    return bool(s) and not s[-1].isalnum() and not s[-1].isspace()
-
-
-def note_preview_text(text: str) -> str:
-    """Build a single-line preview from a possibly multi-line note."""
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    parts: list[str] = []
-    for i, line in enumerate(lines):
-        if parts and not ends_with_separator(lines[i - 1]):
-            parts.append(PREVIEW_INTERPUNCT)
-        elif parts:
-            parts.append(" ")
-        parts.append(line)
-    return " ".join("".join(parts).split())
-
-
-def build_note_panel_row(
-    ref: ManagedNoteRef, *, selected: bool, term_width: int
-) -> str:
-    """Build one rendered row for a note in the panel."""
-    cursor_mark = f"{BOLD}{NOTE_PANEL_CURSOR}{RESET}" if selected else " "
-    kind_str = (
-        f"{RED}flag{RESET}" if ref.kind is NoteKind.FLAG else f"{YELLOW}question{RESET}"
-    )
-    preview = note_preview_text(ref.text)
-    prefix = f"{cursor_mark}[{kind_str}] {DIM}{ref.scope_label}{RESET} "
-    max_preview = term_width - visible_width(prefix) - 1
-    if max_preview > 0 and len(preview) > max_preview:
-        preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
-    elif max_preview <= 0:
-        preview = ""
-    return f"{prefix}{preview}"
-
-
-def compute_note_panel_height(note_count: int, term_height: int) -> int:
-    """Compute the number of terminal rows the note panel should occupy."""
-    max_panel = max(NOTE_PANEL_MIN_HEIGHT, term_height // NOTE_PANEL_MAX_FRACTION)
-    content_rows = max(note_count, 1)
-    return min(content_rows + NOTE_PANEL_CHROME_ROWS, max_panel)
-
-
-def drain_fd(fd: int) -> None:
-    """Read and discard all currently available bytes from *fd*."""
-    while True:
-        ready, _, _ = select.select([fd], [], [], SELECT_IMMEDIATE)
-        if not ready:
-            break
-        if not os.read(fd, DRAIN_READ_SIZE):
-            break
-
-
-def debounce_events(read_fd: int, timeout: float) -> None:
-    """Drain *read_fd* until it stays quiet for *timeout* seconds."""
-    while True:
-        ready, _, _ = select.select([read_fd], [], [], timeout)
-        if not ready:
-            break
-        drain_fd(read_fd)
-
-
-def debounce_resize(wakeup_read_fd: int) -> None:
-    """Wait briefly to coalesce rapid resize signals into one redraw."""
-    debounce_events(wakeup_read_fd, RESIZE_DEBOUNCE_TIMEOUT)
-
-
-class Terminal:
-    """Terminal I/O state for the interactive TUI."""
-
-    DEFAULT_WIDTH = 120
-    DEFAULT_HEIGHT = 40
-    HELP_KEY_COLUMN_WIDTH = 14
-    HELP_BOX_MAX_WIDTH = 78
-    CLEAR_SCREEN = f"{CSI}2J{CSI}H"
-    ALT_SCREEN_ON = f"{CSI}?1049h"
-    ALT_SCREEN_OFF = f"{CSI}?1049l"
-    CURSOR_HIDE = f"{CSI}?25l"
-    CURSOR_SHOW = f"{CSI}?25h"
-
-    ESC_BYTE = b"\x1b"
-    ARROW_UP_SEQ = b"[A"
-    ARROW_DOWN_SEQ = b"[B"
-    KEY_CTRL_C = "\x03"
-    KEY_CTRL_D = "\x04"
-    KEY_CTRL_U = "\x15"
-    KEY_RESIZE = "resize"
-    KEY_RELOAD = "reload"
-
-    def __init__(self) -> None:
-        """Open ``/dev/tty`` read-write and capture geometry and attributes."""
-        self.fd = os.open("/dev/tty", os.O_RDWR)
-        self.refresh_geometry()
-        self.old_attrs: list[int | list[bytes | int]] = termios.tcgetattr(self.fd)
-        self.wakeup_read_fd: int | None = None
-
-    def __enter__(self) -> Self:
-        """Return self for context-managed terminal usage."""
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        """Close the terminal when leaving a context manager block."""
-        self.close()
-
-    def refresh_geometry(self) -> None:
-        """Re-read terminal dimensions, clamping to safe minimums."""
-        try:
-            ts = os.get_terminal_size(self.fd)
-            self.width = max(ts.columns, MIN_TERMINAL_WIDTH)
-            self.height = max(ts.lines, MIN_TERMINAL_HEIGHT)
-        except OSError:
-            self.width = max(
-                getattr(self, "width", self.DEFAULT_WIDTH), MIN_TERMINAL_WIDTH
+    """Open ``$EDITOR`` on a temporary file pre-filled with *existing*."""
+    with tempfile.TemporaryDirectory(prefix="review-") as tmpdir:
+        tmppath = str(Path(tmpdir) / "comment.cfg")
+        with open(tmppath, "w") as tmp:
+            jump_line = write_comment_template(tmp, location, existing, context_lines)
+        with open(TTY_DEVICE, "r+b", buffering=0) as terminal:
+            subprocess.run(
+                [os.environ["EDITOR"], f"{tmppath}:{jump_line}"],
+                check=True,
+                stdin=terminal,
+                stdout=terminal,
+                stderr=terminal,
             )
-            self.height = max(
-                getattr(self, "height", self.DEFAULT_HEIGHT), MIN_TERMINAL_HEIGHT
-            )
+        return read_comment_file(tmppath)
 
-    def apply_resize(self, delta_cache: dict[int, DeltaStream]) -> None:
-        """Refresh geometry and clear cache if width changed."""
-        old_width = self.width
-        self.refresh_geometry()
-        if self.width != old_width:
-            for stream in delta_cache.values():
-                stream.kill()
-            delta_cache.clear()
+
+class TtyDriver(LinuxDriver):
+    """Driver reading its keys from, and drawing on, the controlling terminal."""
+
+    def __init__(
+        self,
+        app: App[object],
+        *,
+        debug: bool = False,
+        mouse: bool = True,
+        size: tuple[int, int] | None = None,
+    ) -> None:
+        """Declare the input a terminal, whatever standard input happens to be."""
+        super().__init__(app, debug=debug, mouse=mouse, size=size)
+        self.tty_file: IO[str] | None = None
+        self.input_tty = True
+
+    def start_application_mode(self) -> None:
+        """Open the controlling terminal, then enter application mode on it."""
+        # Held open for the whole session; released in close().
+        raw = open(TTY_DEVICE, "r+b", buffering=0)  # noqa: SIM115
+        self.tty_file = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+        self.fileno = self.tty_file.fileno()
+        self._file = self.tty_file
+        super().start_application_mode()
+        self.write(ALTERNATE_SCROLL_OFF)
+        self.flush()
+
+    def stop_application_mode(self) -> None:
+        """Leave application mode, handing the wheel back to the terminal."""
+        super().stop_application_mode()
+        self.write(ALTERNATE_SCROLL_ON)
+        self.flush()
 
     def close(self) -> None:
-        """Restore terminal attributes and close the file descriptor."""
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
-        os.close(self.fd)
+        """Leave application mode and release the controlling terminal."""
+        super().close()
+        if self.tty_file is not None:
+            self.tty_file.close()
+            self.tty_file = None
 
-    def write(self, data: bytes | str) -> None:
-        """Write raw bytes or a string to the terminal display."""
-        if isinstance(data, str):
-            data = data.encode()
-        os.write(self.fd, data)
+    def _get_terminal_size(self) -> tuple[int, int]:
+        """Read the geometry of the controlling terminal."""
+        size = os.get_terminal_size(self.fileno)
+        return size.columns, size.lines
 
-    def read_key(
-        self,
-        wakeup_read_fd: int | None = None,
-        watch_read_fd: int | None = None,
-    ) -> str:
-        """Read one keypress, with optional wakeup and repo-watch pipes."""
-        extra_fds = [fd for fd in (wakeup_read_fd, watch_read_fd) if fd is not None]
-        if extra_fds:
-            readable, _, _ = select.select([self.fd, *extra_fds], [], [])
-            if watch_read_fd is not None and watch_read_fd in readable:
-                drain_fd(watch_read_fd)
-                debounce_events(watch_read_fd, WATCH_DEBOUNCE_TIMEOUT)
-                return self.KEY_RELOAD
-            if wakeup_read_fd is not None and wakeup_read_fd in readable:
-                drain_fd(wakeup_read_fd)
-                debounce_resize(wakeup_read_fd)
-                return self.KEY_RESIZE
-        ch = os.read(self.fd, 1)
-        if ch == self.ESC_BYTE:
-            return self.read_escape_sequence()
-        return ch.decode("utf-8", errors="replace")
 
-    def read_escape_sequence(self) -> str:
-        """Resolve an escape byte into an arrow key, or 'esc' on timeout."""
-        ready, _, _ = select.select([self.fd], [], [], ESC_SEQUENCE_TIMEOUT)
-        if not ready:
-            return "esc"
-        seq = os.read(self.fd, 2)
-        if seq == self.ARROW_UP_SEQ:
-            return "up"
-        if seq == self.ARROW_DOWN_SEQ:
-            return "down"
-        return "esc"
+class Chrome(Static):
+    """Status line drawn from the review state."""
 
-    def edit_comment(
-        self,
-        existing: str,
-        location: str,
-        context_lines: list[str] | None = None,
-    ) -> str:
-        """Edit a review comment using ``$EDITOR`` or an inline TTY prompt."""
-        editor = os.environ.get("EDITOR", "")
-        if editor:
-            return self.edit_comment_in_editor(
-                existing, location, editor, context_lines
-            )
-        return self.prompt_inline_comment(existing, location)
+    def __init__(self, state: ReviewState) -> None:
+        """Store the review *state* the chrome draws from."""
+        super().__init__()
+        self.state = state
 
-    def edit_comment_in_editor(
-        self,
-        existing: str,
-        location: str,
-        editor: str,
-        context_lines: list[str] | None = None,
-    ) -> str:
-        """Open *editor* with a temporary file pre-filled with *existing*."""
-        with tempfile.TemporaryDirectory(prefix="review-") as tmpdir:
-            tmppath = str(Path(tmpdir) / "comment.cfg")
-            with open(tmppath, "w") as tmp:
-                jump_line = write_comment_template(
-                    tmp, location, existing, context_lines
-                )
-            with duplicated_fd(self.fd) as dup_fd:
-                subprocess.run(
-                    [editor, f"{tmppath}:{jump_line}"],
-                    check=True,
-                    stdin=dup_fd,
-                    stdout=dup_fd,
-                    stderr=dup_fd,
-                )
-            return read_comment_file(tmppath)
 
-    def prompt_inline_comment(self, existing: str, location: str) -> str:
-        """Prompt for a single-line comment directly on the TTY."""
-        prompt = f"\r\n  Comment for {location}"
-        if existing:
-            prompt += f" [{existing}]"
-        prompt += ": "
-        self.write(prompt)
+class TopBar(Chrome):
+    """Bar naming the current hunk, its file and the note counters."""
 
-        old = termios.tcgetattr(self.fd)
-        cooked = termios.tcgetattr(self.fd)
-        cooked[3] |= termios.ECHO | termios.ICANON
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, cooked)
-        dup_fd = os.dup(self.fd)
-        try:
-            with os.fdopen(dup_fd, "r") as f:
-                line = f.readline().strip()
-        finally:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
-        return line or existing
+    def render(self) -> RenderResult:
+        """Draw the bar for the hunk the review is on."""
+        if self.state.is_empty:
+            return Text()
+        return build_top_bar(self.state, self.size.width)
 
-    def edit_text_outside_tui(
-        self,
-        existing_text: str,
-        prompt_label: str,
-        context_lines: list[str] | None = None,
-    ) -> str:
-        """Temporarily suspend the TUI, edit text, and restore raw mode."""
-        self.write(f"{self.CURSOR_SHOW}{self.ALT_SCREEN_OFF}")
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
-        comment = self.edit_comment(existing_text, prompt_label, context_lines)
-        self.refresh_geometry()
-        self.write(f"{self.ALT_SCREEN_ON}{self.CURSOR_HIDE}")
-        tty.setraw(self.fd)
-        return comment
 
-    def render_review_screen(  # noqa: PLR0913
-        self,
-        hunks: list[Hunk],
-        current_index: int,
-        delta_output: bytes,
-        global_notes: list[GlobalNote],
-        scroll_offset: int = 0,
-        *,
-        streaming: bool = False,
-    ) -> int:
-        """Render the full review screen and return the clamped scroll offset."""
-        hunk = hunks[current_index]
-        margins, _ = build_margin_markers(hunk)
-        diff_lines = build_display_lines(delta_output, self.width, margins)
-        viewport = compute_diff_viewport(len(diff_lines), self.height, scroll_offset)
+class Markers(Chrome):
+    """Line of one marker per hunk, showing what is left to review."""
 
-        self.write(self.CLEAR_SCREEN)
+    def render(self) -> RenderResult:
+        """Draw the marker of every hunk that fits."""
+        if self.state.is_empty:
+            return Text()
+        return build_progress_markers(self.state, self.size.width)
 
-        top_bar = build_top_bar(hunk, current_index, hunks, global_notes, self.width)
-        self.write(chrome_line(top_bar, self.width) + "\r\n")
 
-        markers = build_progress_markers(hunks, current_index, self.width)
-        self.write(chrome_line(markers, self.width) + "\r\n")
+class Diff(RichLog, can_focus=False):
+    """Scrollable view of the current hunk, as ``delta`` renders it."""
 
-        self.render_diff_body(diff_lines, viewport)
-        self.render_footer(viewport, streaming=streaming)
+    def __init__(self, redraw: Callable[[], None]) -> None:
+        """Store *redraw*, called to lay the diff out again on every resize."""
+        super().__init__(wrap=True, auto_scroll=False, min_width=0)
+        self.redraw = redraw
 
-        return viewport.scroll_offset
+    def on_resize(self, event: Resize) -> None:  # noqa: ARG002
+        """Lay the cached delta output out again for the new width."""
+        self.redraw()
 
-    def render_diff_body(
-        self,
-        diff_lines: list[bytes],
-        viewport: DiffViewport,
-    ) -> None:
-        """Render the visible diff lines with scroll indicators."""
-        if viewport.can_scroll_up:
-            self.write(
-                f"  {BOLD}{WHITE}▲ Ctrl-U to scroll up "
-                f"({viewport.lines_above} lines above){RESET}\r\n",
-            )
 
-        start = viewport.scroll_offset
-        end = start + viewport.visible_line_count
-        for line in diff_lines[start:end]:
-            self.write(line)
-            self.write(b"\r\n")
+class ReviewFooter(Footer):
+    """Footer naming every key an action answers to."""
 
-    def render_footer(
-        self,
-        viewport: DiffViewport,
-        footer_text: str | None = None,
-        *,
-        streaming: bool = False,
-    ) -> None:
-        """Render the scroll-down indicator and bottom key hints."""
-        if viewport.can_scroll_down:
-            self.write(f"{CSI}{self.height - 1};1H")
-            suffix = "" if streaming else f" ({viewport.lines_below} lines below)"
-            self.write(f"  {BOLD}{WHITE}▼ Ctrl-D to scroll down{suffix}{RESET}")
+    def compose(self) -> ComposeResult:
+        """Lay out the hints, each spelling out all the keys of its action."""
+        for widget in super().compose():
+            if isinstance(widget, FooterKey):
+                widget.key_display = self.keys_of_action(widget.action)
+            yield widget
 
-        self.write(f"{CSI}{self.height};1H")
-        if footer_text is None:
-            footer_text = build_keyhint_footer(
-                MAIN_FOOTER_SEGMENTS, self.width, ellipsis=True
-            )
-        self.write(chrome_line(footer_text, self.width))
-
-    def render_help_screen(self) -> None:
-        """Display the keyboard shortcuts help overlay."""
-        self.write(self.CLEAR_SCREEN)
-        bindings = [
-            ("j / ↓", "Next hunk"),
-            ("k / ↑", "Previous hunk"),
-            ("Ctrl-D", "Scroll diff down (half page)"),
-            ("Ctrl-U", "Scroll diff up (half page)"),
-            ("a", "Approve hunk (no comment needed)"),
-            ("A", "Approve all hunks in current file"),
-            ("c", "Add question (hunk or line target, opens $EDITOR)"),
-            ("f", "Add flag / request change (hunk or line target, opens $EDITOR)"),
-            (
-                "gc",
-                "Add global question (not tied to a specific hunk, opens $EDITOR)",
-            ),
-            (
-                "gf",
-                "Add global flag / request change (not tied to a specific hunk,"
-                " opens $EDITOR)",
-            ),
-            ("m", "Manage notes (edit / delete)"),
-            ("q / Ctrl-C", "Quit and write output to file"),
-            ("?", "Show help"),
-        ]
-        col = self.HELP_KEY_COLUMN_WIDTH
-        max_w = self.HELP_BOX_MAX_WIDTH
-        right_margin = 1
-        desc_max = max_w - 2 - col - right_margin  # 2-char indent + key column + margin
-        binding_rows: list[str] = []
-        for key, desc in bindings:
-            desc_lines = textwrap.wrap(desc, desc_max)
-            pad = " " * (col - len(key))
-            binding_rows.append(f"  {BOLD}{key}{RESET}{pad}{desc_lines[0]}")
-            cont_pad = " " * (2 + col)
-            binding_rows.extend(f"{cont_pad}{cont}" for cont in desc_lines[1:])
-        rows = [
-            f"{BOLD}  neorev — Keyboard Shortcuts{RESET}",
-            "",
-            *binding_rows,
-            "",
-            f"  Set {BOLD}$EDITOR{RESET} (e.g. hx, nvim) for multi-line",
-            "  comments. Without it, single-line prompt is used.",
-            "",
-            f"  {DIM}Press any key to return.{RESET}",
-        ]
-        width = max(visible_width(row) for row in rows) + right_margin
-        border = "─" * width
-        self.write(chrome_line(f"┌{border}┐", self.width) + "\r\n")
-        self.write(chrome_line(f"├{border}┤", self.width) + "\r\n")
-        self.write_box_rows(width, rows)
-        self.write(chrome_line(f"└{border}┘", self.width) + "\r\n")
-
-    def write_box_rows(self, width: int, rows: list[str]) -> None:
-        """Write a sequence of bordered rows, treating empty strings as blanks."""
-        for row in rows:
-            self.write_box_row(width, row)
-
-    def write_box_row(self, width: int, text: str = "") -> None:
-        """Write one bordered row padded to *width*."""
-        pad = width - visible_width(text)
-        self.write(chrome_line(f"│{text}{' ' * pad}│", self.width) + "\r\n")
-
-    def handle_manage_notes(self, state: ReviewState) -> None:
-        """Interactive panel to manage all notes with cursor navigation."""
-        panel = NotePanelState()
-        hunk = state.hunks[state.current_index]
-        delta_output = render_through_delta(hunk.raw, width=self.width)
-        while True:
-            refs = state.managed_note_refs()
-            if refs:
-                panel.cursor = min(panel.cursor, len(refs) - 1)
-            else:
-                panel.cursor = 0
-            self.render_note_panel(state, refs, panel, delta_output)
-            key = self.read_key(wakeup_read_fd=self.wakeup_read_fd)
-
-            if key == self.KEY_RESIZE:
-                self.refresh_geometry()
-                if delta_output:
-                    hunk = state.hunks[state.current_index]
-                    delta_output = render_through_delta(hunk.raw, width=self.width)
-                continue
-
-            if key in ("q", "esc", self.KEY_CTRL_C):
-                break
-
-            if key in ("j", "down") and refs:
-                panel.cursor = min(panel.cursor + 1, len(refs) - 1)
-            elif key in ("k", "up") and refs:
-                panel.cursor = max(panel.cursor - 1, 0)
-            elif key in ("e", "\r") and refs:
-                self.modify_managed_note(state, refs[panel.cursor], edit=True)
-                tty.setraw(self.fd)
-                break
-            elif key == "d" and refs:
-                self.modify_managed_note(state, refs[panel.cursor], edit=False)
-                break
-
-    def render_note_panel(
-        self,
-        state: ReviewState,
-        refs: list[ManagedNoteRef],
-        panel: NotePanelState,
-        delta_output: bytes,
-    ) -> None:
-        """Render the diff with a note management panel at the bottom."""
-        panel_height = compute_note_panel_height(len(refs), self.height)
-        diff_height = self.height - panel_height
-
-        self.write(self.CLEAR_SCREEN)
-
-        if delta_output and diff_height > CHROME_ROWS:
-            self.render_note_panel_diff(state, delta_output, diff_height)
-
-        panel_top = self.height - panel_height + 1
-        self.write(f"{CSI}{panel_top};1H")
-        header = build_note_panel_header(len(refs), self.width)
-        self.write(chrome_line(header, self.width) + "\r\n")
-
-        content_rows = panel_height - NOTE_PANEL_CHROME_ROWS
-        self.render_note_panel_rows(refs, panel, content_rows)
-
-        self.write(f"{CSI}{self.height};1H")
-        footer = build_keyhint_footer(NOTE_PANEL_FOOTER_SEGMENTS, self.width)
-        self.write(chrome_line(footer, self.width))
-
-    def render_note_panel_diff(
-        self,
-        state: ReviewState,
-        delta_output: bytes,
-        diff_height: int,
-    ) -> None:
-        """Render the reduced-height diff above the note panel."""
-        hunk = state.hunks[state.current_index]
-        margins, _ = build_margin_markers(hunk)
-        diff_lines = build_display_lines(delta_output, self.width, margins)
-        top_bar = build_top_bar(
-            hunk,
-            state.current_index,
-            state.hunks,
-            state.global_notes,
-            self.width,
+    def keys_of_action(self, action: str) -> str:
+        """Join the display of every shown key bound to *action*."""
+        return KEY_SEPARATOR.join(
+            self.app.get_key_display(active.binding)
+            for active in self.screen.active_bindings.values()
+            if active.binding.show and active.binding.action == action
         )
-        self.write(chrome_line(top_bar, self.width) + "\r\n")
-        markers = build_progress_markers(state.hunks, state.current_index, self.width)
-        self.write(chrome_line(markers, self.width) + "\r\n")
-        max_lines = diff_height - NOTE_PANEL_DIFF_CHROME_ROWS
-        start = min(state.scroll_offset, max(0, len(diff_lines) - max_lines))
-        end = start + max_lines
-        for line in diff_lines[start:end]:
-            self.write(line)
-            self.write(b"\r\n")
 
-    def render_note_panel_rows(
-        self,
-        refs: list[ManagedNoteRef],
-        panel: NotePanelState,
-        content_rows: int,
-    ) -> None:
-        """Render the scrollable note list inside the panel."""
-        empty_chrome = chrome_line("", self.width)
-        if not refs:
-            self.write(chrome_line(f"  {DIM}No notes yet.{RESET}", self.width) + "\r\n")
-            for _ in range(content_rows - 1):
-                self.write(empty_chrome + "\r\n")
-            return
 
-        if panel.cursor < panel.scroll_offset:
-            panel.scroll_offset = panel.cursor
-        elif panel.cursor >= panel.scroll_offset + content_rows:
-            panel.scroll_offset = panel.cursor - content_rows + 1
+class ReviewOptionList(OptionList, inherit_bindings=False):
+    """Option list navigable with the j and k keys of the review."""
 
-        for i in range(content_rows):
-            idx = panel.scroll_offset + i
-            if idx >= len(refs):
-                self.write(empty_chrome + "\r\n")
-                continue
-            row = build_note_panel_row(
-                refs[idx],
-                selected=idx == panel.cursor,
-                term_width=self.width,
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("j,down", "cursor_down", "next"),
+        Binding("k,up", "cursor_up", "previous"),
+        Binding("pageup", "page_up", "page up", show=False),
+        Binding("pagedown", "page_down", "page down", show=False),
+        Binding("home", "first", "first", show=False),
+        Binding("end", "last", "last", show=False),
+    ]
+
+
+class PickerList(ReviewOptionList):
+    """List of the diff lines of a hunk, one option per line."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("enter", "select", "pick line"),
+    ]
+
+    def __init__(self, rebuild: Callable[[int], None]) -> None:
+        """Store *rebuild*, called with the content width on every resize."""
+        super().__init__(compact=True)
+        self.rebuild = rebuild
+
+    def on_resize(self) -> None:
+        """Build the prompts again for the new width."""
+        self.rebuild(self.scrollable_content_region.width)
+
+
+class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
+    """Full-screen picker choosing which line of a hunk a note targets."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("h", "whole_hunk", "whole hunk"),
+        Binding("escape,q", "cancel", "cancel"),
+    ]
+
+    def __init__(self, state: ReviewState, kind: NoteKind, start_line: int) -> None:
+        """Render the current hunk of *state*, in the pick style of *kind*."""
+        super().__init__()
+        self.state = state
+        self.start_line = start_line
+        self.pick_style = (
+            STYLE_PICK_FLAG if kind is NoteKind.FLAG else STYLE_PICK_QUESTION
+        )
+        self.lines = render_through_delta(state.current_hunk.raw)
+        self.prompts: list[Text] = []
+        self.painted: int | None = None
+
+    def compose(self) -> ComposeResult:
+        """Lay out the chrome, the line list and the key hints."""
+        yield TopBar(self.state)
+        yield Markers(self.state)
+        yield PickerList(self.rebuild)
+        yield ReviewFooter()
+
+    def rebuild(self, width: int) -> None:
+        """Build one option per diff line, each padded to *width*."""
+        hunk = self.state.current_hunk
+        markers = build_margin_markers(hunk)
+        self.prompts = [
+            pad_to_width(
+                diff_line_text(line, markers[index] if index < len(markers) else ""),
+                width,
             )
-            self.write(chrome_line(row, self.width) + "\r\n")
+            for index, line in enumerate(self.lines)
+        ]
+        options = self.query_one(PickerList)
+        cursor = options.highlighted
+        self.painted = None
+        options.set_options(
+            Option(prompt, disabled=self.line_target(index) is None)
+            for index, prompt in enumerate(self.prompts)
+        )
+        options.highlighted = (
+            initial_picker_line(hunk, self.start_line) if cursor is None else cursor
+        )
+        options.focus()
 
-    def modify_managed_note(
+    def line_target(self, index: int) -> LineTarget | None:
+        """Return the note target of the line at display *index*, if it has one."""
+        lines = self.state.current_hunk.display_lines
+        return lines[index].target if index < len(lines) else None
+
+    def action_whole_hunk(self) -> None:
+        """Choose the whole hunk as the note target."""
+        self.dismiss(HunkTarget())
+
+    def action_cancel(self) -> None:
+        """Leave the picker without choosing a target."""
+        self.dismiss(None)
+
+    def on_option_list_option_highlighted(
+        self,
+        event: OptionList.OptionHighlighted,
+    ) -> None:
+        """Paint the line under the cursor, and repaint the one it left."""
+        options = event.option_list
+        if self.painted is not None:
+            options.replace_option_prompt_at_index(
+                self.painted, self.prompts[self.painted]
+            )
+        index = event.option_index
+        plain = Text(self.prompts[index].plain, justify="left")
+        plain.stylize(self.pick_style)
+        options.replace_option_prompt_at_index(index, plain)
+        self.painted = index
+
+    def on_option_list_option_selected(
+        self,
+        event: OptionList.OptionSelected,
+    ) -> None:
+        """Choose the selected line as the note target."""
+        self.dismiss(self.line_target(event.option_index))
+
+
+class NotesScreen(ModalScreen[None], inherit_bindings=False):
+    """Modal listing every note of the review for editing or deletion."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("e,enter", "edit", "edit"),
+        Binding("d", "delete", "delete"),
+        Binding("escape,q", "close", "close"),
+    ]
+
+    def __init__(
         self,
         state: ReviewState,
-        ref: ManagedNoteRef,
-        *,
-        edit: bool,
+        edit: Callable[[str, str, list[str] | None], str],
+        redraw_review: Callable[[], None],
     ) -> None:
-        """Edit or delete the note identified by *ref*."""
-        found = state.find_note_by_ref(ref)
-        if found is None:
-            return
+        """Store the review *state*, the *edit* callback and *redraw_review*."""
+        super().__init__()
+        self.state = state
+        self.edit = edit
+        self.redraw_review = redraw_review
+        self.notes: list[tuple[Hunk, HunkNote] | GlobalNote] = []
 
-        if isinstance(found, GlobalNote):
-            if edit:
-                new_text = self.edit_text_outside_tui(
-                    found.text, ref.kind.global_editor_label
-                )
-                if new_text:
-                    found.text = new_text
-                    return
-            state.global_notes.remove(found)
-            return
+    def compose(self) -> ComposeResult:
+        """Lay out the note list and the key hints."""
+        yield ReviewOptionList(compact=True)
+        yield ReviewFooter()
 
-        hunk, note = found
-        if edit:
-            if isinstance(note.target, LineTarget):
-                ctx = hunk.build_line_context(note.target)
+    def on_mount(self) -> None:
+        """Fill the note list and give it the keyboard."""
+        self.fill()
+        self.query_one(OptionList).focus()
+
+    def fill(self) -> None:
+        """Rebuild the note list from the review state."""
+        self.notes = self.state.all_notes()
+        options = self.query_one(OptionList)
+        cursor = options.highlighted or 0
+        options.set_options(note_option_text(entry) for entry in self.notes)
+        options.border_title = f"Notes ({len(self.notes)})"
+        if self.notes:
+            options.highlighted = min(cursor, len(self.notes) - 1)
+
+    def highlighted_note(self) -> tuple[Hunk, HunkNote] | GlobalNote | None:
+        """Return the note under the cursor, or None when the list is empty."""
+        index = self.query_one(OptionList).highlighted
+        return None if index is None else self.notes[index]
+
+    def action_edit(self) -> None:
+        """Rewrite the note under the cursor, dropping it when left empty."""
+        entry = self.highlighted_note()
+        if entry is None:
+            return
+        if isinstance(entry, GlobalNote):
+            text = self.edit(entry.text, entry.kind.global_editor_label, None)
+            if text:
+                entry.text = text
             else:
-                ctx = hunk.build_hunk_context(state.scroll_offset)
-            new_text = self.edit_text_outside_tui(note.text, ref.kind.editor_label, ctx)
-            if new_text:
-                note.text = new_text
+                self.state.global_notes.remove(entry)
+        else:
+            hunk, note = entry
+            context = hunk.build_editor_context(note.target, 0)
+            text = self.edit(note.text, note.kind.editor_label, context)
+            if text:
+                note.text = text
+            else:
+                hunk.notes.remove(note)
+        self.fill()
+
+    def action_delete(self) -> None:
+        """Drop the note under the cursor."""
+        entry = self.highlighted_note()
+        if entry is None:
+            return
+        if isinstance(entry, GlobalNote):
+            self.state.global_notes.remove(entry)
+        else:
+            hunk, note = entry
+            hunk.notes.remove(note)
+        self.fill()
+
+    def action_close(self) -> None:
+        """Leave the note list."""
+        self.redraw_review()
+        self.dismiss()
+
+
+class GlobalNoteKind(ModalScreen[NoteKind | None], inherit_bindings=False):
+    """Modal asking which kind of global note to add."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("c", "pick_question", "question"),
+        Binding("f", "pick_flag", "change request"),
+        Binding("escape,q", "cancel", "cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        """Lay out the prompt and the key hints."""
+        yield Label(GLOBAL_NOTE_PROMPT)
+        yield ReviewFooter()
+
+    def action_pick_question(self) -> None:
+        """Choose the global-question kind."""
+        self.dismiss(NoteKind.QUESTION)
+
+    def action_pick_flag(self) -> None:
+        """Choose the global-change-request kind."""
+        self.dismiss(NoteKind.FLAG)
+
+    def action_cancel(self) -> None:
+        """Leave without choosing a kind."""
+        self.dismiss(None)
+
+
+@dataclass
+class Session:
+    """Where a review session reads its diff from and writes its result to."""
+
+    output_path: str
+    diff_source: str | None
+    diff_text: str
+    watch: JjSource | None = None
+
+
+class ReviewScreen(Screen[None], inherit_bindings=False):
+    """Screen showing the hunk under review."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("j,down", "app.move(1)", "next hunk", tooltip="Move to the next hunk"),
+        Binding(
+            "k,up",
+            "app.move(-1)",
+            "previous hunk",
+            tooltip="Move to the previous hunk",
+        ),
+        Binding("a", "app.approve", "approve", tooltip="Approve, then move on"),
+        Binding("A", "app.approve_file", "approve file", tooltip="Approve this file"),
+        Binding("c", "app.question", "question", tooltip="Ask about a line or hunk"),
+        Binding("f", "app.flag", "flag", tooltip="Request a change on a line or hunk"),
+        Binding("g", "app.global_note", "global", tooltip="Add a note tied to no hunk"),
+        Binding("m", "app.manage_notes", "notes", tooltip="Edit or delete the notes"),
+        Binding("q", "app.quit", "save & quit", tooltip="Leave and write the output"),
+        Binding("question_mark", "app.toggle_help", "help", tooltip="Show every key"),
+        Binding("ctrl+d", "app.scroll_half_page(1)", "scroll down", show=False),
+        Binding("ctrl+u", "app.scroll_half_page(-1)", "scroll up", show=False),
+    ]
+
+    def __init__(self, state: ReviewState, redraw: Callable[[], None]) -> None:
+        """Store the review *state* and the *redraw* its diff view calls on a resize."""
+        super().__init__()
+        self.state = state
+        self.redraw = redraw
+
+    def compose(self) -> ComposeResult:
+        """Lay out the chrome, the diff view and the key hints."""
+        yield TopBar(self.state)
+        yield Markers(self.state)
+        yield Diff(self.redraw)
+        yield Static(EMPTY_DIFF_WAIT_MESSAGE, id=EMPTY_ID)
+        yield ReviewFooter()
+
+
+class ReviewApp(App[None], inherit_bindings=False):
+    """Interactive review of a diff, one hunk at a time."""
+
+    TITLE = "neorev"
+    CSS = REVIEW_CSS
+    ENABLE_COMMAND_PALETTE = False
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+c", "quit", show=False, priority=True, system=True),
+    ]
+
+    def __init__(self, state: ReviewState, session: Session) -> None:
+        """Set up the review of *state* on a driver reading the controlling terminal."""
+        super().__init__(driver_class=TtyDriver)
+        self.state = state
+        self.session = session
+        self.delta_cache: dict[int, list[bytes]] = {}
+        self.delta_complete: set[int] = set()
+        self.delta_generation = 0
+        self.delta_mismatch: str | None = None
+        self.margin_markers: list[str] = []
+        self.shown_index: int | None = None
+        self.painted = 0
+        self.review_written = False
+        self.reload_timer: Timer | None = None
+        self.watch_process: subprocess.Popen[bytes] | None = None
+        self.watch_stopped = False
+
+    def get_default_screen(self) -> ReviewScreen:
+        """Return the screen showing the review."""
+        return ReviewScreen(self.state, self.refresh_diff)
+
+    def on_mount(self) -> None:
+        """Draw in the colours of the terminal rather than in a palette of our own."""
+        self.theme = APP_THEME
+
+    def on_ready(self) -> None:
+        """Show the first hunk, and start watching the repository."""
+        self.show_hunk()
+        if self.session.watch is not None:
+            self.start_watching()
+
+    def on_unmount(self) -> None:
+        """Stop the repository watcher."""
+        self.stop_watching()
+
+    @property
+    def diff_log(self) -> Diff:
+        """Return the widget showing the current hunk."""
+        return self.query_one(Diff)
+
+    def show_hunk(self) -> None:
+        """Refresh the chrome and the diff view for the current hunk."""
+        empty = self.state.is_empty
+        for chrome in self.query(Chrome):
+            chrome.display = not empty
+            chrome.refresh()
+        self.diff_log.display = not empty
+        self.query_one(f"#{EMPTY_ID}", Static).display = empty
+        if empty:
+            self.shown_index = None
+            return
+        index = self.state.current_index
+        if index != self.shown_index:
+            self.diff_log.scroll_to(y=0, animate=False)
+            self.shown_index = index
+        streaming = index not in self.delta_complete
+        if streaming:
+            self.delta_cache.pop(index, None)
+        self.refresh_diff()
+        if streaming:
+            self.stream_hunk(index, self.state.current_hunk.raw, self.delta_generation)
+
+    def visible_end(self) -> int:
+        """Return the display index just past the last line the diff view shows."""
+        log = self.diff_log
+        return log.scroll_offset.y + log.scrollable_content_region.height
+
+    def refresh_diff(self) -> None:
+        """Redraw the diff view from the delta output cached for the current hunk."""
+        visible_end = self.visible_end()
+        self.diff_log.clear()
+        self.painted = 0
+        if not self.state.is_empty:
+            index = self.state.current_index
+            self.margin_markers = build_margin_markers(self.state.current_hunk)
+            self.write_cached_lines(index, visible_end)
+            self.paint_diff(index)
+
+    @work(exclusive=True, group=PAINT_WORKER_GROUP)
+    async def paint_diff(self, index: int) -> None:
+        """Write the delta output of hunk *index* below the view, batch by batch."""
+        batch = max(1, self.diff_log.scrollable_content_region.height)
+        while index == self.state.current_index and self.painted < len(
+            self.delta_cache.get(index, [])
+        ):
+            await asyncio.sleep(0)
+            if not self.is_running:
                 return
-        hunk.notes.remove(note)
+            self.write_cached_lines(index, self.painted + batch)
 
-    def handle_hunk_comment(self, state: ReviewState, key: str) -> None:
-        """Handle ``c`` (question) or ``f`` (flag) with target selection."""
-        hunk = state.hunks[state.current_index]
-        kind = NoteKind.FLAG if key == "f" else NoteKind.QUESTION
+    def write_cached_lines(self, index: int, upto: int) -> None:
+        """Write the cached lines of hunk *index* from the paint cursor to *upto*."""
+        lines = self.delta_cache.get(index, [])[self.painted : upto]
+        self.write_diff_lines(self.painted, lines)
+        self.painted += len(lines)
 
-        target: NoteTarget | None = (
-            self.pick_line_target(state, kind)
-            if any(dl.target is not None for dl in hunk.display_lines)
-            else HunkTarget()
+    def write_diff_lines(self, first: int, lines: list[bytes]) -> None:
+        """Append delta output *lines*, the first of them at display index *first*."""
+        log = self.diff_log
+        width = log.scrollable_content_region.width
+        if width <= 0:
+            return
+        markers = self.margin_markers
+        for offset, line in enumerate(lines):
+            index = first + offset
+            margin = markers[index] if index < len(markers) else ""
+            log.write(diff_line_text(line, margin), width=width)
+
+    @work(thread=True, exclusive=True, group=DELTA_WORKER_GROUP)
+    def stream_hunk(self, index: int, raw: str, generation: int) -> None:
+        """Run ``delta`` on the hunk at *index* and feed its lines to the view."""
+        worker = get_current_worker()
+        pending = b""
+        with delta_output(raw) as stdout:
+            while chunk := stdout.read(DELTA_READ_SIZE):
+                *complete, pending = (pending + chunk).split(b"\n")
+                if worker.is_cancelled:
+                    return
+                self.call_from_thread(
+                    self.absorb_delta_lines, index, generation, complete
+                )
+        if worker.is_cancelled:
+            return
+        if pending:
+            self.call_from_thread(self.absorb_delta_lines, index, generation, [pending])
+        self.call_from_thread(self.mark_delta_complete, index, generation)
+
+    def absorb_delta_lines(
+        self,
+        index: int,
+        generation: int,
+        lines: list[bytes],
+    ) -> None:
+        """Cache streamed delta *lines* of hunk *index* and show the new ones."""
+        if generation != self.delta_generation:
+            return
+        cache = self.delta_cache.setdefault(index, [])
+        if not cache and lines and not lines[0]:
+            lines = lines[1:]
+        cache.extend(lines)
+        if lines and index == self.state.current_index:
+            self.write_cached_lines(index, self.visible_end())
+            self.paint_diff(index)
+
+    def mark_delta_complete(self, index: int, generation: int) -> None:
+        """Record the delta output of hunk *index* as fully cached."""
+        if generation != self.delta_generation:
+            return
+        self.delta_complete.add(index)
+        self.check_delta_shape(self.state.hunks[index], self.delta_cache.get(index, []))
+
+    def check_delta_shape(self, hunk: Hunk, rows: list[bytes]) -> bool:
+        """Leave the review when a hunk with display lines has a different row count."""
+        expected = len(hunk.display_lines)
+        # A rename carries no body, so delta renders its header instead of lines.
+        if not expected or len(rows) == expected:
+            return True
+        self.delta_mismatch = (
+            f"{hunk.short_location}: {len(rows)} rows for {expected} diff lines"
         )
+        self.exit(return_code=os.EX_SOFTWARE)
+        return False
 
+    def edit_note_text(
+        self,
+        existing: str,
+        location: str,
+        context_lines: list[str] | None = None,
+    ) -> str:
+        """Suspend the review and edit *existing* in ``$EDITOR``."""
+        with self.suspend():
+            return edit_comment_in_editor(existing, location, context_lines)
+
+    def action_move(self, delta: int) -> None:
+        """Move the review by *delta* hunks."""
+        if not self.state.is_empty and self.state.move(delta):
+            self.show_hunk()
+
+    def action_scroll_half_page(self, direction: int) -> None:
+        """Scroll the diff half a page in *direction*."""
+        log = self.diff_log
+        half = max(1, log.scrollable_content_region.height // 2)
+        log.scroll_relative(y=direction * half, animate=False)
+
+    def action_approve(self) -> None:
+        """Approve the current hunk."""
+        if not self.state.is_empty:
+            self.state.approve()
+            self.show_hunk()
+
+    def action_approve_file(self) -> None:
+        """Approve every note-free hunk of the current file."""
+        if not self.state.is_empty:
+            self.state.approve_file()
+            self.show_hunk()
+
+    def action_question(self) -> None:
+        """Ask a question about the current hunk or one of its lines."""
+        self.start_hunk_note(NoteKind.QUESTION)
+
+    def action_flag(self) -> None:
+        """Request a change on the current hunk or one of its lines."""
+        self.start_hunk_note(NoteKind.FLAG)
+
+    def action_global_note(self) -> None:
+        """Add a note tied to no particular hunk."""
+        self.push_screen(GlobalNoteKind(), self.write_global_note)
+
+    def action_manage_notes(self) -> None:
+        """Open the list of every note taken so far."""
+        self.push_screen(NotesScreen(self.state, self.edit_note_text, self.show_hunk))
+
+    def action_toggle_help(self) -> None:
+        """Show the key panel, or hide it when it is already up."""
+        if self.screen.query(HelpPanel):
+            self.action_hide_help_panel()
+        else:
+            self.action_show_help_panel()
+
+    def start_hunk_note(self, kind: NoteKind) -> None:
+        """Ask which line a note of *kind* targets, then write it."""
+        if self.state.is_empty:
+            return
+        hunk = self.state.current_hunk
+        if not hunk.selectable_lines:
+            self.write_hunk_note(kind, HunkTarget())
+            return
+        picker = LinePicker(self.state, kind, self.diff_log.scroll_offset.y)
+        if not self.check_delta_shape(hunk, picker.lines):
+            return
+        self.push_screen(picker, partial(self.write_hunk_note, kind))
+
+    def write_hunk_note(self, kind: NoteKind, target: NoteTarget | None) -> None:
+        """Edit the note of *kind* on *target*, dropping it when left empty."""
         if target is None:
             return
-
+        hunk = self.state.current_hunk
         existing = hunk.get_note(target)
-        existing_text = existing.text if existing else ""
-
-        if isinstance(target, LineTarget):
-            ctx = hunk.build_line_context(target)
-        else:
-            ctx = hunk.build_hunk_context(state.scroll_offset)
-        comment = self.edit_text_outside_tui(
-            existing_text,
-            f"{hunk.short_location} @ {target} [{kind.editor_label}]",
-            ctx,
+        text = self.edit_note_text(
+            existing.text if existing is not None else "",
+            f"{hunk.short_location}{HEADING_TARGET_SEPARATOR}{target}"
+            f" [{kind.editor_label}]",
+            hunk.build_editor_context(target, self.diff_log.scroll_offset.y),
         )
-
-        if comment:
-            hunk.upsert_note(kind, target, comment)
+        if text:
+            hunk.upsert_note(kind, target, text)
             hunk.approved = False
             if isinstance(target, HunkTarget):
-                state.current_index = state.find_next_unhandled()
-        elif existing:
+                self.state.advance_to_next_unhandled()
+        elif existing is not None:
             hunk.remove_note(target)
+        self.show_hunk()
 
-    def pick_line_target(self, state: ReviewState, kind: NoteKind) -> NoteTarget | None:
-        """Display a full-screen delta line picker and return the chosen target."""
-        hunk = state.hunks[state.current_index]
-        selectable = [dl for dl in hunk.display_lines if dl.target is not None]
-        if not selectable:
-            return None
-
-        cursor = initial_line_picker_cursor(selectable, hunk, state.scroll_offset)
-        scroll = state.scroll_offset
-        highlight = (
-            BG_YELLOW_BLACK.encode() if kind is NoteKind.FLAG else REVERSE.encode()
-        )
-        delta_output = render_through_delta(
-            hunk.raw,
-            width=self.width,
-        )
-        while True:
-            scroll = self.render_line_picker(
-                state,
-                selectable,
-                cursor,
-                delta_output,
-                scroll,
-                highlight_escape=highlight,
-            )
-            key = self.read_key(wakeup_read_fd=self.wakeup_read_fd)
-            if key == self.KEY_RESIZE:
-                self.refresh_geometry()
-                delta_output = render_through_delta(
-                    hunk.raw,
-                    width=self.width,
-                )
-                continue
-            if key in ("q", "esc", self.KEY_CTRL_C):
-                return None
-            if key == "h":
-                return HunkTarget()
-            if key in ("j", "down"):
-                cursor = min(cursor + 1, len(selectable) - 1)
-            elif key in ("k", "up"):
-                cursor = max(cursor - 1, 0)
-            elif key == LINE_PICKER_SELECT_KEY:
-                return selectable[cursor].target
-
-    def render_line_picker(  # noqa: PLR0913
-        self,
-        state: ReviewState,
-        selectable: list[DisplayLine],
-        cursor: int,
-        delta_output: bytes,
-        scroll_offset: int,
-        *,
-        highlight_escape: bytes = REVERSE.encode(),
-    ) -> int:
-        """Render full-screen line picker with delta formatting."""
-        hunk = state.hunks[state.current_index]
-        selected_target = selectable[cursor].target
-        margin_markers, highlight_idx = build_margin_markers(hunk, selected_target)
-        diff_lines = build_display_lines(
-            delta_output,
-            self.width,
-            margin_markers,
-            highlight_index=highlight_idx,
-            highlight_escape=highlight_escape,
-        )
-
-        # Ensure cursor line is visible
-        cursor_idx = next(
-            (i for i, dl in enumerate(hunk.display_lines) if dl is selectable[cursor]),
-            None,
-        )
-        if cursor_idx is not None:
-            visible = self.height - CHROME_ROWS - SCROLL_INDICATOR_ROWS
-            if cursor_idx < scroll_offset:
-                scroll_offset = cursor_idx
-            elif cursor_idx >= scroll_offset + visible:
-                scroll_offset = cursor_idx - visible + 1
-
-        viewport = compute_diff_viewport(
-            len(diff_lines),
-            self.height,
-            scroll_offset,
-        )
-
-        self.write(self.CLEAR_SCREEN)
-        top_bar = build_top_bar(
-            hunk,
-            state.current_index,
-            state.hunks,
-            state.global_notes,
-            self.width,
-        )
-        self.write(chrome_line(top_bar, self.width) + "\r\n")
-        markers = build_progress_markers(state.hunks, state.current_index, self.width)
-        self.write(chrome_line(markers, self.width) + "\r\n")
-        self.render_diff_body(diff_lines, viewport)
-        picker_footer = build_keyhint_footer(LINE_PICKER_FOOTER_SEGMENTS, self.width)
-        self.render_footer(viewport, picker_footer)
-        return viewport.scroll_offset
-
-    def handle_global_note(self, state: ReviewState, key: str) -> None:
-        """Handle ``gc`` (global question) or ``gf`` (global flag)."""
-        kind = NoteKind.FLAG if key == "f" else NoteKind.QUESTION
-        text = self.edit_text_outside_tui("", kind.global_editor_label)
-        if text:
-            state.global_notes.append(GlobalNote(kind=kind, text=text))
-
-    def handle_scroll(
-        self,
-        key: str,
-        state: ReviewState,
-        redraw: Callable[[], None],
-    ) -> bool:
-        """Handle scroll keys (Ctrl-D/Ctrl-U), returning True if handled."""
-        half = max(1, (self.height - CHROME_ROWS - SCROLL_INDICATOR_ROWS) // 2)
-        if key == self.KEY_CTRL_D:
-            state.scroll_offset += half
-        elif key == self.KEY_CTRL_U:
-            state.scroll_offset = max(0, state.scroll_offset - half)
-        else:
-            return False
-        redraw()
-        return True
-
-    def dispatch_key(
-        self,
-        key: str,
-        state: ReviewState,
-        redraw: Callable[[], None],
-    ) -> bool:
-        """Handle a single keypress, returning True if a full redraw is needed."""
-        if self.handle_scroll(key, state, redraw):
-            return False
-
-        if state.navigate(key):
-            state.scroll_offset = 0
-            return True
-
-        if key == "a":
-            state.approve()
-        elif key == "A":
-            state.approve_file()
-        elif key in ("c", "f"):
-            self.handle_hunk_comment(state, key)
-        elif key == "g":
-            key2 = self.read_key()
-            if key2 not in ("c", "f"):
-                return False
-            self.handle_global_note(state, key2)
-        elif key == "m":
-            self.handle_manage_notes(state)
-        elif key == "?":
-            self.render_help_screen()
-            self.read_key()
-        else:
-            return False
-        return True
-
-    def run_review_loop(
-        self,
-        state: ReviewState,
-        delta_cache: dict[int, DeltaStream],
-        watch_read_fd: int | None = None,
-    ) -> LoopResult:
-        """Run the interactive key-handling loop until quit or repo change."""
-        with nonblocking_pipe() as (wakeup_r, wakeup_w):
-
-            def get_stream(index: int) -> DeltaStream:
-                """Return the cached delta stream for hunk at *index*."""
-                if index not in delta_cache:
-                    delta_cache[index] = DeltaStream(
-                        state.hunks[index].raw,
-                        width=self.width,
-                    )
-                return delta_cache[index]
-
-            def redraw() -> None:
-                """Redraw the review screen."""
-                viewport_lines = self.height - CHROME_ROWS
-                needed = (
-                    state.scroll_offset + viewport_lines + DELTA_VIEWPORT_LINE_BUFFER
-                )
-                stream = get_stream(state.current_index)
-                delta_output = stream.get_output(needed)
-                state.scroll_offset = self.render_review_screen(
-                    state.hunks,
-                    state.current_index,
-                    delta_output,
-                    state.global_notes,
-                    state.scroll_offset,
-                    streaming=not stream.exhausted,
-                )
-
-            prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
-            prev_handler = signal.getsignal(signal.SIGWINCH)
-            signal.signal(signal.SIGWINCH, lambda *_: None)
-            self.wakeup_read_fd = wakeup_r
-            try:
-                tty.setraw(self.fd)
-                redraw()
-
-                while True:
-                    key = self.read_key(
-                        wakeup_read_fd=wakeup_r, watch_read_fd=watch_read_fd
-                    )
-
-                    if key == self.KEY_RESIZE:
-                        self.apply_resize(delta_cache)
-                        redraw()
-                        continue
-
-                    if key == self.KEY_RELOAD:
-                        return LoopResult.RELOAD
-
-                    if key in ("q", self.KEY_CTRL_C):
-                        return LoopResult.QUIT
-
-                    handled = self.dispatch_key(key, state, redraw)
-                    if handled:
-                        redraw()
-            finally:
-                for stream in delta_cache.values():
-                    stream.kill()
-                self.wakeup_read_fd = None
-                signal.signal(signal.SIGWINCH, prev_handler)
-                signal.set_wakeup_fd(prev_wakeup_fd)
-
-    def render_wait_screen(self) -> None:
-        """Render the placeholder shown while the watched diff is empty."""
-        self.write(self.CLEAR_SCREEN)
-        row = max(1, self.height // 2)
-        col = max(1, (self.width - visible_width(EMPTY_DIFF_WAIT_MESSAGE)) // 2 + 1)
-        self.write(f"{CSI}{row};{col}H{DIM}{EMPTY_DIFF_WAIT_MESSAGE}{RESET}")
-        self.write(f"{CSI}{self.height};1H")
-        footer = build_keyhint_footer(WATCH_WAIT_FOOTER_SEGMENTS, self.width)
-        self.write(chrome_line(footer, self.width))
-
-    def run_wait_screen(self, watch_read_fd: int) -> LoopResult:
-        """Wait on the empty-diff placeholder until a repo change or quit."""
-        with nonblocking_pipe() as (wakeup_r, wakeup_w):
-            prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
-            prev_handler = signal.getsignal(signal.SIGWINCH)
-            signal.signal(signal.SIGWINCH, lambda *_: None)
-            self.wakeup_read_fd = wakeup_r
-            try:
-                tty.setraw(self.fd)
-                self.render_wait_screen()
-                while True:
-                    key = self.read_key(
-                        wakeup_read_fd=wakeup_r, watch_read_fd=watch_read_fd
-                    )
-                    if key == self.KEY_RELOAD:
-                        return LoopResult.RELOAD
-                    if key == self.KEY_RESIZE:
-                        self.refresh_geometry()
-                        self.render_wait_screen()
-                    elif key in ("q", self.KEY_CTRL_C):
-                        return LoopResult.QUIT
-            finally:
-                self.wakeup_read_fd = None
-                signal.signal(signal.SIGWINCH, prev_handler)
-                signal.set_wakeup_fd(prev_wakeup_fd)
-
-
-class RepoWatcher:
-    """Monitors repository paths via ``inotifywait`` and signals on a pipe."""
-
-    def __init__(self, paths: list[str]) -> None:
-        """Spawn ``inotifywait`` on *paths* and a thread forwarding events."""
-        self.read_fd, self.write_fd = os.pipe()
-        os.set_blocking(self.read_fd, False)
-        self.process: subprocess.Popen[bytes] | None = None
-        if paths:
-            self.process = subprocess.Popen(
-                [
-                    "inotifywait",
-                    "-m",
-                    "-q",
-                    "-e",
-                    "close_write,create,delete,move",
-                    "--",
-                    *paths,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        self.reader: threading.Thread = threading.Thread(target=self.pump, daemon=True)
-        self.reader.start()
-
-    def pump(self) -> None:
-        """Forward every ``inotifywait`` event line as one wakeup byte."""
-        if self.process is None or self.process.stdout is None:
+    def write_global_note(self, kind: NoteKind | None) -> None:
+        """Edit a global note of *kind* and add it to the review."""
+        if kind is None:
             return
-        for _ in self.process.stdout:
-            with suppress(OSError):
-                os.write(self.write_fd, b"\x01")
+        text = self.edit_note_text("", kind.global_editor_label)
+        if text:
+            self.state.global_notes.append(GlobalNote(kind=kind, text=text))
+        self.show_hunk()
 
-    def close(self) -> None:
-        """Terminate ``inotifywait`` and release the pipe and thread."""
-        if self.process is not None:
-            if self.process.poll() is None:
-                self.process.terminate()
-                self.process.wait()
-            if self.process.stdout is not None:
-                self.process.stdout.close()
-        self.reader.join()
-        os.close(self.read_fd)
-        os.close(self.write_fd)
+    def start_watching(self) -> None:
+        """Watch the repository for changes, from scratch."""
+        self.watch_stopped = False
+        self.watch_repo()
+
+    @work(thread=True, exclusive=True, group=WATCH_WORKER_GROUP)
+    def watch_repo(self) -> None:
+        """Report every change of the watched repository as a pending reload."""
+        root = jj_root()
+        paths = watch_paths(root) if root is not None else []
+        worker = get_current_worker()
+        if not paths or worker.is_cancelled or self.watch_stopped:
+            return
+        with inotify_events(paths) as (process, events):
+            self.watch_process = process
+            if worker.is_cancelled or self.watch_stopped:
+                return
+            for _ in events:
+                if worker.is_cancelled:
+                    return
+                self.call_from_thread(self.schedule_reload)
+
+    def stop_watching(self) -> None:
+        """Terminate the ``inotifywait`` process, if one is running."""
+        self.watch_stopped = True
+        if self.watch_process is not None and self.watch_process.poll() is None:
+            self.watch_process.terminate()
+            self.watch_process.wait()
+        self.watch_process = None
+
+    def schedule_reload(self) -> None:
+        """Restart the timer coalescing repository events into one reload."""
+        if self.reload_timer is not None:
+            self.reload_timer.stop()
+        self.reload_timer = self.set_timer(WATCH_DEBOUNCE_TIMEOUT, self.reload)
+
+    def reload(self) -> None:
+        """Rebuild the review from the watched source after a repository change."""
+        source = self.session.watch
+        if source is None:
+            return
+        if not isinstance(self.screen, ReviewScreen):
+            self.schedule_reload()
+            return
+        self.save_review()
+        diff_text, self.session.diff_source = fetch_watch_diff(source)
+        if diff_text == self.session.diff_text and not self.state.is_empty:
+            return
+        self.session.diff_text = diff_text
+        self.state.adopt(build_watch_state(diff_text, self.session.output_path))
+        self.delta_cache.clear()
+        self.delta_complete.clear()
+        self.delta_generation += 1
+        self.shown_index = None
+        self.stop_watching()
+        self.start_watching()
+        self.show_hunk()
+
+    def save_review(self) -> None:
+        """Write the review to its output file when it holds any user action."""
+        if not review_has_content(self.state.hunks, self.state.global_notes):
+            return
+        write_review_output(
+            self.session.output_path,
+            self.state.hunks,
+            self.state.global_notes,
+            self.session.diff_source,
+            quiet=True,
+        )
+        self.review_written = True
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2822,15 +2425,6 @@ def watch_paths(root: str) -> list[str]:
     return [str(op_heads)] if op_heads.exists() else []
 
 
-def restart_watcher(old: RepoWatcher | None) -> RepoWatcher:
-    """Close *old* (if any) and start a fresh watcher with current paths."""
-    if old is not None:
-        old.close()
-    root = jj_root()
-    paths = watch_paths(root) if root is not None else []
-    return RepoWatcher(paths)
-
-
 def fetch_watch_diff(source: JjSource) -> tuple[str, str]:
     """Fetch the diff for *source*, returning ``("", label)`` on failure."""
     cmd = jj_diff_command(source.rev)
@@ -2842,13 +2436,9 @@ def fetch_watch_diff(source: JjSource) -> tuple[str, str]:
     return result.stdout, label
 
 
-def build_watch_state(diff_text: str, output_path: str) -> ReviewState | None:
-    """Build review state for *diff_text*, or None when it has no hunks."""
-    if not diff_text.strip():
-        return None
-    hunks = parse_diff(diff_text)
-    if not hunks:
-        return None
+def build_watch_state(diff_text: str, output_path: str) -> ReviewState:
+    """Build review state for *diff_text*, hunk-less when it holds no diff."""
+    hunks = parse_diff(diff_text) if diff_text.strip() else []
     global_notes = load_or_resume_review(hunks, output_path, quiet=True)
     return ReviewState(
         hunks=hunks,
@@ -2857,58 +2447,25 @@ def build_watch_state(diff_text: str, output_path: str) -> ReviewState | None:
     )
 
 
-def watch_loop(
-    term: Terminal,
-    args: argparse.Namespace,
-    source: JjSource,
-) -> bool:
-    """Drive watch-mode review; return whether a review file was written."""
+def run_watch_session(args: argparse.Namespace, source: JjSource) -> None:
+    """Run watch mode, handling the exit side effects."""
     if args.clear:
         Path(args.output).unlink(missing_ok=True)
-    watcher = restart_watcher(None)
     diff_text, diff_source = fetch_watch_diff(source)
-    state = build_watch_state(diff_text, args.output)
-    review_written = False
-    try:
-        while True:
-            if state is None:
-                result = term.run_wait_screen(watcher.read_fd)
-            else:
-                delta_cache: dict[int, DeltaStream] = {}
-                result = term.run_review_loop(state, delta_cache, watcher.read_fd)
-                if review_has_content(state.hunks, state.global_notes):
-                    write_review_output(
-                        args.output,
-                        state.hunks,
-                        state.global_notes,
-                        diff_source,
-                        quiet=True,
-                    )
-                    review_written = True
-            if result is LoopResult.QUIT:
-                return review_written
-            new_diff, diff_source = fetch_watch_diff(source)
-            if new_diff == diff_text and state is not None:
-                continue
-            diff_text = new_diff
-            watcher = restart_watcher(watcher)
-            state = build_watch_state(diff_text, args.output)
-    finally:
-        watcher.close()
-
-
-def run_watch_session(args: argparse.Namespace, source: JjSource) -> None:
-    """Run watch mode inside the alt screen, handling exit side effects."""
-    with Terminal() as term:
-        term.write(f"{term.ALT_SCREEN_ON}{term.CURSOR_HIDE}")
-        try:
-            review_written = watch_loop(term, args, source)
-        finally:
-            term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
-    if review_written:
+    session = Session(
+        output_path=args.output,
+        diff_source=diff_source,
+        diff_text=diff_text,
+        watch=source,
+    )
+    app = ReviewApp(build_watch_state(diff_text, args.output), session)
+    app.run(mouse=False)
+    app.save_review()
+    if app.review_written:
         sys.stderr.write(f"Review written to {compact_path(args.output)}\n")
         if args.clip:
             copy_output_reference_to_clipboard(args.output)
+    exit_on_delta_mismatch(app)
 
 
 def run_single_session(
@@ -2923,29 +2480,35 @@ def run_single_session(
         Path(args.output).unlink(missing_ok=True)
 
     global_notes = load_or_resume_review(hunks, args.output)
-
-    delta_cache: dict[int, DeltaStream] = {}
     state = ReviewState(
         hunks=hunks,
         global_notes=global_notes,
         current_index=ReviewState.initial_index(hunks),
     )
+    session = Session(
+        output_path=args.output,
+        diff_source=diff_source,
+        diff_text=diff_text,
+    )
+    app = ReviewApp(state, session)
+    app.run(mouse=False)
 
-    with Terminal() as term:
-        term.write(f"{term.ALT_SCREEN_ON}{term.CURSOR_HIDE}")
-        try:
-            term.run_review_loop(state, delta_cache)
-        finally:
-            term.write(f"{term.CURSOR_SHOW}{term.ALT_SCREEN_OFF}")
+    if review_has_content(hunks, global_notes):
+        if review_is_all_clear(hunks, global_notes):
+            sys.stderr.write(ALL_CLEAR_MESSAGE)
+        else:
+            write_review_output(args.output, hunks, global_notes, diff_source)
+            if args.clip:
+                copy_output_reference_to_clipboard(args.output)
+    exit_on_delta_mismatch(app)
 
-    if not review_has_content(hunks, global_notes):
+
+def exit_on_delta_mismatch(app: ReviewApp) -> None:
+    """Report delta output that did not line up with the diff, and exit."""
+    if app.delta_mismatch is None:
         return
-    if review_is_all_clear(hunks, global_notes):
-        sys.stderr.write(ALL_CLEAR_MESSAGE)
-    else:
-        write_review_output(args.output, hunks, global_notes, diff_source)
-        if args.clip:
-            copy_output_reference_to_clipboard(args.output)
+    sys.stderr.write(f"{DELTA_MISMATCH_MESSAGE} ({app.delta_mismatch})\n")
+    sys.exit(os.EX_SOFTWARE)
 
 
 def resolve_diff_origin(
@@ -2972,6 +2535,10 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     resolve_args(args)
+
+    if not os.environ.get("EDITOR"):
+        sys.stderr.write("Error: $EDITOR is not set — required to write notes.\n")
+        exit(os.EX_USAGE)
 
     if args.watch and shutil.which("inotifywait") is None:
         sys.stderr.write("Error: 'inotifywait' not found — required for --watch.\n")

@@ -1,4 +1,4 @@
-[tool.ruff.lint]
+[lint]
 select = ["ALL"]
 ignore = [
     "COM812",  # missing trailing comma
