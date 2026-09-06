@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --python-preference only-system --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = ["rich>=15,<16"]
+# ///
 """neorev — human review for agent diffs."""
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import threading
 import tty
 from collections import Counter
@@ -26,9 +31,16 @@ from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.cells import split_graphemes
+from rich.console import Console
+from rich.segment import Segment
+from rich.text import Text
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from typing import IO, Self
+
+    from rich.style import Style
 
 CSI = "\033["
 BOLD = f"{CSI}1m"
@@ -45,8 +57,10 @@ WHITE = f"{CSI}37m"
 BG_CYAN = f"{CSI}46m"
 BG_YELLOW_BLACK = f"{CSI}43;30m"
 REVERSE = f"{CSI}7m"
+ERASE_TO_LINE_END = f"{CSI}0K"
 
-ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+CONSOLE = Console()
+STYLE_PROBE_CHAR = " "
 
 HUNK_BODY_MAX_LINES = 10
 HUNK_BODY_CONTEXT_LINES = HUNK_BODY_MAX_LINES // 2
@@ -105,7 +119,6 @@ DIFF_MODIFIED_ICON = ""
 RENAME_ARROW = "→"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = b"  "
-ANSI_ESCAPE_BYTES_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 HUNK_RANGE_LINE_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@"
 )
@@ -1282,105 +1295,57 @@ def nonblocking_pipe() -> Iterator[tuple[int, int]]:
         os.close(write_fd)
 
 
-def visible_len(text: str) -> int:
-    """Return the visible character count of *text* (ignoring ANSI escapes)."""
-    return len(ANSI_ESCAPE_TEXT_RE.sub("", text))
+def visible_width(text: str) -> int:
+    """Return the terminal column count of *text* (ignoring ANSI escapes)."""
+    return Text.from_ansi(text).cell_len
 
 
-def truncate_ansi_text(text: str, max_visible: int) -> str:
-    """Truncate *text* to *max_visible* visible chars, preserving ANSI escapes."""
-    if max_visible <= 0:
-        return ""
-    if visible_len(text) <= max_visible:
-        return text
-    budget = max_visible - len(TRUNCATION_ELLIPSIS)
-    if budget <= 0:
-        return TRUNCATION_ELLIPSIS[:max_visible]
-    result: list[str] = []
-    visible_count = 0
-    pos = 0
-    while pos < len(text) and visible_count < budget:
-        m = ANSI_ESCAPE_TEXT_RE.match(text, pos)
-        if m:
-            result.append(m.group())
-            pos = m.end()
-        else:
-            result.append(text[pos])
-            visible_count += 1
-            pos += 1
-    result.append(RESET)
-    result.append(TRUNCATION_ELLIPSIS)
-    return "".join(result)
+def erase_fill_style(line: str) -> Style | None:
+    """Return the style active at *line*'s erase-to-end-of-line sequence, if any."""
+    prefix, separator, _ = line.partition(ERASE_TO_LINE_END)
+    if not separator:
+        return None
+    probed = Text.from_ansi(prefix + STYLE_PROBE_CHAR)
+    return probed.get_style_at_offset(CONSOLE, -1)
 
 
-def wrap_plain_text(text: str, max_width: int) -> list[str]:
-    """Word-wrap plain *text* (no ANSI) to *max_width* chars per line."""
-    if len(text) <= max_width:
-        return [text]
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}" if current else word
-        if len(candidate) > max_width and current:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines
+def render_ansi_text(
+    text: Text, width: int | None = None, pad_style: Style | None = None
+) -> str:
+    """Render *text* as an ANSI string, padded to *width* with *pad_style*."""
+    segments = list(text.render(CONSOLE))
+    if width is not None:
+        fill = (
+            pad_style
+            if pad_style is not None
+            else next((s.style for s in reversed(segments) if s.text), None)
+        )
+        segments = Segment.adjust_line_length(segments, width, style=fill)
+    return "".join(s.style.render(s.text) if s.style else s.text for s in segments)
 
 
-def update_active_sgr(esc: str, active_sgr: list[str]) -> None:
-    """Track active SGR sequences, clearing on reset."""
-    if esc.endswith("m"):
-        if esc in (f"{CSI}0m", f"{CSI}m"):
-            active_sgr.clear()
-        else:
-            active_sgr.append(esc)
+def fold_offsets(text: str, width: int) -> list[int]:
+    """Return the offsets at which *text* must be split to fit *width* columns."""
+    offsets: list[int] = []
+    used = 0
+    spans, _ = split_graphemes(text)
+    for start, _, grapheme_width in spans:
+        if used + grapheme_width > width:
+            offsets.append(start)
+            used = 0
+        used += grapheme_width
+    return offsets
 
 
 def wrap_ansi_line_to_rows(line: bytes, term_width: int) -> list[bytes]:
     """Split one ANSI-colored line into terminal-width display rows."""
-    if term_width <= 1:
-        return [line]
-
-    text = line.decode("utf-8", errors="replace")
-    chunks: list[str] = []
-    current: list[str] = []
-    visible = 0
-    active_sgr: list[str] = []
-
-    def flush_chunk() -> None:
-        nonlocal current, visible
-        if active_sgr:
-            current.append(RESET)
-        chunks.append("".join(current))
-        current = list(active_sgr)
-        visible = 0
-
-    def append_plain(plain: str) -> None:
-        nonlocal visible
-        for ch in plain:
-            if visible >= term_width:
-                flush_chunk()
-            current.append(ch)
-            visible += 1
-
-    pos = 0
-    for match in ANSI_ESCAPE_TEXT_RE.finditer(text):
-        append_plain(text[pos : match.start()])
-        esc = match.group(0)
-        current.append(esc)
-        update_active_sgr(esc, active_sgr)
-        pos = match.end()
-    append_plain(text[pos:])
-
-    if current or not chunks:
-        chunks.append("".join(current))
-
-    return [chunk.encode("utf-8", errors="replace") for chunk in chunks]
+    decoded = line.decode("utf-8", errors="replace")
+    text = Text.from_ansi(decoded)
+    fill = erase_fill_style(decoded)
+    return [
+        render_ansi_text(row, term_width, fill).encode("utf-8", errors="replace")
+        for row in text.divide(fold_offsets(text.plain, term_width))
+    ]
 
 
 def build_margin_markers(
@@ -1446,35 +1411,19 @@ def build_display_lines(
     display_lines: list[bytes] = []
     for i, line in enumerate(raw_lines):
         highlighted = highlight_index is not None and i == highlight_index
-        if highlighted:
-            plain = ANSI_ESCAPE_BYTES_RE.sub(b"", line)
-            wrapped = wrap_ansi_line_to_rows(plain, wrap_width)
-        else:
-            wrapped = wrap_ansi_line_to_rows(line, wrap_width)
-        if margin_markers:
-            margin = margin_markers[i] if i < len(margin_markers) else MARGIN_EMPTY
-            for j, segment in enumerate(wrapped):
-                prefix = margin if j == 0 else MARGIN_EMPTY
-                row = prefix + segment
-                if highlighted:
-                    row_text = row.decode("utf-8", errors="replace")
-                    pad = max(0, term_width - visible_len(row_text))
-                    row = highlight_escape + row + b" " * pad + RESET.encode()
-                display_lines.append(row)
-        elif highlighted:
-            display_lines.extend(
-                highlight_escape
-                + seg
-                + b" "
-                * max(
-                    0,
-                    term_width - visible_len(seg.decode("utf-8", errors="replace")),
-                )
-                + RESET.encode()
-                for seg in wrapped
-            )
-        else:
-            display_lines.extend(wrapped)
+        source = (
+            Text.from_ansi(line.decode("utf-8", errors="replace")).plain.encode()
+            if highlighted
+            else line
+        )
+        for j, segment in enumerate(wrap_ansi_line_to_rows(source, wrap_width)):
+            row = segment
+            if margin_markers:
+                margin = margin_markers[i] if i < len(margin_markers) else MARGIN_EMPTY
+                row = (margin if j == 0 else MARGIN_EMPTY) + row
+            if highlighted:
+                row = highlight_escape + row + RESET.encode()
+            display_lines.append(row)
 
     return display_lines or [b""]
 
@@ -1528,7 +1477,7 @@ def compute_diff_viewport(
 def chrome_line(text: str, term_width: int) -> str:
     """Wrap *text* with the chrome background, padded to *term_width*."""
     bg_text = BG_CHROME + text.replace(RESET, RESET + BG_CHROME)
-    pad = max(0, term_width - visible_len(text))
+    pad = max(0, term_width - visible_width(text))
     return bg_text + " " * pad + RESET
 
 
@@ -1564,7 +1513,10 @@ def build_top_bar(
         f"{counters}"
     )
     if term_width is not None:
-        bar = truncate_ansi_text(bar, term_width)
+        styled = Text.from_ansi(bar)
+        if styled.cell_len > term_width:
+            styled.truncate(term_width, overflow="ellipsis")
+            bar = render_ansi_text(styled)
     return bar
 
 
@@ -1676,7 +1628,7 @@ def build_keyhint_footer(
     for i, (key, label) in enumerate(segments):
         sep = "  " if i > 0 else ""
         segment = f"{sep}{DIM}{key}{RESET} {label}"
-        segment_width = visible_len(segment)
+        segment_width = visible_width(segment)
         if used + segment_width > term_width:
             truncated = True
             break
@@ -1743,7 +1695,7 @@ def build_note_panel_row(
     )
     preview = note_preview_text(ref.text)
     prefix = f"{cursor_mark}[{kind_str}] {DIM}{ref.scope_label}{RESET} "
-    max_preview = term_width - visible_len(prefix) - 1
+    max_preview = term_width - visible_width(prefix) - 1
     if max_preview > 0 and len(preview) > max_preview:
         preview = preview[: max_preview - 1] + TRUNCATION_ELLIPSIS
     elif max_preview <= 0:
@@ -2058,7 +2010,7 @@ class Terminal:
         desc_max = max_w - 2 - col - right_margin  # 2-char indent + key column + margin
         binding_rows: list[str] = []
         for key, desc in bindings:
-            desc_lines = wrap_plain_text(desc, desc_max)
+            desc_lines = textwrap.wrap(desc, desc_max)
             pad = " " * (col - len(key))
             binding_rows.append(f"  {BOLD}{key}{RESET}{pad}{desc_lines[0]}")
             cont_pad = " " * (2 + col)
@@ -2073,7 +2025,7 @@ class Terminal:
             "",
             f"  {DIM}Press any key to return.{RESET}",
         ]
-        width = max(visible_len(row) for row in rows) + right_margin
+        width = max(visible_width(row) for row in rows) + right_margin
         border = "─" * width
         self.write(chrome_line(f"┌{border}┐", self.width) + "\r\n")
         self.write(chrome_line(f"├{border}┤", self.width) + "\r\n")
@@ -2087,7 +2039,7 @@ class Terminal:
 
     def write_box_row(self, width: int, text: str = "") -> None:
         """Write one bordered row padded to *width*."""
-        pad = width - visible_len(text)
+        pad = width - visible_width(text)
         self.write(chrome_line(f"│{text}{' ' * pad}│", self.width) + "\r\n")
 
     def handle_manage_notes(self, state: ReviewState) -> None:
@@ -2513,7 +2465,7 @@ class Terminal:
         """Render the placeholder shown while the watched diff is empty."""
         self.write(self.CLEAR_SCREEN)
         row = max(1, self.height // 2)
-        col = max(1, (self.width - visible_len(EMPTY_DIFF_WAIT_MESSAGE)) // 2 + 1)
+        col = max(1, (self.width - visible_width(EMPTY_DIFF_WAIT_MESSAGE)) // 2 + 1)
         self.write(f"{CSI}{row};{col}H{DIM}{EMPTY_DIFF_WAIT_MESSAGE}{RESET}")
         self.write(f"{CSI}{self.height};1H")
         footer = build_keyhint_footer(WATCH_WAIT_FOOTER_SEGMENTS, self.width)

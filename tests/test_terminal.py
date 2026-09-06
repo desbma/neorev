@@ -16,6 +16,9 @@ from tests.helpers import (
     CENTERED_SNIPPET_TARGET_LINE,
     COMMENT_KEY_QUESTION,
     DELETE_FILE_DIFF,
+    DELTA_ADDED_BACKGROUND,
+    DELTA_REMOVED_BACKGROUND,
+    DELTA_WORD_BACKGROUND,
     DISPATCH_COMMENT_TEXT,
     DISPATCH_REDRAW_FALSE,
     ESC_ARROW_DOWN,
@@ -27,6 +30,7 @@ from tests.helpers import (
     GLOBAL_NOTE_DELETE_KEY,
     GLOBAL_NOTE_EDIT_KEY,
     GLOBAL_NOTE_EDITED_TEXT,
+    GRAPHEME_CLUSTER_SAMPLE,
     KEY_CTRL_C,
     LARGE_BODY_LINE_COUNT,
     LINE_PICKER_MANY_LINES,
@@ -50,7 +54,10 @@ from tests.helpers import (
     TERM_WIDTH,
     TINY_WIDTH,
     TOP_BAR_INDEX_TOKEN,
+    WIDE_CHARACTER_CELL_WIDTH,
+    WIDE_CHARACTER_SAMPLE,
     WIDE_FOOTER_WIDTH,
+    WIDE_GLYPH_SAMPLES,
     WINSIZE_FORMAT,
     FakeTTY,
     decode_visible_terminal_output,
@@ -58,36 +65,23 @@ from tests.helpers import (
     make_large_diff,
     neorev,
     remove_ansi_escape_sequences,
+    terminal_cell_width,
 )
 
 
 class TestRenderingHelpers(unittest.TestCase):
     """Tests for ANSI text measurement, wrapping, and display-line building."""
 
-    def test_visible_text_length_plain(self) -> None:
-        """Verify plain ASCII text has visible length equal to byte count."""
-        self.assertEqual(neorev.visible_len("hello"), 5)
+    def test_visible_width_plain(self) -> None:
+        """Verify plain ASCII text occupies one column per character."""
+        self.assertEqual(neorev.visible_width("hello"), 5)
 
-    def test_visible_text_length_ansi(self) -> None:
-        """Verify ANSI escape sequences are excluded from visible length."""
+    def test_visible_width_ansi(self) -> None:
+        """Verify ANSI escape sequences occupy no columns."""
         line = f"{neorev.GREEN}hello{neorev.RESET}"
-        self.assertEqual(neorev.visible_len(line), 5)
+        self.assertEqual(neorev.visible_width(line), 5)
 
-    def test_visible_len_str(self) -> None:
-        """Verify visible_len works on str with ANSI codes."""
-        text = f"{neorev.BOLD}hi{neorev.RESET}"
-        self.assertEqual(neorev.visible_len(text), 2)
-
-    def test_estimate_wrapped_rows_short(self) -> None:
-        """Verify a short line occupies one wrapped row."""
-        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(b"short", TERM_WIDTH)), 1)
-
-    def test_estimate_wrapped_rows_long(self) -> None:
-        """Verify a line longer than term_width wraps to multiple rows."""
-        long_line = b"x" * (TERM_WIDTH * 2)
-        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(long_line, TERM_WIDTH)), 2)
-
-    def test_estimate_wrapped_rows_empty(self) -> None:
+    def test_wrap_ansi_line_empty(self) -> None:
         """Verify an empty line still occupies one display row."""
         self.assertEqual(len(neorev.wrap_ansi_line_to_rows(b"", TERM_WIDTH)), 1)
 
@@ -111,8 +105,8 @@ class TestRenderingHelpers(unittest.TestCase):
         """Verify leading/trailing blank lines from delta output are stripped."""
         raw = b"\nline1\nline2\n"
         lines = neorev.build_display_lines(raw, TERM_WIDTH)
-        self.assertEqual(lines[0], b"line1")
-        self.assertEqual(lines[-1], b"line2")
+        self.assertEqual(lines[0].rstrip(), b"line1")
+        self.assertEqual(lines[-1].rstrip(), b"line2")
 
     def test_build_display_lines_empty(self) -> None:
         """Verify empty input produces a single empty-bytes entry."""
@@ -120,11 +114,21 @@ class TestRenderingHelpers(unittest.TestCase):
         self.assertEqual(lines, [b""])
 
     def test_wrap_ansi_line_short(self) -> None:
-        """Verify a line shorter than term_width is returned as-is."""
+        """Verify a line shorter than term_width becomes one row padded to width."""
         line = b"hello"
         result = neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0], b"hello")
+        self.assertEqual(result[0], b"hello" + b" " * (TERM_WIDTH - len(line)))
+
+    def test_wrap_ansi_line_pads_with_trailing_style(self) -> None:
+        """Verify row padding falls back to the trailing style with no erase."""
+        line = f"{neorev.BG_BLUE}text{neorev.RESET}".encode()
+        (row,) = neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)
+        self.assertIn(neorev.BG_BLUE, row.decode())
+        self.assertEqual(
+            terminal_cell_width(remove_ansi_escape_sequences(row.decode())),
+            TERM_WIDTH,
+        )
 
     def test_wrap_ansi_line_exact(self) -> None:
         """Verify a line exactly term_width long produces one row."""
@@ -138,34 +142,12 @@ class TestRenderingHelpers(unittest.TestCase):
         result = neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)
         self.assertEqual(len(result), 2)
 
-    def test_update_active_sgr_reset_clears(self) -> None:
-        """Verify a reset sequence clears the active SGR list."""
-        active: list[str] = [neorev.BOLD]
-        neorev.update_active_sgr(f"{neorev.CSI}0m", active)
-        self.assertEqual(active, [])
+    def test_visible_width_unicode(self) -> None:
+        """Verify narrow multi-byte UTF-8 characters occupy one column each."""
+        self.assertEqual(neorev.visible_width("héllo"), 5)
 
-    def test_update_active_sgr_accumulates(self) -> None:
-        """Verify non-reset SGR sequences accumulate."""
-        active: list[str] = []
-        neorev.update_active_sgr(neorev.BOLD, active)
-        neorev.update_active_sgr(neorev.GREEN, active)
-        self.assertEqual(len(active), 2)
-
-    def test_visible_text_length_unicode(self) -> None:
-        """Verify multi-byte UTF-8 characters count as single visible characters."""
-        self.assertEqual(neorev.visible_len("héllo"), 5)
-
-    def test_visible_len_no_ansi(self) -> None:
-        """Verify plain string with no escapes returns len()."""
-        self.assertEqual(neorev.visible_len("hello"), 5)
-
-    def test_estimate_wrapped_rows_exactly_width(self) -> None:
-        """Verify a line exactly term_width visible chars occupies 1 row."""
-        line = b"x" * TERM_WIDTH
-        self.assertEqual(len(neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)), 1)
-
-    def test_estimate_wrapped_rows_one_over(self) -> None:
-        """Verify a line of term_width + 1 visible chars occupies 2 rows."""
+    def test_wrap_ansi_line_one_over(self) -> None:
+        """Verify a line of term_width + 1 columns occupies 2 rows."""
         line = b"x" * (TERM_WIDTH + 1)
         self.assertEqual(len(neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)), 2)
 
@@ -190,19 +172,53 @@ class TestRenderingHelpers(unittest.TestCase):
         second_row = result[1].decode("utf-8", errors="replace")
         self.assertIn(neorev.GREEN, second_row)
 
-    def test_wrap_ansi_line_term_width_1(self) -> None:
-        """Verify term_width <= 1 returns the line as-is (guard clause)."""
-        line = b"hello"
-        result = neorev.wrap_ansi_line_to_rows(line, 1)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0], line)
-
     def test_build_display_lines_multiple_wraps(self) -> None:
         """Verify lines exceeding width produce more display lines than raw lines."""
         long_line = b"x" * (TERM_WIDTH * 2)
         raw = long_line + b"\n" + b"short"
         lines = neorev.build_display_lines(raw, TERM_WIDTH)
         self.assertGreater(len(lines), 2)
+
+    def test_visible_width_wide_characters(self) -> None:
+        """Verify wide characters count as two terminal columns."""
+        self.assertEqual(
+            neorev.visible_width(WIDE_CHARACTER_SAMPLE), WIDE_CHARACTER_CELL_WIDTH
+        )
+
+    def test_wrap_ansi_line_wide_glyphs(self) -> None:
+        """Verify rows holding wide glyphs stay within the terminal width."""
+        for sample in WIDE_GLYPH_SAMPLES:
+            with self.subTest(sample=sample):
+                line = (sample * TERM_WIDTH).encode()
+                for row in neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH):
+                    visible = remove_ansi_escape_sequences(row.decode())
+                    self.assertLessEqual(terminal_cell_width(visible), TERM_WIDTH)
+
+    def test_wrap_ansi_line_keeps_every_character(self) -> None:
+        """Verify wrapping a grapheme cluster across the fold loses no text."""
+        text = "x" * (TERM_WIDTH - 2) + GRAPHEME_CLUSTER_SAMPLE + "PAYLOAD"
+        rows = neorev.wrap_ansi_line_to_rows(text.encode(), TERM_WIDTH)
+        joined = "".join(
+            remove_ansi_escape_sequences(row.decode()).rstrip() for row in rows
+        )
+        self.assertEqual(joined, text)
+
+    def test_wrap_ansi_line_pads_with_erase_background(self) -> None:
+        """Verify padding uses the background active at delta's erase sequence."""
+        text = "foo x"
+        line = (
+            f"{DELTA_REMOVED_BACKGROUND}foo {DELTA_WORD_BACKGROUND}x{neorev.RESET}"
+            f"{DELTA_REMOVED_BACKGROUND}{neorev.ERASE_TO_LINE_END}{neorev.RESET}"
+        ).encode()
+        (row,) = neorev.wrap_ansi_line_to_rows(line, TERM_WIDTH)
+        padding = " " * (TERM_WIDTH - len(text))
+        self.assertIn(DELTA_REMOVED_BACKGROUND + padding, row.decode())
+
+    def test_wrap_ansi_line_keeps_empty_change_background(self) -> None:
+        """Verify a changed line with no text keeps its background across the row."""
+        line = f"{DELTA_ADDED_BACKGROUND}{neorev.ERASE_TO_LINE_END}{neorev.RESET}"
+        (row,) = neorev.wrap_ansi_line_to_rows(line.encode(), TERM_WIDTH)
+        self.assertIn(DELTA_ADDED_BACKGROUND + " " * TERM_WIDTH, row.decode())
 
 
 class TestViewport(unittest.TestCase):
@@ -424,71 +440,38 @@ class TestChrome(unittest.TestCase):
         full_footer = neorev.build_keyhint_footer(
             neorev.MAIN_FOOTER_SEGMENTS, WIDE_FOOTER_WIDTH, ellipsis=True
         )
-        visible = neorev.visible_len(full_footer)
+        visible = neorev.visible_width(full_footer)
         exact_footer = neorev.build_keyhint_footer(
             neorev.MAIN_FOOTER_SEGMENTS, visible, ellipsis=True
         )
         self.assertNotIn("…", exact_footer)
 
 
-class TestTruncateAnsiText(unittest.TestCase):
-    """Tests for truncate_ansi_text."""
-
-    def test_no_truncation_needed(self) -> None:
-        """Return text unchanged when it fits within max_visible."""
-        text = "hello"
-        result = neorev.truncate_ansi_text(text, TERM_WIDTH)
-        self.assertEqual(result, text)
-
-    def test_plain_text_truncated(self) -> None:
-        """Truncate plain text and append ellipsis."""
-        text = "hello world"
-        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
-        visible = neorev.ANSI_ESCAPE_TEXT_RE.sub("", result)
-        self.assertEqual(len(visible), TINY_WIDTH)
-        self.assertTrue(visible.endswith(neorev.TRUNCATION_ELLIPSIS))
-
-    def test_ansi_sequences_preserved(self) -> None:
-        """Check ANSI escape sequences pass through without consuming visible budget."""
-        text = f"{neorev.BOLD}hello world{neorev.RESET}"
-        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
-        visible = neorev.ANSI_ESCAPE_TEXT_RE.sub("", result)
-        self.assertEqual(len(visible), TINY_WIDTH)
-        self.assertIn(neorev.BOLD, result)
-
-    def test_zero_width_returns_empty(self) -> None:
-        """Verify a max_visible of zero produces an empty string."""
-        self.assertEqual(neorev.truncate_ansi_text("hello", 0), "")
-
-    def test_width_one_returns_ellipsis(self) -> None:
-        """Verify a max_visible of one returns just the ellipsis character."""
-        result = neorev.truncate_ansi_text("hello world", 1)
-        self.assertEqual(result, neorev.TRUNCATION_ELLIPSIS)
-
-    def test_ends_with_reset(self) -> None:
-        """Verify truncated ANSI text ends with RESET before ellipsis."""
-        text = f"{neorev.RED}a long red string{neorev.RESET}"
-        result = neorev.truncate_ansi_text(text, TINY_WIDTH)
-        self.assertIn(neorev.RESET, result)
-
-
 class TestTopBarTruncation(unittest.TestCase):
     """Tests for build_top_bar width truncation."""
 
     def test_narrow_width_truncates(self) -> None:
-        """Verify top bar is truncated when term_width is small."""
+        """Verify top bar is truncated to an ellipsis when term_width is small."""
         hunk = make_hunk()
         bar = neorev.build_top_bar(
             hunk, 0, [hunk], [], term_width=NARROW_PROGRESS_WIDTH
         )
-        visible = neorev.visible_len(bar)
-        self.assertLessEqual(visible, NARROW_PROGRESS_WIDTH)
+        self.assertLessEqual(neorev.visible_width(bar), NARROW_PROGRESS_WIDTH)
+        visible = remove_ansi_escape_sequences(bar)
+        self.assertTrue(visible.endswith(neorev.TRUNCATION_ELLIPSIS))
+
+    def test_fitting_width_passes_bar_through(self) -> None:
+        """Verify a bar that fits reaches the terminal exactly as it was built."""
+        hunk = make_hunk()
+        untruncated = neorev.build_top_bar(hunk, 0, [hunk], [], term_width=None)
+        bar = neorev.build_top_bar(hunk, 0, [hunk], [], term_width=WIDE_FOOTER_WIDTH)
+        self.assertEqual(bar, untruncated)
 
     def test_no_truncation_without_width(self) -> None:
         """Verify top bar is not truncated when term_width is None (default)."""
         hunk = make_hunk()
         bar = neorev.build_top_bar(hunk, 0, [hunk], [], term_width=None)
-        visible = neorev.visible_len(bar)
+        visible = neorev.visible_width(bar)
         self.assertGreater(visible, NARROW_PROGRESS_WIDTH)
 
 
@@ -531,7 +514,7 @@ class TestFooterTinyWidth(unittest.TestCase):
         """Verify tiny widths produce a footer without crashing."""
         for w in range(1, TINY_WIDTH + 1):
             result = neorev.build_keyhint_footer(neorev.MAIN_FOOTER_SEGMENTS, w)
-            visible = neorev.visible_len(result)
+            visible = neorev.visible_width(result)
             self.assertLessEqual(visible, w)
 
 

@@ -2,11 +2,12 @@
 
 ## Overview
 
-neorev is a single-file Python 3 CLI tool (`./neorev`) for interactive human review of [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) unified diffs. It reads a diff from stdin, renders hunks via `delta`, and lets the user annotate them. No build step, no external Python dependencies — only stdlib and the `delta` binary. Tested on Python 3.13+; may work on earlier Python 3 versions.
+neorev is a single-file Python 3 CLI tool (`./neorev`) for interactive human review of [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) unified diffs. It reads a diff from stdin, renders hunks via `delta`, and lets the user annotate them. No build step: dependencies are declared in a [PEP 723](https://peps.python.org/pep-0723/) header and installed by `uv` through the shebang. Tested on Python 3.13+; may work on earlier Python 3 versions.
 
 ## Code Style
 
-- Python 3.13+. No third-party imports.
+- Python 3.13+.
+- Third-party imports are allowed, but each one must remove more code than it adds. Declare them in the PEP 723 header, and add them to the `tests` and `type-check` jobs of `.github/workflows/ci.yml`.
 - Dataclasses for all structured data.
 - No `_` prefix on any name (methods, functions, variables, attributes) unless it is genuinely unused (e.g. `for _ in range(n)`). All names are plain, even internal helpers.
 - Docstrings mandatory on all functions (imperative mood).
@@ -34,7 +35,7 @@ Unless stated otherwise, always use a red-green testing approach:
 
 ## Testing
 
-Tests use `unittest` (stdlib only), live under `tests/`, and are split across logical modules.
+Tests use `unittest`, live under `tests/`, and are split across logical modules. They import `neorev` as a module, so the interpreter running them needs the PEP 723 dependencies installed.
 
 - Tests must follow the same code style conventions as the main code (docstrings, type annotations, named constants, etc.).
 - Tests must pass the same formatter, linter, and type checker as the main code.
@@ -52,18 +53,10 @@ python3 -m unittest tests.test_diff.TestParseDiff.test_single_hunk
 
 ## Linting & Formatting
 
-Code must pass all three:
+Code and tests must pass all three (`ty` needs the third-party dependencies importable):
 
 ```sh
-ty check neorev
-ruff check neorev
-ruff format --check neorev
-```
-
-Tests must also pass:
-
-```sh
-ty check tests
-ruff check tests
-ruff format --check tests
+uvx --with rich ty check neorev tests
+ruff check neorev tests
+ruff format --check neorev tests
 ```

@@ -6,10 +6,12 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import re
 import select
 import struct
 import sys
 import termios
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Self
@@ -26,6 +28,7 @@ neorev = importlib.util.module_from_spec(
 sys.modules["neorev"] = neorev
 NEOREV_LOADER.exec_module(neorev)
 
+ANSI_ESCAPE_TEXT_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 TERM_WIDTH = 80
 TERM_HEIGHT = 24
 TERM_PIXEL_SIZE = 0  # pixel dimensions unused by tests
@@ -35,6 +38,17 @@ SELECT_TIMEOUT = 0.1
 READ_DRAIN_TIMEOUT = 0.01
 READ_DRAIN_EMPTY_POLLS = 3
 TINY_WIDTH = 5
+WIDE_EAST_ASIAN_WIDTHS = ("W", "F")
+WIDE_CHARACTER_SAMPLE = "漢字"
+WIDE_CHARACTER_CELL_WIDTH = 4
+EMOJI_SAMPLE = "🚀"
+WIDE_GLYPH_SAMPLES = (WIDE_CHARACTER_SAMPLE, EMOJI_SAMPLE)
+# Heart plus variation selector: one grapheme, two cells, two code points.
+GRAPHEME_CLUSTER_SAMPLE = "❤️"
+# Backgrounds delta paints removed lines, changed words and added lines with.
+DELTA_REMOVED_BACKGROUND = "\x1b[48;2;63;0;1m"
+DELTA_WORD_BACKGROUND = "\x1b[48;2;144;16;17m"
+DELTA_ADDED_BACKGROUND = "\x1b[48;2;0;40;0m"
 NARROW_FOOTER_WIDTH = 15
 WIDE_FOOTER_WIDTH = 120
 NARROW_PROGRESS_WIDTH = 40
@@ -431,7 +445,15 @@ def reopen_review(
 
 def remove_ansi_escape_sequences(text: str) -> str:
     """Return *text* with ANSI escape sequences removed."""
-    return neorev.ANSI_ESCAPE_TEXT_RE.sub("", text)
+    return ANSI_ESCAPE_TEXT_RE.sub("", text)
+
+
+def terminal_cell_width(text: str) -> int:
+    """Return the terminal column count of *text*, counting wide characters as two."""
+    return sum(
+        2 if unicodedata.east_asian_width(char) in WIDE_EAST_ASIAN_WIDTHS else 1
+        for char in text
+    )
 
 
 def decode_visible_terminal_output(output: bytes) -> str:

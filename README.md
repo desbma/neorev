@@ -31,7 +31,7 @@ Main screen, selecting a line in hunk:
   - tied to a line, a hunk, or global
   - request for change or question
 - Minimal solution:
-  - single file, no external Python dependencies
+  - single file, with dependencies declared inline ([PEP 723](https://peps.python.org/pep-0723/)) and installed on first run
   - rely on [`delta`](https://github.com/dandavison/delta) for diff formatting and coloring
   - rely on your editor to write annotations
 - Quit and resume review without losing state
@@ -53,12 +53,14 @@ Agents are not like humans. They don't need you to be nice or polite, in fact st
 
 ## Install
 
-Install [delta](https://github.com/dandavison/delta) (you haven't already, seriously?), ensure you have a recent Python version, download [`neorev`](https://raw.githubusercontent.com/desbma/neorev/master/neorev) from this repository, make it executable and you are ready to go.
+Install [delta](https://github.com/dandavison/delta) (you haven't already, seriously?) and [uv](https://github.com/astral-sh/uv), download [`neorev`](https://raw.githubusercontent.com/desbma/neorev/master/neorev) from this repository, make it executable and you are ready to go.
 
 ```bash
 curl https://raw.githubusercontent.com/desbma/neorev/master/neorev -o neorev
 chmod +x ./neorev
 ```
+
+The shebang runs the script with `uv`, which installs the dependencies listed in the script's PEP 723 header on first run.
 
 The interface uses [Nerd Font](https://www.nerdfonts.com/) icons (e.g. for file status and note markers), so a patched font is required for them to render correctly.
 
