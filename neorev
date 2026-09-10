@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     from rich.style import Style
     from textual.app import ComposeResult, RenderResult
     from textual.events import Resize
+    from textual.geometry import Region
+    from textual.strip import Strip
     from textual.timer import Timer
     from unidiff.patch import Line
 
@@ -1199,6 +1201,14 @@ def diff_line_text(line: bytes, margin: str = "") -> Text:
     return text
 
 
+def render_hunk_lines(lines: list[bytes], markers: list[str]) -> list[Text]:
+    """Build the renderable of every ``delta`` output line, under its margin marker."""
+    return [
+        diff_line_text(line, markers[index] if index < len(markers) else "")
+        for index, line in enumerate(lines)
+    ]
+
+
 def pad_to_width(text: Text, width: int) -> Text:
     """Pad *text* with blanks up to *width* columns, in the style it carries."""
     text.pad_right(max(0, width - text.cell_len))
@@ -1458,13 +1468,18 @@ class PickerList(ReviewOptionList):
     ]
 
     def __init__(self, rebuild: Callable[[int], None]) -> None:
-        """Store *rebuild*, called with the content width on every resize."""
+        """Store *rebuild*, called with the content width whenever it changes."""
         super().__init__(compact=True)
         self.rebuild = rebuild
+        self.built_width: int | None = None
 
-    def on_resize(self) -> None:
-        """Build the prompts again for the new width."""
-        self.rebuild(self.scrollable_content_region.width)
+    def render_lines(self, crop: Region) -> list[Strip]:
+        """Build the prompts for the current width, then draw the rows of *crop*."""
+        width = self.scrollable_content_region.width
+        if width > 0 and width != self.built_width:
+            self.built_width = width
+            self.rebuild(width)
+        return super().render_lines(crop)
 
 
 class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
@@ -1475,15 +1490,21 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
         Binding("escape,q", "cancel", "cancel"),
     ]
 
-    def __init__(self, state: ReviewState, kind: NoteKind, start_line: int) -> None:
-        """Render the current hunk of *state*, in the pick style of *kind*."""
+    def __init__(
+        self,
+        state: ReviewState,
+        kind: NoteKind,
+        start_line: int,
+        line_texts: list[Text],
+    ) -> None:
+        """Pick among *line_texts* of the current hunk, in the pick style of *kind*."""
         super().__init__()
         self.state = state
         self.start_line = start_line
         self.pick_style = (
             STYLE_PICK_FLAG if kind is NoteKind.FLAG else STYLE_PICK_QUESTION
         )
-        self.lines = render_through_delta(state.current_hunk.raw)
+        self.line_texts = line_texts
         self.prompts: list[Text] = []
         self.painted: int | None = None
 
@@ -1497,14 +1518,7 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
     def rebuild(self, width: int) -> None:
         """Build one option per diff line, each padded to *width*."""
         hunk = self.state.current_hunk
-        markers = build_margin_markers(hunk)
-        self.prompts = [
-            pad_to_width(
-                diff_line_text(line, markers[index] if index < len(markers) else ""),
-                width,
-            )
-            for index, line in enumerate(self.lines)
-        ]
+        self.prompts = [pad_to_width(text.copy(), width) for text in self.line_texts]
         options = self.query_one(PickerList)
         cursor = options.highlighted
         self.painted = None
@@ -1517,6 +1531,8 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
             options.scroll_to_highlight(top=True)
         else:
             options.highlighted = cursor
+        if options.highlighted is not None:
+            self.paint_cursor(options, options.highlighted)
         options.focus()
 
     def line_target(self, index: int) -> LineTarget | None:
@@ -1532,21 +1548,25 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
         """Leave the picker without choosing a target."""
         self.dismiss(None)
 
+    def paint_cursor(self, options: OptionList, index: int) -> None:
+        """Draw the line at *index* in the pick style, restoring the one it left."""
+        if index == self.painted:
+            return
+        if self.painted is not None:
+            options.replace_option_prompt_at_index(
+                self.painted, self.prompts[self.painted]
+            )
+        plain = Text(self.prompts[index].plain, justify="left")
+        plain.stylize(self.pick_style)
+        options.replace_option_prompt_at_index(index, plain)
+        self.painted = index
+
     def on_option_list_option_highlighted(
         self,
         event: OptionList.OptionHighlighted,
     ) -> None:
         """Paint the line under the cursor, and repaint the one it left."""
-        options = event.option_list
-        if self.painted is not None:
-            options.replace_option_prompt_at_index(
-                self.painted, self.prompts[self.painted]
-            )
-        index = event.option_index
-        plain = Text(self.prompts[index].plain, justify="left")
-        plain.stylize(self.pick_style)
-        options.replace_option_prompt_at_index(index, plain)
-        self.painted = index
+        self.paint_cursor(event.option_list, event.option_index)
 
     def on_option_list_option_selected(
         self,
@@ -1740,6 +1760,7 @@ class ReviewApp(App[None], inherit_bindings=False):
         self.shown_index: int | None = None
         self.painted = 0
         self.line_rows: list[int] = []
+        self.line_texts: list[Text] = []
         self.review_written = False
         self.reload_timer: Timer | None = None
         self.watch_process: subprocess.Popen[bytes] | None = None
@@ -1801,6 +1822,7 @@ class ReviewApp(App[None], inherit_bindings=False):
         self.diff_log.clear()
         self.painted = 0
         self.line_rows = []
+        self.line_texts = []
         if not self.state.is_empty:
             index = self.state.current_index
             self.margin_markers = build_margin_markers(self.state.current_hunk)
@@ -1831,12 +1853,10 @@ class ReviewApp(App[None], inherit_bindings=False):
         width = log.scrollable_content_region.width
         if width <= 0:
             return
-        markers = self.margin_markers
-        for offset, line in enumerate(lines):
-            index = first + offset
-            margin = markers[index] if index < len(markers) else ""
+        for text in render_hunk_lines(lines, self.margin_markers[first:]):
             self.line_rows.append(len(log.lines))
-            log.write(diff_line_text(line, margin), width=width)
+            self.line_texts.append(text)
+            log.write(text, width=width)
 
     def top_display_line(self) -> int:
         """Return the display line the diff view starts on."""
@@ -1883,16 +1903,18 @@ class ReviewApp(App[None], inherit_bindings=False):
         if generation != self.delta_generation:
             return
         self.delta_complete.add(index)
-        self.check_delta_shape(self.state.hunks[index], self.delta_cache.get(index, []))
+        self.check_delta_shape(
+            self.state.hunks[index], len(self.delta_cache.get(index, []))
+        )
 
-    def check_delta_shape(self, hunk: Hunk, rows: list[bytes]) -> bool:
+    def check_delta_shape(self, hunk: Hunk, rows: int) -> bool:
         """Leave the review when a hunk with display lines has a different row count."""
         expected = len(hunk.display_lines)
         # A rename carries no body, so delta renders its header instead of lines.
-        if not expected or len(rows) == expected:
+        if not expected or rows == expected:
             return True
         self.delta_mismatch = (
-            f"{hunk.short_location}: {len(rows)} rows for {expected} diff lines"
+            f"{hunk.short_location}: {rows} rows for {expected} diff lines"
         )
         self.exit(return_code=os.EX_SOFTWARE)
         return False
@@ -1961,10 +1983,20 @@ class ReviewApp(App[None], inherit_bindings=False):
         if not hunk.selectable_lines:
             self.write_hunk_note(kind, HunkTarget())
             return
-        picker = LinePicker(self.state, kind, self.top_display_line())
-        if not self.check_delta_shape(hunk, picker.lines):
+        line_texts = self.hunk_line_texts()
+        if not self.check_delta_shape(hunk, len(line_texts)):
             return
+        picker = LinePicker(self.state, kind, self.top_display_line(), line_texts)
         self.push_screen(picker, partial(self.write_hunk_note, kind))
+
+    def hunk_line_texts(self) -> list[Text]:
+        """Return the renderable of every delta line of the current hunk."""
+        index = self.state.current_index
+        cached = self.delta_cache.get(index, [])
+        if index in self.delta_complete and len(self.line_texts) == len(cached):
+            return self.line_texts
+        raw = self.state.current_hunk.raw
+        return render_hunk_lines(render_through_delta(raw), self.margin_markers)
 
     def write_hunk_note(self, kind: NoteKind, target: NoteTarget | None) -> None:
         """Edit the note of *kind* on *target*, dropping it when left empty."""

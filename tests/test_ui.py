@@ -7,6 +7,8 @@ from unittest.mock import patch
 from rich.color import ColorType
 from rich.segment import Segment
 from rich.style import Style
+from textual.geometry import Region
+from textual.strip import Strip
 from textual.widgets import Footer, HelpPanel, OptionList, Static
 from textual.widgets._footer import FooterKey
 from textual.widgets._key_panel import BindingsTable
@@ -18,6 +20,7 @@ from tests.helpers import (
     GLOBAL_NOTE_ADD_QUESTION_KEY,
     GLOBAL_NOTE_CREATED_TEXT,
     GLOBAL_NOTE_EDITED_TEXT,
+    LARGE_LINE_PREFIX,
     LINE_PICKER_MANY_LINES,
     NOTE_DELETE_KEY,
     NOTE_EDIT_KEY,
@@ -623,6 +626,57 @@ class TestLinePicker(ReviewTestCase):
             picker = review.app.screen
             self.assertEqual(len(picker.query(neorev.TopBar)), 1)
             self.assertEqual(len(picker.query(neorev.Markers)), 1)
+
+    async def test_picker_reuses_what_the_diff_view_rendered(self) -> None:
+        """Verify opening the picker runs neither delta nor the line renderer again."""
+        async with review_session(make_large_diff(LINE_PICKER_MANY_LINES)) as review:
+            with (
+                patch.object(
+                    neorev, "diff_line_text", wraps=neorev.diff_line_text
+                ) as render,
+                patch.object(
+                    neorev, "render_through_delta", wraps=neorev.render_through_delta
+                ) as delta,
+            ):
+                await review.press(QUESTION_KEY)
+            render.assert_not_called()
+            delta.assert_not_called()
+            picker = review.app.screen
+            if not isinstance(picker, neorev.LinePicker):
+                self.fail("the line picker is not up")
+            self.assertEqual(len(picker.line_texts), LINE_PICKER_MANY_LINES)
+
+    async def test_picker_fills_its_first_frame(self) -> None:
+        """Verify the first paint of the line list already shows the diff lines."""
+        async with review_session(make_large_diff(LINE_PICKER_MANY_LINES)) as review:
+            frames: list[str] = []
+            draw = neorev.PickerList.render_lines
+
+            def record(options: neorev.PickerList, crop: Region) -> list[Strip]:
+                """Draw the rows of *crop* and keep the text they hold."""
+                strips = draw(options, crop)
+                frames.append("".join(strip.text for strip in strips))
+                return strips
+
+            with patch.object(neorev.PickerList, "render_lines", record):
+                await review.press(QUESTION_KEY)
+            self.assertTrue(frames)
+            self.assertIn(LARGE_LINE_PREFIX, frames[0])
+
+    async def test_picker_renders_the_lines_the_diff_view_is_missing(self) -> None:
+        """Verify the picker holds every line when the diff view lags behind."""
+        async with review_session(make_large_diff(LINE_PICKER_MANY_LINES)) as review:
+            review.app.delta_complete.clear()
+            review.app.line_texts = []
+            await review.press(QUESTION_KEY)
+            picker = review.app.screen
+            if not isinstance(picker, neorev.LinePicker):
+                self.fail("the line picker is not up")
+            self.assertEqual(len(picker.line_texts), LINE_PICKER_MANY_LINES)
+            self.assertEqual(
+                picker.query_one(OptionList).option_count,
+                LINE_PICKER_MANY_LINES,
+            )
 
     async def test_picker_survives_a_resize(self) -> None:
         """Verify resizing while picking rebuilds the lines at the new width."""

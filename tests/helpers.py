@@ -659,6 +659,8 @@ ANCHOR_LEGACY_COMMENT = "legacy note"
 
 LARGE_BODY_LINE_COUNT = 100
 LARGE_FILE_NAME = "big.txt"
+# The text every line of a large diff opens with, before its number.
+LARGE_LINE_PREFIX = "line "
 SECOND_LARGE_FILE_NAME = "other.txt"
 
 
@@ -673,7 +675,7 @@ def make_large_diff(
         f"+++ b/{name}\n"
         f"@@ -0,0 +1,{line_count} @@\n"
     )
-    body = "".join(f"+line {i}\n" for i in range(line_count))
+    body = "".join(f"+{LARGE_LINE_PREFIX}{i}\n" for i in range(line_count))
     return header + body
 
 
