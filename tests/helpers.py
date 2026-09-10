@@ -677,5 +677,31 @@ def make_large_diff(
     return header + body
 
 
+WIDE_BODY_LINE_COUNT = 30
+WIDE_LINE_WORD_COUNT = 20
+WIDE_FILE_NAME = "wide.txt"
+# The number the text of every line of a wide diff opens with.
+WIDE_LINE_NUMBER_FORMAT = "line {index:02d}"
+
+
+def make_wide_diff(
+    line_count: int = WIDE_BODY_LINE_COUNT,
+    words: int = WIDE_LINE_WORD_COUNT,
+) -> str:
+    """Build a synthetic diff whose added lines are wider than the terminal."""
+    header = (
+        f"diff --git a/{WIDE_FILE_NAME} b/{WIDE_FILE_NAME}\n"
+        f"--- a/{WIDE_FILE_NAME}\n"
+        f"+++ b/{WIDE_FILE_NAME}\n"
+        f"@@ -0,0 +1,{line_count} @@\n"
+    )
+    filler = " ".join(f"word{i}" for i in range(words))
+    body = "".join(
+        f"+{WIDE_LINE_NUMBER_FORMAT.format(index=i)} {filler}\n"
+        for i in range(line_count)
+    )
+    return header + body
+
+
 CENTERED_SNIPPET_LINE_COUNT = 20
 CENTERED_SNIPPET_TARGET_LINE = 10

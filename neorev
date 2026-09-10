@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from bisect import bisect_right
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1511,9 +1512,11 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
             Option(prompt, disabled=self.line_target(index) is None)
             for index, prompt in enumerate(self.prompts)
         )
-        options.highlighted = (
-            initial_picker_line(hunk, self.start_line) if cursor is None else cursor
-        )
+        if cursor is None:
+            options.highlighted = initial_picker_line(hunk, self.start_line)
+            options.scroll_to_highlight(top=True)
+        else:
+            options.highlighted = cursor
         options.focus()
 
     def line_target(self, index: int) -> LineTarget | None:
@@ -1736,6 +1739,7 @@ class ReviewApp(App[None], inherit_bindings=False):
         self.margin_markers: list[str] = []
         self.shown_index: int | None = None
         self.painted = 0
+        self.line_rows: list[int] = []
         self.review_written = False
         self.reload_timer: Timer | None = None
         self.watch_process: subprocess.Popen[bytes] | None = None
@@ -1796,6 +1800,7 @@ class ReviewApp(App[None], inherit_bindings=False):
         visible_end = self.visible_end()
         self.diff_log.clear()
         self.painted = 0
+        self.line_rows = []
         if not self.state.is_empty:
             index = self.state.current_index
             self.margin_markers = build_margin_markers(self.state.current_hunk)
@@ -1830,7 +1835,12 @@ class ReviewApp(App[None], inherit_bindings=False):
         for offset, line in enumerate(lines):
             index = first + offset
             margin = markers[index] if index < len(markers) else ""
+            self.line_rows.append(len(log.lines))
             log.write(diff_line_text(line, margin), width=width)
+
+    def top_display_line(self) -> int:
+        """Return the display line the diff view starts on."""
+        return max(bisect_right(self.line_rows, self.diff_log.scroll_offset.y) - 1, 0)
 
     @work(thread=True, exclusive=True, group=DELTA_WORKER_GROUP)
     def stream_hunk(self, index: int, raw: str, generation: int) -> None:
@@ -1951,7 +1961,7 @@ class ReviewApp(App[None], inherit_bindings=False):
         if not hunk.selectable_lines:
             self.write_hunk_note(kind, HunkTarget())
             return
-        picker = LinePicker(self.state, kind, self.diff_log.scroll_offset.y)
+        picker = LinePicker(self.state, kind, self.top_display_line())
         if not self.check_delta_shape(hunk, picker.lines):
             return
         self.push_screen(picker, partial(self.write_hunk_note, kind))
@@ -1966,7 +1976,7 @@ class ReviewApp(App[None], inherit_bindings=False):
             existing.text if existing is not None else "",
             f"{hunk.short_location}{HEADING_TARGET_SEPARATOR}{target}"
             f" [{kind.editor_label}]",
-            hunk.build_editor_context(target, self.diff_log.scroll_offset.y),
+            hunk.build_editor_context(target, self.top_display_line()),
         )
         if text:
             hunk.upsert_note(kind, target, text)

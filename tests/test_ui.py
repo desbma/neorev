@@ -30,10 +30,12 @@ from tests.helpers import (
     TERM_WIDTH,
     TWO_FILE_DIFF,
     TWO_HUNK_DIFF,
+    WIDE_LINE_NUMBER_FORMAT,
     FakeEditor,
     ReviewDriver,
     ReviewTestCase,
     make_large_diff,
+    make_wide_diff,
     neorev,
     rendered_segments,
     rendered_text,
@@ -99,6 +101,9 @@ HUNK_NOTE_EDITED_TEXT = "edited hunk note"
 PAINT_BACKLOG_LINES = 4000
 SHORT_HEIGHT = 10
 NARROW_WIDTH = 40
+WRAPPED_SCROLL_PRESSES = 4
+# Enough half-page scrolls to leave the row offset past the line count.
+DEEP_SCROLL_PRESSES = 12
 
 BRAND_TOKEN = "neorev"
 HUNK_TOKEN = "Hunk"
@@ -475,6 +480,25 @@ class TestHunkNotes(ReviewTestCase):
                 any(neorev.EDITOR_TARGET_MARKER in c for c in context or [])
             )
 
+    async def test_editor_context_starts_on_the_shown_line(self) -> None:
+        """Verify a hunk note quotes the wrapped lines the diff view shows."""
+        editor = FakeEditor(DISPATCH_COMMENT_TEXT)
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_wide_diff(), editor, size=size) as review:
+            log = review.app.query_one(neorev.Diff)
+            rows = len(log.lines) // len(review.state.current_hunk.display_lines)
+            for _ in range(WRAPPED_SCROLL_PRESSES):
+                await review.press(SCROLL_DOWN_KEY)
+            shown = log.scroll_offset.y // rows
+            await review.press(FLAG_KEY)
+            await review.press(WHOLE_HUNK_KEY)
+            (_existing, _location, context) = editor.calls[0]
+            self.assertIsNotNone(context)
+            self.assertIn(
+                WIDE_LINE_NUMBER_FORMAT.format(index=shown),
+                (context or [""])[0],
+            )
+
     async def test_hunk_without_selectable_line_skips_the_picker(self) -> None:
         """Verify a hunk with no added or removed line goes straight to the editor."""
         editor = FakeEditor(DISPATCH_COMMENT_TEXT)
@@ -518,6 +542,54 @@ class TestLinePicker(ReviewTestCase):
             await review.press(QUESTION_KEY)
             self.assertEqual(review.app.screen.query_one(OptionList).highlighted, 1)
 
+    async def test_picker_opens_where_the_diff_view_was_left(self) -> None:
+        """Verify the picker starts on the row the scrolled diff view starts on."""
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_large_diff(), size=size) as review:
+            await review.press(SCROLL_DOWN_KEY)
+            await review.press(SCROLL_DOWN_KEY)
+            offset = review.app.query_one(neorev.Diff).scroll_offset.y
+            self.assertGreater(offset, 0)
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(OptionList)
+            self.assertEqual(options.scroll_offset.y, offset)
+
+    def rows_per_line(self, review: ReviewDriver) -> int:
+        """Return how many rendered rows each display line of the hunk wraps to."""
+        rows = len(review.app.query_one(neorev.Diff).lines)
+        lines = len(review.state.current_hunk.display_lines)
+        self.assertEqual(rows, rows // lines * lines)
+        self.assertGreater(rows // lines, 1)
+        return rows // lines
+
+    async def test_picker_opens_where_a_wrapped_diff_view_was_left(self) -> None:
+        """Verify lines wrapping over several rows do not shift the picker."""
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_wide_diff(), size=size) as review:
+            rows = self.rows_per_line(review)
+            log = review.app.query_one(neorev.Diff)
+            for _ in range(WRAPPED_SCROLL_PRESSES):
+                await review.press(SCROLL_DOWN_KEY)
+            offset = log.scroll_offset.y
+            self.assertGreater(offset, 0)
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(OptionList)
+            self.assertEqual(options.highlighted, offset // rows)
+
+    async def test_picker_follows_a_scroll_past_the_line_count(self) -> None:
+        """Verify a row offset larger than the line count still finds its line."""
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_wide_diff(), size=size) as review:
+            rows = self.rows_per_line(review)
+            log = review.app.query_one(neorev.Diff)
+            for _ in range(DEEP_SCROLL_PRESSES):
+                await review.press(SCROLL_DOWN_KEY)
+            offset = log.scroll_offset.y
+            self.assertGreater(offset, len(review.state.current_hunk.display_lines))
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(OptionList)
+            self.assertEqual(options.highlighted, offset // rows)
+
     async def test_cursor_skips_over_context_lines(self) -> None:
         """Verify j moves from one changed line to the next, not to a context line."""
         diff = (
@@ -559,8 +631,12 @@ class TestLinePicker(ReviewTestCase):
             picker = review.app.screen
             if not isinstance(picker, neorev.LinePicker):
                 self.fail("the line picker is not up")
+            options = picker.query_one(neorev.PickerList)
+            await review.press(NEXT_KEY)
+            cursor = options.highlighted
             before = picker.prompts[0].cell_len
             await review.resize(NARROW_WIDTH, TERM_HEIGHT)
+            self.assertEqual(options.highlighted, cursor)
             width = picker.query_one(neorev.PickerList).scrollable_content_region.width
             self.assertNotEqual(before, width)
             self.assertEqual({prompt.cell_len for prompt in picker.prompts}, {width})
