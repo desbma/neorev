@@ -35,6 +35,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App
 from textual.binding import Binding, BindingType
+from textual.containers import Horizontal
 from textual.drivers.linux_driver import LinuxDriver
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, HelpPanel, Label, OptionList, RichLog, Static
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from textual.app import ComposeResult, RenderResult
     from textual.events import Resize
     from textual.geometry import Region
+    from textual.scroll_view import ScrollView
     from textual.strip import Strip
     from textual.timer import Timer
     from unidiff.patch import Line
@@ -118,6 +120,8 @@ DIFF_REMOVED_ICON = ""
 DIFF_RENAMED_ICON = ""
 DIFF_MODIFIED_ICON = ""
 RENAME_ARROW = "→"
+SCROLL_UP_ICON = "▲"
+SCROLL_DOWN_ICON = "▼"
 MARGIN_WIDTH = 2  # margin column chars (marker + space)
 MARGIN_EMPTY = " " * MARGIN_WIDTH
 HUNK_RANGE_PREFIX = "@@"
@@ -185,10 +189,10 @@ GLOBAL_NOTE_PROMPT = "Global note"
 # Textual theme drawing every colour from the terminal's own palette.
 APP_THEME = "ansi-dark"
 REVIEW_CSS = """
-TopBar, Markers {
+MarkerRow, TopBar, Markers {
     height: 1;
 }
-TopBar, Markers, Footer, FooterKey, FooterKey > .footer-key--description {
+MarkerRow, TopBar, Markers, Footer, FooterKey, FooterKey > .footer-key--description {
     background: ansi_black;
 }
 FooterKey > .footer-key--key {
@@ -206,14 +210,29 @@ Diff {
     overflow-x: hidden;
     overflow-y: auto;
 }
+/* Preserve a covered diff's width while hiding its scrollbar. */
+.covered Diff {
+    scrollbar-visibility: hidden;
+}
 #empty {
     display: none;
     height: 1fr;
     content-align: center middle;
 }
+HiddenRows {
+    display: none;
+    dock: right;
+    border-left: vkey ansi_default;
+}
+/* Visibility, not display: a covered marker line must not reflow. */
+.covered HiddenRows {
+    visibility: hidden;
+}
 LinePicker OptionList {
     height: 1fr;
-    overflow-y: scroll;
+    overflow-y: auto;
+    /* The reserved gutter keeps the width the prompts are padded to stable. */
+    scrollbar-gutter: stable;
 }
 /* Blank the block cursor of the list: the pick style paints the line itself. */
 LinePicker OptionList > .option-list--option-highlighted {
@@ -232,7 +251,7 @@ NotesScreen OptionList {
 GlobalNoteKind {
     align: center middle;
 }
-GlobalNoteKind Label {
+GlobalNoteKind > Label {
     padding: 1 2;
     border: round $primary;
     background: $surface;
@@ -270,7 +289,7 @@ class JjSource:
 
 
 class Status(enum.Enum):
-    """Enumerate high-level hunk review statuses."""
+    """High-level review status of a hunk."""
 
     APPROVED = enum.auto()
     FLAG = enum.auto()
@@ -278,7 +297,7 @@ class Status(enum.Enum):
 
 
 class NoteKind(enum.Enum):
-    """Enumerate note categories used in reviews — each value is its action label."""
+    """Category of a review note — each value is its action label."""
 
     FLAG = "CHANGE REQUESTED"
     QUESTION = "QUESTION"
@@ -306,7 +325,7 @@ class NoteKind(enum.Enum):
 
 
 class FileStatus(enum.Enum):
-    """Enumerate how a diff alters a file."""
+    """Way a diff alters a file."""
 
     MODIFIED = enum.auto()
     ADDED = enum.auto()
@@ -326,19 +345,26 @@ class FileStatus(enum.Enum):
 
 
 class LineSide(enum.Enum):
-    """Enumerate whether a note targets an added or removed line."""
+    """Side of a diff a note's target line sits on."""
 
     ADDED = "+"
     REMOVED = "-"
 
 
 class DisplayLineKind(enum.Enum):
-    """Enumerate logical diff row types — each value is the unified-diff prefix."""
+    """Logical kind of a diff line — each value is the unified-diff prefix."""
 
     ADDED = "+"
     REMOVED = "-"
     CONTEXT = " "
     META = "\\"
+
+
+class ScrollEdge(enum.Enum):
+    """Edge of a scrolling view — each value is its arrow."""
+
+    ABOVE = SCROLL_UP_ICON
+    BELOW = SCROLL_DOWN_ICON
 
 
 @dataclass
@@ -1415,6 +1441,49 @@ class Markers(Chrome):
         return build_progress_markers(self.state, self.size.width)
 
 
+class HiddenRows(Label):
+    """Count of the rows a scrolling view keeps past one of its edges."""
+
+    def __init__(self, scroller: ScrollView, edge: ScrollEdge) -> None:
+        """Count the rows *scroller* keeps past its *edge*."""
+        super().__init__()
+        self.scroller = scroller
+        self.edge = edge
+
+    def on_mount(self) -> None:
+        """Follow the scroll position, the content and the height of the view."""
+        self.watch(self.scroller, "scroll_y", self.follow_view)
+        self.watch(self.scroller, "virtual_size", self.follow_view)
+        # Only the scrollbar publishes the height of the view as a reactive.
+        self.watch(self.scroller.vertical_scrollbar, "window_size", self.follow_view)
+
+    def follow_view(self) -> None:
+        """Redraw the count, shown while the view keeps rows past its edge."""
+        self.display = self.rows() > 0
+        self.refresh(layout=True)
+
+    def rows(self) -> int:
+        """Return how many rows the view keeps past the edge counted."""
+        if not self.scroller.display:
+            return 0
+        above = self.scroller.scroll_offset.y
+        if self.edge is ScrollEdge.ABOVE:
+            return above
+        return self.scroller.max_scroll_y - above
+
+    def render(self) -> RenderResult:
+        """Draw how many rows the edge hides, then the arrow pointing at them."""
+        return Text(f"{self.rows()}{self.edge.value}")
+
+
+class MarkerRow(Horizontal):
+    """Marker line of a review screen, with the count of the rows hidden above."""
+
+    def __init__(self, state: ReviewState, scroller: ScrollView) -> None:
+        """Pair the markers of *state* with what *scroller* keeps above its view."""
+        super().__init__(Markers(state), HiddenRows(scroller, ScrollEdge.ABOVE))
+
+
 class Diff(RichLog, can_focus=False):
     """Scrollable view of the current hunk, as ``delta`` renders it."""
 
@@ -1429,14 +1498,21 @@ class Diff(RichLog, can_focus=False):
 
 
 class ReviewFooter(Footer):
-    """Footer naming every key an action answers to."""
+    """Footer naming every key an action answers to, plus an optional row count."""
+
+    def __init__(self, scroller: ScrollView | None = None) -> None:
+        """Count what *scroller* keeps below its viewport, if given."""
+        super().__init__()
+        self.scroller = scroller
 
     def compose(self) -> ComposeResult:
-        """Lay out the hints, each spelling out all the keys of its action."""
+        """Lay out the hints, each spelling out all its action keys, then the count."""
         for widget in super().compose():
             if isinstance(widget, FooterKey):
                 widget.key_display = self.keys_of_action(widget.action)
             yield widget
+        if self.scroller is not None:
+            yield HiddenRows(self.scroller, ScrollEdge.BELOW)
 
     def keys_of_action(self, action: str) -> str:
         """Join the display of every shown key bound to *action*."""
@@ -1510,10 +1586,11 @@ class LinePicker(Screen[NoteTarget | None], inherit_bindings=False):
 
     def compose(self) -> ComposeResult:
         """Lay out the chrome, the line list and the key hints."""
+        options = PickerList(self.rebuild)
         yield TopBar(self.state)
-        yield Markers(self.state)
-        yield PickerList(self.rebuild)
-        yield ReviewFooter()
+        yield MarkerRow(self.state, options)
+        yield options
+        yield ReviewFooter(options)
 
     def rebuild(self, width: int) -> None:
         """Build one option per diff line, each padded to *width*."""
@@ -1730,11 +1807,12 @@ class ReviewScreen(Screen[None], inherit_bindings=False):
 
     def compose(self) -> ComposeResult:
         """Lay out the chrome, the diff view and the key hints."""
+        diff = Diff(self.redraw)
         yield TopBar(self.state)
-        yield Markers(self.state)
-        yield Diff(self.redraw)
+        yield MarkerRow(self.state, diff)
+        yield diff
         yield Static(EMPTY_DIFF_WAIT_MESSAGE, id=EMPTY_ID)
-        yield ReviewFooter()
+        yield ReviewFooter(diff)
 
 
 class ReviewApp(App[None], inherit_bindings=False):
@@ -1743,6 +1821,8 @@ class ReviewApp(App[None], inherit_bindings=False):
     TITLE = "neorev"
     CSS = REVIEW_CSS
     ENABLE_COMMAND_PALETTE = False
+    # CSS class Textual puts on a screen covered by another.
+    SUSPENDED_SCREEN_CLASS = "covered"
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "quit", show=False, priority=True, system=True),
     ]
@@ -1795,8 +1875,12 @@ class ReviewApp(App[None], inherit_bindings=False):
         for chrome in self.query(Chrome):
             chrome.display = not empty
             chrome.refresh()
+        for row in self.query(MarkerRow):
+            row.display = not empty
         self.diff_log.display = not empty
         self.query_one(f"#{EMPTY_ID}", Static).display = empty
+        for count in self.query(HiddenRows):
+            count.follow_view()
         if empty:
             self.shown_index = None
             return

@@ -20,6 +20,7 @@ from tests.helpers import (
     GLOBAL_NOTE_ADD_QUESTION_KEY,
     GLOBAL_NOTE_CREATED_TEXT,
     GLOBAL_NOTE_EDITED_TEXT,
+    LARGE_BODY_LINE_COUNT,
     LARGE_LINE_PREFIX,
     LINE_PICKER_MANY_LINES,
     NOTE_DELETE_KEY,
@@ -33,6 +34,7 @@ from tests.helpers import (
     TERM_WIDTH,
     TWO_FILE_DIFF,
     TWO_HUNK_DIFF,
+    WIDE_BODY_LINE_COUNT,
     WIDE_LINE_NUMBER_FORMAT,
     FakeEditor,
     ReviewDriver,
@@ -103,11 +105,39 @@ PICKER_NOTE_TEXT = "look at this line"
 HUNK_NOTE_EDITED_TEXT = "edited hunk note"
 PAINT_BACKLOG_LINES = 4000
 SHORT_HEIGHT = 10
+# Lines a hunk holds to fit the view at full height, but not at SHORT_HEIGHT.
+FITTING_HUNK_LINES = 12
+# Words a line holds to wrap in the picker, narrower than the diff view by its gutter.
+WRAPPING_HUNK_WORDS = 8
+# Lines whose wrapped height fits the diff view but not the picker, at TINY_WIDTH.
+WRAPPING_HUNK_LINES = 3
+# Lines whose wrapped height fits the picker but not a diff view the help panel narrows.
+HELP_WRAPPING_HUNK_LINES = 11
+# Rows a scrolling view holds: the terminal less the two chrome lines and the footer.
+VIEW_ROWS = TERM_HEIGHT - 3
+SHORT_VIEW_ROWS = SHORT_HEIGHT - 3
+# Rows of a large hunk left below the view, seen from its top.
+LARGE_ROWS_BELOW = LARGE_BODY_LINE_COUNT - VIEW_ROWS
+SHORT_ROWS_BELOW = LARGE_BODY_LINE_COUNT - SHORT_VIEW_ROWS
+# Rows a half-page scroll moves.
+HALF_PAGE_ROWS = VIEW_ROWS // 2
+SHORT_HALF_PAGE_ROWS = SHORT_VIEW_ROWS // 2
+# Half-page scrolls leaving a single digit above the view at SHORT_HEIGHT.
+ONE_DIGIT_SCROLLS = 3
+TINY_WIDTH = 30
 NARROW_WIDTH = 40
 WRAPPED_SCROLL_PRESSES = 4
 # Enough half-page scrolls to leave the row offset past the line count.
 DEEP_SCROLL_PRESSES = 12
+# Cursor moves leaving the picker list scrolled well past its top at SHORT_HEIGHT.
+PICKER_NEXT_PRESSES = 20
+# Rows the picker list then hides above, its cursor resting on the last row shown.
+PICKER_ROWS_ABOVE = PICKER_NEXT_PRESSES - SHORT_VIEW_ROWS + 1
 
+# Every widget of the chrome drawn from the review state.
+CHROME_SELECTOR = "TopBar, Markers, HiddenRows"
+# The key a vkey border draws to set a count apart from the row it sits on.
+COUNT_SEPARATOR = "▏"
 BRAND_TOKEN = "neorev"
 HUNK_TOKEN = "Hunk"
 CURSOR_LINE_TOKEN = "import os"
@@ -882,6 +912,154 @@ class TestFooter(ReviewTestCase):
             self.assertEqual(footer_hints(review), GLOBAL_NOTE_FOOTER_HINTS)
 
 
+class TestHiddenRows(ReviewTestCase):
+    """Tests for the counts of the rows a scrolling view keeps out of sight."""
+
+    async def test_the_top_of_a_hunk_is_counted_below_only(self) -> None:
+        """Verify a hunk seen from its top counts below, under its scrollbar."""
+        async with review_session(make_large_diff()) as review:
+            above = hidden_rows(review, neorev.ScrollEdge.ABOVE)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertFalse(above.display)
+            self.assertTrue(below.display)
+            self.assertEqual(painted_text(below), below_text(LARGE_ROWS_BELOW))
+            scrollbar = review.app.query_one(neorev.Diff).vertical_scrollbar
+            self.assertEqual(below.region.right, scrollbar.region.right)
+
+    async def test_scrolling_moves_rows_from_below_to_above(self) -> None:
+        """Verify a scroll gives the count above what it takes from the one below."""
+        async with review_session(make_large_diff()) as review:
+            await review.press(SCROLL_DOWN_KEY)
+            above = hidden_rows(review, neorev.ScrollEdge.ABOVE)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertEqual(painted_text(above), above_text(HALF_PAGE_ROWS))
+            self.assertEqual(
+                painted_text(below), below_text(LARGE_ROWS_BELOW - HALF_PAGE_ROWS)
+            )
+            self.assertEqual(above.region.right, below.region.right)
+
+    async def test_the_end_of_a_hunk_is_counted_above_only(self) -> None:
+        """Verify a hunk scrolled to its end counts above and no longer below."""
+        async with review_session(make_large_diff()) as review:
+            for _ in range(DEEP_SCROLL_PRESSES):
+                await review.press(SCROLL_DOWN_KEY)
+            above = hidden_rows(review, neorev.ScrollEdge.ABOVE)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertEqual(painted_text(above), above_text(LARGE_ROWS_BELOW))
+            self.assertFalse(below.display)
+
+    async def test_wrapped_lines_are_counted_by_the_row(self) -> None:
+        """Verify a hunk of wrapping lines counts the rows it draws, not its lines."""
+        async with review_session(make_wide_diff()) as review:
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertGreater(below.rows(), WIDE_BODY_LINE_COUNT)
+
+    async def test_the_counts_follow_the_hunk(self) -> None:
+        """Verify moving to a hunk that fits takes both counts away, and back."""
+        diff = make_large_diff() + make_large_diff(
+            FITTING_HUNK_LINES, name=SECOND_LARGE_FILE_NAME
+        )
+        async with review_session(diff) as review:
+            await review.press(NEXT_KEY)
+            self.assertFalse(hidden_rows(review, neorev.ScrollEdge.ABOVE).display)
+            self.assertFalse(hidden_rows(review, neorev.ScrollEdge.BELOW).display)
+            await review.press(PREVIOUS_KEY)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertTrue(below.display)
+            self.assertEqual(painted_text(below), below_text(LARGE_ROWS_BELOW))
+
+    async def test_shrinking_the_view_brings_the_count_in(self) -> None:
+        """Verify a hunk that stops fitting on a resize gets counted."""
+        async with review_session(make_large_diff(FITTING_HUNK_LINES)) as review:
+            self.assertFalse(hidden_rows(review, neorev.ScrollEdge.BELOW).display)
+            await review.resize(TERM_WIDTH, SHORT_HEIGHT)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertTrue(below.display)
+            self.assertEqual(
+                painted_text(below), below_text(FITTING_HUNK_LINES - SHORT_VIEW_ROWS)
+            )
+
+    async def test_a_shorter_picker_counts_the_rows_it_loses(self) -> None:
+        """Verify a resize under the open picker recounts what its list hides."""
+        async with review_session(make_large_diff()) as review:
+            await review.press(QUESTION_KEY)
+            await review.resize(TERM_WIDTH, SHORT_HEIGHT)
+            below = hidden_rows(review, neorev.ScrollEdge.BELOW)
+            self.assertEqual(painted_text(below), below_text(SHORT_ROWS_BELOW))
+
+    async def test_the_picker_counts_the_rows_its_cursor_leaves_above(self) -> None:
+        """Verify the picker cursor leaving the top counts the rows its list hides."""
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_large_diff(), size=size) as review:
+            await review.press(QUESTION_KEY)
+            await review.press(*([NEXT_KEY] * PICKER_NEXT_PRESSES))
+            above = hidden_rows(review, neorev.ScrollEdge.ABOVE)
+            self.assertEqual(painted_text(above), above_text(PICKER_ROWS_ABOVE))
+
+    async def test_the_count_widens_with_another_digit(self) -> None:
+        """Verify a count scrolled into two digits is not drawn cut short."""
+        size = (TERM_WIDTH, SHORT_HEIGHT)
+        async with review_session(make_large_diff(), size=size) as review:
+            for _ in range(ONE_DIGIT_SCROLLS):
+                await review.press(SCROLL_DOWN_KEY)
+            above = hidden_rows(review, neorev.ScrollEdge.ABOVE)
+            rows = SHORT_HALF_PAGE_ROWS * ONE_DIGIT_SCROLLS
+            self.assertEqual(painted_text(above), above_text(rows))
+            await review.press(SCROLL_DOWN_KEY)
+            self.assertEqual(
+                painted_text(above), above_text(rows + SHORT_HALF_PAGE_ROWS)
+            )
+
+    async def test_the_picker_counts_what_only_it_scrolls(self) -> None:
+        """Verify a hunk the diff view holds is counted when the picker wraps it."""
+        diff = make_wide_diff(WRAPPING_HUNK_LINES, WRAPPING_HUNK_WORDS)
+        async with review_session(diff, size=(TINY_WIDTH, SHORT_HEIGHT)) as review:
+            self.assertFalse(review.app.query_one(neorev.Diff).show_vertical_scrollbar)
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(neorev.PickerList)
+            self.assertTrue(options.show_vertical_scrollbar)
+            self.assertTrue(hidden_rows(review, neorev.ScrollEdge.BELOW).display)
+
+    async def test_the_help_panel_brings_no_count_to_the_picker(self) -> None:
+        """Verify a diff view the help panel narrows brings no count to the picker."""
+        diff = make_wide_diff(HELP_WRAPPING_HUNK_LINES, WRAPPING_HUNK_WORDS)
+        async with review_session(diff) as review:
+            await review.press(HELP_KEY)
+            self.assertTrue(review.app.query_one(neorev.Diff).show_vertical_scrollbar)
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(neorev.PickerList)
+            self.assertFalse(options.show_vertical_scrollbar)
+            self.assertFalse(hidden_rows(review, neorev.ScrollEdge.BELOW).display)
+
+    async def test_a_picker_holding_the_whole_hunk_shows_no_scrollbar(self) -> None:
+        """Verify a picker with nothing to scroll shows neither bar nor count."""
+        async with review_session(SIMPLE_DIFF) as review:
+            await review.press(QUESTION_KEY)
+            options = review.app.screen.query_one(neorev.PickerList)
+            self.assertFalse(options.show_vertical_scrollbar)
+            self.assertFalse(hidden_rows(review, neorev.ScrollEdge.BELOW).display)
+
+
+class TestModalChrome(ReviewTestCase):
+    """Tests for what the review screen stops drawing while a modal covers it."""
+
+    async def test_a_modal_hides_the_counts_and_the_diff_scrollbar(self) -> None:
+        """Verify a modal drops the counts and the bar, leaving the diff width put."""
+        async with review_session(make_large_diff()) as review:
+            await review.press(SCROLL_DOWN_KEY)
+            diff = review.app.query_one(neorev.Diff)
+            scrollbar = diff.vertical_scrollbar
+            width = diff.scrollable_content_region.width
+            self.assertTrue(scrollbar.region)
+            await review.press(NOTES_KEY)
+            self.assertEqual(counts_shown(review), [False, False])
+            self.assertFalse(scrollbar.region)
+            self.assertEqual(diff.scrollable_content_region.width, width)
+            await review.press(CANCEL_KEY)
+            self.assertEqual(counts_shown(review), [True, True])
+            self.assertTrue(scrollbar.region)
+
+
 class TestHelpPanel(ReviewTestCase):
     """Tests for the key help."""
 
@@ -961,6 +1139,7 @@ class TestEmptyDiff(ReviewTestCase):
             self.assertTrue(review.state.is_empty)
             self.assertFalse(review.app.query_one(neorev.Diff).display)
             self.assertFalse(review.app.query_one(neorev.TopBar).display)
+            self.assertFalse(review.app.query_one(neorev.MarkerRow).display)
             placeholder = review.app.query_one(f"#{neorev.EMPTY_ID}", Static)
             self.assertTrue(placeholder.display)
             self.assertEqual(rendered_text(placeholder), neorev.EMPTY_DIFF_WAIT_MESSAGE)
@@ -988,10 +1167,12 @@ class TestTerminalColours(ReviewTestCase):
 
     async def test_chrome_colours_come_from_the_palette(self) -> None:
         """Verify the chrome names palette entries rather than absolute colours."""
-        async with review_session(SIMPLE_DIFF) as review:
-            for widget_type in (neorev.TopBar, neorev.Markers):
-                with self.subTest(widget=widget_type.__name__):
-                    for segment in rendered_segments(review.app.query_one(widget_type)):
+        async with review_session(make_large_diff()) as review:
+            await review.press(SCROLL_DOWN_KEY)
+            chrome = review.app.screen.query(CHROME_SELECTOR).nodes
+            for index, widget in enumerate(chrome):
+                with self.subTest(widget=f"{type(widget).__name__} {index}"):
+                    for segment in rendered_segments(widget):
                         self.assertTrue(is_palette_style(segment.style), segment.text)
 
     async def test_only_the_brand_carries_the_highlight(self) -> None:
@@ -1024,11 +1205,13 @@ class TestTerminalColours(ReviewTestCase):
 
     async def test_chrome_sits_on_its_own_background(self) -> None:
         """Verify the bars framing the diff are set off from it."""
-        async with review_session(SIMPLE_DIFF) as review:
+        async with review_session(make_large_diff()) as review:
+            await review.press(SCROLL_DOWN_KEY)
             widgets = [
                 review.app.query_one(neorev.TopBar),
                 review.app.query_one(neorev.Markers),
                 review.app.query_one(Footer),
+                *review.app.query(neorev.HiddenRows),
                 *review.app.query(FooterKey),
             ]
             for index, widget in enumerate(widgets):
@@ -1068,6 +1251,37 @@ def footer_hints(review: ReviewDriver) -> list[tuple[str, str]]:
     return [
         (key.key_display, key.description) for key in review.app.screen.query(FooterKey)
     ]
+
+
+def hidden_rows(
+    review: ReviewDriver,
+    edge: neorev.ScrollEdge,
+) -> neorev.HiddenRows:
+    """Return the count the visible screen carries past *edge*."""
+    counts = review.app.screen.query(neorev.HiddenRows).nodes
+    return next(count for count in counts if count.edge is edge)
+
+
+def counts_shown(review: ReviewDriver) -> list[bool]:
+    """Return whether each count of the review screen is drawn, above then below."""
+    screen = review.app.screen_stack[0]
+    return [count.visible for count in screen.query(neorev.HiddenRows).nodes]
+
+
+def painted_text(count: neorev.HiddenRows) -> str:
+    """Return the text *count* last painted, its separator included."""
+    strips = count.render_lines(count.region.reset_offset)
+    return "".join(segment.text for strip in strips for segment in strip)
+
+
+def above_text(rows: int) -> str:
+    """Return the text the count of *rows* hidden above paints."""
+    return f"{COUNT_SEPARATOR}{rows}{neorev.SCROLL_UP_ICON}"
+
+
+def below_text(rows: int) -> str:
+    """Return the text the count of *rows* hidden below paints."""
+    return f"{COUNT_SEPARATOR}{rows}{neorev.SCROLL_DOWN_ICON}"
 
 
 def is_palette_style(style: Style | None) -> bool:

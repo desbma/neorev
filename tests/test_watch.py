@@ -20,6 +20,7 @@ from tests.helpers import (
     TWO_HUNK_DIFF,
     ReviewDriver,
     ReviewTestCase,
+    make_large_diff,
     neorev,
     review_session,
 )
@@ -34,6 +35,7 @@ APPROVE_KEY = "a"
 QUIT_KEY = "q"
 FLAG_KEY = "f"
 CANCEL_KEY = "escape"
+SCROLL_DOWN_KEY = "ctrl+d"
 DEBOUNCE_TIMEOUT = 0.01
 DEBOUNCE_SETTLE = 0.2
 # Long enough for a watcher that ignores the shutdown to spawn inotifywait.
@@ -63,6 +65,11 @@ async def reload_with(review: ReviewDriver, diff_text: str) -> None:
     ):
         review.app.reload()
     await review.settle()
+
+
+def counts_shown(review: ReviewDriver) -> list[bool]:
+    """Return whether each count of *review* is drawn, above then below."""
+    return [count.display for count in review.app.query(neorev.HiddenRows).nodes]
 
 
 def watch_session_args(output: str) -> argparse.Namespace:
@@ -251,6 +258,15 @@ class TestWatchReload(ReviewTestCase):
             await reload_with(review, SIMPLE_DIFF)
             self.assertEqual(len(review.state.hunks), 1)
             self.assertTrue(review.app.query_one(neorev.Diff).display)
+
+    async def test_a_reload_to_an_empty_diff_takes_the_counts_away(self) -> None:
+        """Verify an emptied review leaves no count in the chrome it scrolled."""
+        async with watch_review(make_large_diff()) as (review, _):
+            await review.press(SCROLL_DOWN_KEY)
+            self.assertEqual(counts_shown(review), [True, True])
+            await reload_with(review, "")
+            self.assertTrue(review.state.is_empty)
+            self.assertEqual(counts_shown(review), [False, False])
 
     async def test_reload_waits_for_an_open_modal(self) -> None:
         """Verify a change under an open picker is held back until it closes."""
