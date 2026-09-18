@@ -108,6 +108,8 @@ Pass `-c`/`--clear` to discard a previous review and start fresh.
 
 Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-j` or auto-detected jj source — it cannot watch a piped diff). The current review is saved before each reload, just like quitting and reopening; with `-x`, the clipboard is only updated when you quit, never on an automatic reload.
 
+If no path is given with `-o`, `neorev` stores review files in `~/.local/state/agents/reviews/`, in a per project subdirectory shared by the workspaces of a repository.
+
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 
 This basically applies the [squash workflow](https://steveklabnik.github.io/jujutsu-tutorial/real-world-workflows/the-squash-workflow.html) to the agentic development process.
@@ -125,17 +127,6 @@ Notes :
 
 - you can stack another commit on top of the "under review" one, to track a round of changes, or to narrow down the review on a specific aspect
 - using Jujutsu [workspaces](https://docs.jj-vcs.dev/latest/cli-reference/#jj-workspace), you can do that on several trees simultaneously without disrupting work
-
-## Cleanup
-
-If no path is given, `neorev` stores review files by default in `~/.local/state/agents/reviews/`, in a per project subdirectory shared by the workspaces of a repository. To automatically clean up old review files, install the provided systemd user tmpfiles config:
-
-```bash
-mkdir -p ~/.config/user-tmpfiles.d/
-cp user-tmpfiles.d/neorev.conf ~/.config/user-tmpfiles.d/
-```
-
-This will automatically remove review files older than 2 months.
 
 ## License
 
