@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +44,7 @@ PROBE_TIMEOUT = 5.0
 
 
 @contextlib.asynccontextmanager
-async def watch_review(diff_text: str) -> AsyncIterator[tuple[ReviewDriver, Path]]:
+async def watch_review(diff_text: str) -> AsyncGenerator[tuple[ReviewDriver, Path]]:
     """Run a watched review over *diff_text*, yielding its driver and output path."""
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / WATCH_OUTPUT_NAME

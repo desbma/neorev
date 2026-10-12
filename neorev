@@ -44,7 +44,7 @@ from textual.widgets.option_list import Option
 from textual.worker import get_current_worker
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator
     from typing import IO
 
     from rich.style import Style
@@ -635,7 +635,7 @@ class ReviewState:
 
 
 @contextmanager
-def delta_output(raw: str) -> Iterator[IO[bytes]]:
+def delta_output(raw: str) -> Generator[IO[bytes]]:
     """Spawn ``delta`` on *raw* and yield its output stream, reaping it on exit."""
     with tempfile.TemporaryFile() as source:
         source.write(raw.encode())
@@ -657,7 +657,7 @@ def delta_output(raw: str) -> Iterator[IO[bytes]]:
 @contextmanager
 def inotify_events(
     paths: list[str],
-) -> Iterator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
+) -> Generator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
     """Watch *paths*, yielding the watcher and its events, reaping it on exit."""
     read_fd, write_fd = os.pipe()
     with (
@@ -2283,9 +2283,18 @@ def jj_workspace_roots() -> list[Path]:
     return [Path(line) for line in output.splitlines()]
 
 
+def common_prefix(strings: list[str]) -> str:
+    """Return the longest leading substring shared by all *strings*."""
+    first, last = min(strings), max(strings)
+    for index, char in enumerate(first):
+        if char != last[index]:
+            return first[:index]
+    return first
+
+
 def shared_workspace_root(cwd: Path, ws_roots: list[Path]) -> Path:
     """Return the directory shared by a repo's workspace roots, or *cwd*'s own root."""
-    shared = Path(os.path.commonprefix([str(root) for root in ws_roots]).rstrip(os.sep))
+    shared = Path(common_prefix([str(root) for root in ws_roots]).rstrip(os.sep))
     # a prefix cutting mid-component is not a real directory; back up to its parent
     if not shared.is_dir():
         shared = shared.parent

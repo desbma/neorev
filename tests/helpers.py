@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import unittest
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -599,7 +599,7 @@ async def review_session(
     size: tuple[int, int] = (TERM_WIDTH, TERM_HEIGHT),
     output_path: str = MOCK_OUTPUT_PATH,
     watch: neorev.JjSource | None = None,
-) -> AsyncIterator[ReviewDriver]:
+) -> AsyncGenerator[ReviewDriver]:
     """Run a review app over *diff_text* and yield a driver for it."""
     hunks = neorev.parse_diff(diff_text)
     state = neorev.ReviewState(

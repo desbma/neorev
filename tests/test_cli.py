@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -340,6 +341,15 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
             nested.mkdir(parents=True)
             result = neorev.shared_workspace_root(nested / "src", [main, nested])
         self.assertEqual(result, nested)
+
+    def test_emits_no_warning(self) -> None:
+        """Verify resolving the shared root raises no warning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main = Path(tmpdir) / "proj"
+            main.mkdir()
+            with warnings.catch_warnings(action="error"):
+                result = neorev.shared_workspace_root(main, [main])
+        self.assertEqual(result, main)
 
 
 class TestJjRoot(unittest.TestCase):
