@@ -1,5 +1,7 @@
 """CLI-related tests for neorev."""
 
+import contextlib
+import io
 import os
 import subprocess
 import tempfile
@@ -9,20 +11,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.helpers import (
-    MOCK_OUTPUT_PATH,
+    FAKE_CHANGE_ID,
     neorev,
 )
 
+PIPED_CWD = Path("/home/user/Projets/Piped")
+PIPED_DIRNAME = "projets-piped"
+REPO_DIRNAME = "projets-proj"
+RESOLVED_REV = "trunk()..@"
+OTHER_CHANGE_ID = "zzzzzzzzkkkkkkkkzzzzzzzzkkkkkkkk"
+
 
 class TestArgParser(unittest.TestCase):
-    """Tests for build_arg_parser and resolve_args."""
+    """Tests for build_arg_parser."""
 
     def test_output_flag(self) -> None:
-        """Verify the -o/--output flag sets the output path."""
+        """Verify the -o/--output flag sets the output path, other flags unset."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args(["-o", "out.md"])
         self.assertEqual(args.output, "out.md")
-        self.assertFalse(args.clip)
+        self.assertTrue(args.clip)
         self.assertFalse(args.clear)
 
     def test_output_long_form(self) -> None:
@@ -31,13 +39,12 @@ class TestArgParser(unittest.TestCase):
         args = parser.parse_args(["--output", "out.md"])
         self.assertEqual(args.output, "out.md")
 
-    def test_clip_flag(self) -> None:
-        """Verify the -x/--clip flag is recognised."""
+    def test_no_clip_flag(self) -> None:
+        """Verify the -X/--no-clip flag turns the clipboard copy off."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--clip", "-o", "out.md"])
-        self.assertTrue(args.clip)
-        args_short = parser.parse_args(["-x", "-o", "out.md"])
-        self.assertTrue(args_short.clip)
+        for flag in ("-X", "--no-clip"):
+            with self.subTest(flag=flag):
+                self.assertFalse(parser.parse_args([flag, "-o", "out.md"]).clip)
 
     def test_clear_flag(self) -> None:
         """Verify the -c/--clear flag is recognised."""
@@ -48,203 +55,122 @@ class TestArgParser(unittest.TestCase):
         self.assertTrue(args_short.clear)
 
     def test_output_defaults_to_none(self) -> None:
-        """Verify omitting -o leaves output as None for resolve_args to fill."""
+        """Verify omitting -o leaves output as None."""
         parser = neorev.build_arg_parser()
         args = parser.parse_args([])
         self.assertIsNone(args.output)
 
-    def test_resolve_args_fills_default_output(self) -> None:
-        """Verify resolve_args fills in a default output path when not provided."""
+    def test_jj_revision_argument(self) -> None:
+        """Verify the optional revision accepted by -j and --jj."""
         parser = neorev.build_arg_parser()
-        args = parser.parse_args([])
-        with patch.object(
-            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
-        ) as mock:
-            neorev.resolve_args(args)
-        self.assertEqual(args.output, MOCK_OUTPUT_PATH)
-        mock.assert_called_once_with(None)
+        cases = (
+            ([], None),
+            (["-j"], neorev.JJ_DEFAULT_REV),
+            (["-j", "abc123"], "abc123"),
+            (["--jj"], neorev.JJ_DEFAULT_REV),
+            (["--jj", "v1.0"], "v1.0"),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(parser.parse_args(argv).rev, expected)
 
-    def test_resolve_args_keeps_explicit_output(self) -> None:
-        """Verify resolve_args preserves an explicitly provided -o value."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-o", "mine.md"])
-        neorev.resolve_args(args)
-        self.assertEqual(args.output, "mine.md")
 
-    def test_jj_with_revision(self) -> None:
-        """Verify the -j flag records a JjSource with the given rev."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "abc123", "-o", "out.md"])
-        self.assertEqual(args.source, neorev.JjSource("abc123"))
-        self.assertEqual(args.output, "out.md")
+class TestResolveJjSource(unittest.TestCase):
+    """Tests for resolve_jj_source."""
 
-    def test_jj_without_revision(self) -> None:
-        """Verify the -j flag without a revision records JjSource(None)."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j"])
-        self.assertEqual(args.source, neorev.JjSource(None))
+    def resolve(self, stdout: str) -> tuple[neorev.JjSource, list[str]]:
+        """Resolve RESOLVED_REV against a jj printing *stdout*, with its command."""
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
+        with patch("neorev.subprocess.run", return_value=completed) as run:
+            source = neorev.resolve_jj_source(RESOLVED_REV)
+        return source, run.call_args[0][0]
 
-    def test_source_none_when_no_flag_passed(self) -> None:
-        """Verify source defaults to None without -j."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args([])
-        self.assertIsNone(args.source)
+    def test_returns_the_full_change_id(self) -> None:
+        """Verify the single change the revision matches is returned in full."""
+        source, command = self.resolve(f"{FAKE_CHANGE_ID}\n")
+        self.assertEqual(source, neorev.JjSource(FAKE_CHANGE_ID))
+        self.assertEqual(command[command.index("-r") + 1], RESOLVED_REV)
 
-    def test_long_form_jj_with_revision(self) -> None:
-        """Verify the --jj long form works with a revision."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--jj", "v1.0"])
-        self.assertEqual(args.source, neorev.JjSource("v1.0"))
+    def test_snapshots_the_working_copy(self) -> None:
+        """Verify the lookup lets jj record pending edits before evaluating."""
+        _, command = self.resolve(f"{FAKE_CHANGE_ID}\n")
+        self.assertNotIn("--ignore-working-copy", command)
 
-    def test_long_form_jj_without_revision(self) -> None:
-        """Verify the --jj long form works without a revision."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["--jj"])
-        self.assertEqual(args.source, neorev.JjSource(None))
+    def test_never_colors_the_change_id(self) -> None:
+        """Verify the lookup output stays free of escape codes whatever the config."""
+        _, command = self.resolve(f"{FAKE_CHANGE_ID}\n")
+        self.assertIn("--color=never", command)
+
+    def test_exits_when_the_change_id_selects_another_commit(self) -> None:
+        """Verify a divergent or hidden commit exits with a hint to pipe its diff."""
+        for state in ("divergent", "hidden"):
+            with (
+                self.subTest(state=state),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as caught,
+            ):
+                self.resolve(f"{FAKE_CHANGE_ID} {state}\n")
+            self.assertEqual(caught.exception.code, os.EX_DATAERR)
+            self.assertIn(f"jj show '{RESOLVED_REV}' | neorev", stderr.getvalue())
+
+    def test_exits_unless_exactly_one_change(self) -> None:
+        """Verify a revision matching no change or several exits with an error."""
+        for stdout in ("", f"{FAKE_CHANGE_ID}\n{OTHER_CHANGE_ID}\n"):
+            with (
+                self.subTest(stdout=stdout),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as caught,
+            ):
+                self.resolve(stdout)
+            self.assertEqual(caught.exception.code, os.EX_DATAERR)
+            self.assertIn(RESOLVED_REV, stderr.getvalue())
 
 
 class TestDefaultOutputPath(unittest.TestCase):
-    """Tests for default_output_path and jj_metadata."""
-
-    def make_meta(
-        self,
-        dirname: str = "proj",
-        rev: str | None = None,
-    ) -> neorev.JjMetadata:
-        """Build a JjMetadata with test defaults."""
-        return neorev.JjMetadata(dirname=dirname, rev=rev)
-
-    def test_uses_xdg_state_home_env(self) -> None:
-        """Respect $XDG_STATE_HOME when set."""
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
-            patch.object(neorev, "jj_metadata", return_value=self.make_meta()),
-        ):
-            result = neorev.default_output_path()
-        self.assertTrue(result.startswith(tmpdir))
-        self.assertTrue(result.endswith(".md"))
+    """Tests for default_output_path."""
 
     def test_falls_back_to_xdg_default(self) -> None:
         """Use ~/.local/state when $XDG_STATE_HOME is unset."""
         with (
             patch.dict(os.environ, {}, clear=True),
-            patch.object(neorev, "jj_metadata", return_value=self.make_meta()),
-            patch.object(Path, "mkdir"),
+            patch.object(Path, "cwd", return_value=PIPED_CWD),
         ):
-            result = neorev.default_output_path()
-        self.assertIn(".local/state/agents/reviews/proj", result)
+            result = neorev.default_output_path(None)
+        self.assertIn(f".local/state/agents/reviews/{PIPED_DIRNAME}", result)
 
-    def test_filename_parts_basic(self) -> None:
-        """Verify filename is just neorev.md; dirname becomes a subdirectory."""
+    def test_piped_diff_uses_xdg_state_without_jj(self) -> None:
+        """Verify a piped diff uses the XDG path without querying jj."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
-            patch.object(
-                neorev,
-                "jj_metadata",
-                return_value=self.make_meta(dirname="myproj"),
-            ),
+            patch.object(Path, "cwd", return_value=PIPED_CWD),
+            patch("neorev.subprocess.run") as run,
         ):
-            result = neorev.default_output_path()
-        self.assertEqual(Path(result).name, "neorev.md")
-        self.assertEqual(Path(result).parent.name, "myproj")
+            result = Path(neorev.default_output_path(None))
+        run.assert_not_called()
+        self.assertEqual(
+            result,
+            Path(tmpdir) / neorev.REVIEWS_STATE_DIR / PIPED_DIRNAME / "neorev.md",
+        )
 
-    def test_filename_parts_with_rev(self) -> None:
-        """Verify filename leads with the rev, and never carries the workspace name."""
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
-            patch.object(
-                neorev,
-                "jj_metadata",
-                return_value=self.make_meta(rev="def456"),
-            ),
-        ):
-            result = neorev.default_output_path()
-        self.assertEqual(Path(result).name, "def456-neorev.md")
-        self.assertEqual(Path(result).parent.name, "proj")
-
-    def test_does_not_create_state_directory(self) -> None:
-        """Verify default_output_path must not create the directory itself."""
+    def test_jj_source_leads_with_its_change_id(self) -> None:
+        """Verify a jj review file opens with a fixed-length change id prefix."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_dir = Path(tmpdir) / "sub" / "agents" / "reviews" / "proj"
+            workspace = Path(tmpdir) / "Projets" / "proj"
+            workspace.mkdir(parents=True)
             with (
-                patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmpdir) / "sub")}),
-                patch.object(neorev, "jj_metadata", return_value=self.make_meta()),
+                patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
+                patch.object(neorev, "jj_workspace_roots", return_value=[workspace]),
+                patch.object(Path, "cwd", return_value=workspace),
             ):
-                neorev.default_output_path()
-            self.assertFalse(state_dir.is_dir())
+                result = Path(
+                    neorev.default_output_path(neorev.JjSource(FAKE_CHANGE_ID))
+                )
+        prefix = FAKE_CHANGE_ID[: neorev.JJ_REV_LENGTH]
+        self.assertEqual(result.name, f"{prefix}-neorev.md")
+        self.assertEqual(result.parent.name, REPO_DIRNAME)
 
-    def test_resolve_args_detects_jj_from_flag(self) -> None:
-        """Verify resolve_args passes working-copy rev (None) to default_output_path."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j"])
-        with patch.object(
-            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
-        ) as mock:
-            neorev.resolve_args(args)
-        mock.assert_called_once_with(None)
-
-    def test_resolve_args_passes_jj_rev(self) -> None:
-        """Verify resolve_args forwards the jj revision to default_output_path."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args(["-j", "abc123"])
-        with patch.object(
-            neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH
-        ) as mock:
-            neorev.resolve_args(args)
-        mock.assert_called_once_with("abc123")
-
-    def test_resolve_args_fills_output_outside_jj(self) -> None:
-        """Verify resolve_args fills a default output for a piped diff outside jj."""
-        parser = neorev.build_arg_parser()
-        args = parser.parse_args([])
-        with (
-            patch.object(neorev, "jj_root", return_value=None),
-            patch.object(neorev, "default_output_path", return_value=MOCK_OUTPUT_PATH),
-        ):
-            neorev.resolve_args(args)
-        self.assertEqual(args.output, MOCK_OUTPUT_PATH)
-
-    def test_jj_uses_fixed_length_rev(self) -> None:
-        """Verify jj_metadata asks for a fixed-length change id, not the shortest."""
-        calls: list[list[str]] = []
-
-        def fake_run_jj(cmd: list[str]) -> str:
-            """Capture calls and return stub output."""
-            calls.append(cmd)
-            if "log" in cmd:
-                return "l" * neorev.JJ_REV_LENGTH
-            return "/some/path"
-
-        with patch.object(neorev, "run_jj", side_effect=fake_run_jj):
-            meta = neorev.jj_metadata()
-        self.assertEqual(meta.rev, "l" * neorev.JJ_REV_LENGTH)
-        log_cmd = calls[0]
-        template_arg = log_cmd[-1]
-        self.assertIn(f"short({neorev.JJ_REV_LENGTH})", template_arg)
-        self.assertNotIn("shortest", template_arg)
-
-    def test_jj_passes_custom_rev_to_log(self) -> None:
-        """Verify jj_metadata passes a custom rev to jj log -r."""
-        calls: list[list[str]] = []
-
-        def fake_run_jj(cmd: list[str]) -> str:
-            """Capture calls and return stub output."""
-            calls.append(cmd)
-            if "log" in cmd:
-                return "x"
-            return "/some/path"
-
-        with patch.object(neorev, "run_jj", side_effect=fake_run_jj):
-            meta = neorev.jj_metadata(rev="myrev")
-        self.assertEqual(meta.rev, "x")
-        log_cmd = calls[0]
-        r_idx = log_cmd.index("-r")
-        self.assertEqual(log_cmd[r_idx + 1], "myrev")
-
-    def test_jj_metadata_shares_dirname_across_workspaces(self) -> None:
+    def test_jj_source_shares_dirname_across_workspaces(self) -> None:
         """Verify every workspace of a repo resolves to the same project directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir) / "Projets"
@@ -252,30 +178,30 @@ class TestDefaultOutputPath(unittest.TestCase):
             feature_ws = base / "proj-feature"
             for workspace in (default_ws, feature_ws):
                 workspace.mkdir(parents=True)
-
-            def fake_run_jj(cmd: list[str]) -> str:
-                """Return a stub change id and the repo's workspace roots."""
-                if "log" in cmd:
-                    return "abc"
-                return f"{default_ws}\n{feature_ws}"
-
             dirnames = []
             for cwd in (default_ws, feature_ws, feature_ws / "src"):
                 with (
-                    patch.object(neorev, "run_jj", side_effect=fake_run_jj),
+                    patch.object(
+                        neorev,
+                        "jj_workspace_roots",
+                        return_value=[default_ws, feature_ws],
+                    ),
                     patch.object(Path, "cwd", return_value=cwd),
                 ):
-                    dirnames.append(neorev.jj_metadata().dirname)
-        self.assertEqual(dirnames, ["projets-proj"] * len(dirnames))
+                    output = neorev.default_output_path(neorev.JjSource(FAKE_CHANGE_ID))
+                dirnames.append(Path(output).parent.name)
+        self.assertEqual(dirnames, [REPO_DIRNAME] * len(dirnames))
 
-    def test_jj_metadata_falls_back_on_failure(self) -> None:
-        """Verify jj_metadata returns a name-only fallback when jj is unavailable."""
-        with (
-            patch.object(neorev, "run_jj", side_effect=FileNotFoundError),
-            patch.object(neorev, "project_name", return_value="proj"),
-        ):
-            meta = neorev.jj_metadata()
-        self.assertEqual(meta, neorev.JjMetadata(dirname="proj"))
+    def test_does_not_create_state_directory(self) -> None:
+        """Verify default_output_path must not create the directory itself."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "sub" / "agents" / "reviews" / PIPED_DIRNAME
+            with (
+                patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmpdir) / "sub")}),
+                patch.object(Path, "cwd", return_value=PIPED_CWD),
+            ):
+                neorev.default_output_path(None)
+            self.assertFalse(state_dir.is_dir())
 
 
 class TestProjectName(unittest.TestCase):

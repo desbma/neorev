@@ -83,6 +83,7 @@ UPSERT_NOTE_TEXT = "initial note"
 UPSERT_NOTE_UPDATED_TEXT = "updated note"
 LINE_PICKER_MANY_LINES = 30
 MOCK_OUTPUT_PATH = "/mock/output/review.md"
+FAKE_CHANGE_ID = "qpvuntsmwlqtpsluzzsnyyzlmlwvmlnu"
 # Slice textual's pilot sleeps for while polling the process clock for idleness.
 IDLE_POLL_GRANULARITY_S = 0.005
 
@@ -634,7 +635,7 @@ def run_main_with_scripted_app(
 ) -> str:
     """Run neorev.main() with *script* standing in for the UI, returning stderr."""
     stderr = io.StringIO()
-    argv = ["neorev", *(extra_args or []), "-o", output_path]
+    argv = ["neorev", "-X", *(extra_args or []), "-o", output_path]
 
     def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
         """Apply the scripted state mutations instead of starting the UI."""

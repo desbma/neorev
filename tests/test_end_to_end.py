@@ -7,9 +7,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from tests.helpers import (
+    FAKE_CHANGE_ID,
     FAKE_EDITOR,
     FENCED_BODY_DIFF,
     REOPEN_CYCLE_COUNT,
@@ -29,7 +30,7 @@ from tests.helpers import (
 
 MISMATCH_DETAIL = "hello.py:1: 2 rows for 4 diff lines"
 MISMATCH_NOTE_TEXT = "taken before the rows stopped lining up"
-MISMATCH_OUTPUT_NAME = "review.md"
+REVIEW_OUTPUT_NAME = "review.md"
 
 
 class TestMainWorkflow(unittest.TestCase):
@@ -195,12 +196,10 @@ class TestMainWorkflow(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_auto_detect_jj_uses_jj_show(self) -> None:
-        """Verify a detected jj repo with no piped diff defaults to 'jj show'."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            output_path = f.name
-
-        try:
+    def review_jj_change(self, extra_args: list[str]) -> tuple[MagicMock, str]:
+        """Review a jj change through main(), returning the lookup mock and output."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = str(Path(tmp) / REVIEW_OUTPUT_NAME)
             with (
                 patch.object(
                     neorev,
@@ -210,7 +209,12 @@ class TestMainWorkflow(unittest.TestCase):
                 patch.object(neorev, "jj_root", return_value="/repo"),
                 patch.object(
                     neorev,
-                    "fetch_diff_from_jj",
+                    "resolve_jj_source",
+                    return_value=neorev.JjSource(FAKE_CHANGE_ID),
+                ) as resolve_mock,
+                patch.object(
+                    neorev,
+                    "run_jj_or_exit",
                     return_value=TWO_HUNK_DIFF,
                 ) as fetch_mock,
             ):
@@ -218,58 +222,27 @@ class TestMainWorkflow(unittest.TestCase):
                     TWO_HUNK_DIFF,
                     output_path,
                     lambda state: state.hunks[0].__setattr__("approved", True),
+                    extra_args=extra_args,
                 )
-            fetch_mock.assert_called_once_with(["jj", "show"])
-            output = Path(output_path).read_text()
-            self.assertIn("`jj show`", output)
-        finally:
-            os.unlink(output_path)
+            fetch_mock.assert_called_once_with(["jj", "show", FAKE_CHANGE_ID])
+            return resolve_mock, Path(output_path).read_text()
 
-    def test_jj_with_revision_uses_jj_show_rev(self) -> None:
-        """Verify using -j REV runs 'jj show REV' and records it as the source."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            output_path = f.name
+    def test_auto_detect_jj_reviews_the_default_revision(self) -> None:
+        """Verify a detected jj repo with no piped diff reviews the default change."""
+        resolve_mock, output = self.review_jj_change([])
+        resolve_mock.assert_called_once_with(neorev.JJ_DEFAULT_REV)
+        self.assertIn(f"`jj show {FAKE_CHANGE_ID}`", output)
 
-        try:
-            with patch.object(
-                neorev,
-                "fetch_diff_from_jj",
-                return_value=TWO_HUNK_DIFF,
-            ) as fetch_mock:
-                run_main_with_scripted_app(
-                    TWO_HUNK_DIFF,
-                    output_path,
-                    lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-j", "abc123"],
-                )
-            fetch_mock.assert_called_once_with(["jj", "show", "abc123"])
-            output = Path(output_path).read_text()
-            self.assertIn("`jj show abc123`", output)
-        finally:
-            os.unlink(output_path)
+    def test_jj_with_revision_reviews_its_change(self) -> None:
+        """Verify -j REV reviews the change REV matches and records it as source."""
+        resolve_mock, output = self.review_jj_change(["-j", "abc123"])
+        resolve_mock.assert_called_once_with("abc123")
+        self.assertIn(f"`jj show {FAKE_CHANGE_ID}`", output)
 
-    def test_jj_without_revision_includes_diff_source(self) -> None:
-        """Verify using -j without a revision includes 'jj show' as diff source."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            output_path = f.name
-
-        try:
-            with patch.object(
-                neorev,
-                "fetch_diff_from_jj",
-                return_value=TWO_HUNK_DIFF,
-            ):
-                run_main_with_scripted_app(
-                    TWO_HUNK_DIFF,
-                    output_path,
-                    lambda state: state.hunks[0].__setattr__("approved", True),
-                    extra_args=["-j"],
-                )
-            output = Path(output_path).read_text()
-            self.assertIn("Reviewed diff:", output)
-            self.assertIn("jj show", output)
-        finally:
-            os.unlink(output_path)
+    def test_jj_without_revision_reviews_the_default_revision(self) -> None:
+        """Verify -j without a revision reviews the default change."""
+        resolve_mock, _ = self.review_jj_change(["-j"])
+        resolve_mock.assert_called_once_with(neorev.JJ_DEFAULT_REV)
 
     def test_clear_flag_discards_previous_review(self) -> None:
         """Verify the --clear flag discards a previous review and starts fresh."""
@@ -326,8 +299,8 @@ class TestDeltaMismatchExit(unittest.TestCase):
             app.delta_mismatch = MISMATCH_DETAIL
 
         with tempfile.TemporaryDirectory() as tmp:
-            output_path = str(Path(tmp) / MISMATCH_OUTPUT_NAME)
-            argv = ["neorev", "-o", output_path]
+            output_path = str(Path(tmp) / REVIEW_OUTPUT_NAME)
+            argv = ["neorev", "-X", "-o", output_path]
             with (
                 patch.object(neorev.ReviewApp, "run", run),
                 patch.dict(os.environ, {"EDITOR": FAKE_EDITOR}),
@@ -342,6 +315,41 @@ class TestDeltaMismatchExit(unittest.TestCase):
         self.assertIn(neorev.DELTA_MISMATCH_MESSAGE, stderr.getvalue())
         self.assertIn(MISMATCH_DETAIL, stderr.getvalue())
         self.assertIn(MISMATCH_NOTE_TEXT, written)
+
+
+class TestClipboardOnExit(unittest.TestCase):
+    """Workflow tests: a written review fills the clipboard unless -X is given."""
+
+    def test_written_review_is_copied_unless_disabled(self) -> None:
+        """Verify quitting with a written review copies it, except under -X."""
+
+        def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
+            """Flag a hunk instead of starting the UI."""
+            app.state.hunks[0].notes.append(
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG,
+                    target=neorev.HunkTarget(),
+                    text=WORKFLOW_FLAG_COMMENT,
+                )
+            )
+
+        for flags, copied in (([], True), (["-X"], False)):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                output_path = str(Path(tmp) / REVIEW_OUTPUT_NAME)
+                with (
+                    patch.object(neorev.ReviewApp, "run", run),
+                    patch.dict(os.environ, {"EDITOR": FAKE_EDITOR}),
+                    patch.object(sys, "argv", ["neorev", *flags, "-o", output_path]),
+                    patch.object(sys, "stdin", io.StringIO(SIMPLE_DIFF)),
+                    patch.object(sys, "stderr", io.StringIO()),
+                    patch.object(
+                        neorev, "copy_output_reference_to_clipboard"
+                    ) as clipboard,
+                ):
+                    neorev.main()
+                self.assertEqual(
+                    clipboard.call_args_list, [call(output_path)] if copied else []
+                )
 
 
 class TestAllClearSkipsFile(unittest.TestCase):

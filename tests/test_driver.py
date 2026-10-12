@@ -53,7 +53,7 @@ class Session:
         os.write(write_fd, SIMPLE_DIFF.encode())
         os.close(write_fd)
         self.process = subprocess.Popen(
-            [sys.executable, NEOREV_PATH, "-o", output_path],
+            [sys.executable, NEOREV_PATH, "-X", "-o", output_path],
             stdin=read_fd,
             stdout=slave_fd,
             stderr=slave_fd,

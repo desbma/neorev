@@ -12,9 +12,10 @@ import threading
 import unittest
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from tests.helpers import (
+    FAKE_CHANGE_ID,
     FAKE_EDITOR,
     SIMPLE_DIFF,
     TWO_HUNK_DIFF,
@@ -30,7 +31,10 @@ UNUSED_OUTPUT_PATH = "unused-review.md"
 APPROVED_HASHES_TOKEN = "approved-hashes="
 ALL_CLEAR_TOKEN = "all clear"
 INOTIFYWAIT_FAKE_PATH = "/usr/bin/inotifywait"
-JJ_WORKING_COPY_SOURCE = "jj show"
+JJ_CHANGE_SOURCE = f"jj show {FAKE_CHANGE_ID}"
+JJ_MISSING_CHANGE_ERROR = f"Error: Revision `{FAKE_CHANGE_ID}` doesn't exist\n"
+HUNK_NOTE_TEXT = "Rename this variable"
+GLOBAL_NOTE_TEXT = "Why this approach?"
 APPROVE_KEY = "a"
 QUIT_KEY = "q"
 FLAG_KEY = "f"
@@ -51,7 +55,7 @@ async def watch_review(diff_text: str) -> AsyncGenerator[tuple[ReviewDriver, Pat
         async with review_session(
             diff_text,
             output_path=str(output),
-            watch=neorev.JjSource(None),
+            watch=neorev.JjSource(FAKE_CHANGE_ID),
         ) as review:
             yield review, output
 
@@ -61,9 +65,10 @@ async def reload_with(review: ReviewDriver, diff_text: str) -> None:
     with patch.object(
         neorev,
         "fetch_watch_diff",
-        return_value=(diff_text, JJ_WORKING_COPY_SOURCE),
-    ):
+        return_value=(diff_text, JJ_CHANGE_SOURCE),
+    ) as fetch:
         review.app.reload()
+    fetch.assert_called_once_with(neorev.JjSource(FAKE_CHANGE_ID))
     await review.settle()
 
 
@@ -72,20 +77,13 @@ def counts_shown(review: ReviewDriver) -> list[bool]:
     return [count.display for count in review.app.query(neorev.HiddenRows).nodes]
 
 
-def watch_session_args(output: str) -> argparse.Namespace:
-    """Parse the command line of a watch session writing its review to *output*."""
-    return neorev.build_arg_parser().parse_args(["-w", "-x", "-o", output])
+def watch_session_args(output: str, *flags: str) -> argparse.Namespace:
+    """Parse the command line of a watch session with *flags*, writing to *output*."""
+    return neorev.build_arg_parser().parse_args(["-w", *flags, "-o", output])
 
 
 class TestJjWorkingCopyFlag(unittest.TestCase):
-    """The diff command snapshots the working copy; metadata queries skip it."""
-
-    def test_jj_diff_command_spellings(self) -> None:
-        """Verify jj_diff_command appends the rev and never stops snapshotting."""
-        cases = [(None, ["jj", "show"]), ("abc123", ["jj", "show", "abc123"])]
-        for rev, expected in cases:
-            with self.subTest(rev=rev):
-                self.assertEqual(neorev.jj_diff_command(rev), expected)
+    """Metadata queries skip snapshotting the working copy."""
 
     def test_jj_root_probes_with_ignore_working_copy(self) -> None:
         """Verify jj_root probes jj root with --ignore-working-copy."""
@@ -138,7 +136,7 @@ class TestWatchPaths(unittest.TestCase):
 
 
 class TestFetchWatchDiff(unittest.TestCase):
-    """fetch_watch_diff tolerates empty diffs and command failures."""
+    """Tests for fetch_watch_diff."""
 
     def test_returns_stdout_on_success(self) -> None:
         """Verify a successful command yields its stdout and the source label."""
@@ -146,17 +144,9 @@ class TestFetchWatchDiff(unittest.TestCase):
             args=[], returncode=0, stdout=SIMPLE_DIFF
         )
         with patch("neorev.subprocess.run", return_value=completed):
-            text, source = neorev.fetch_watch_diff(neorev.JjSource(None))
+            text, source = neorev.fetch_watch_diff(neorev.JjSource(FAKE_CHANGE_ID))
         self.assertEqual(text, SIMPLE_DIFF)
-        self.assertEqual(source, JJ_WORKING_COPY_SOURCE)
-
-    def test_returns_empty_on_failure(self) -> None:
-        """Verify a failed command yields empty text without raising."""
-        error = subprocess.CalledProcessError(1, ["jj", "show"])
-        with patch("neorev.subprocess.run", side_effect=error):
-            text, source = neorev.fetch_watch_diff(neorev.JjSource("abc"))
-        self.assertEqual(text, "")
-        self.assertEqual(source, "jj show abc")
+        self.assertEqual(source, JJ_CHANGE_SOURCE)
 
 
 class TestBuildWatchState(unittest.TestCase):
@@ -213,6 +203,26 @@ class TestWatchModeGuards(unittest.TestCase):
                 code = self.run_main(argv, "")
         self.assertEqual(code, os.EX_UNAVAILABLE)
 
+    def test_watch_keeps_the_change_found_at_startup(self) -> None:
+        """Verify watch mode reviews the change the default revision matched."""
+        source = neorev.JjSource(FAKE_CHANGE_ID)
+        with (
+            patch("neorev.shutil.which", return_value=INOTIFYWAIT_FAKE_PATH),
+            patch.dict(os.environ, {"EDITOR": FAKE_EDITOR}),
+            patch.object(sys, "argv", ["neorev", "-w", "-o", UNUSED_OUTPUT_PATH]),
+            patch.object(
+                neorev, "read_diff_from_stdin", side_effect=neorev.NoDiffOnStdinError
+            ),
+            patch.object(neorev, "jj_root", return_value="/repo"),
+            patch.object(
+                neorev, "resolve_jj_source", return_value=source
+            ) as resolve_mock,
+            patch.object(neorev, "run_watch_session") as session_mock,
+        ):
+            neorev.main()
+        resolve_mock.assert_called_once_with(neorev.JJ_DEFAULT_REV)
+        self.assertEqual(session_mock.call_args[0][1], source)
+
     def test_missing_editor_is_fatal(self) -> None:
         """Verify an unset $EDITOR stops the review before it starts."""
         with (
@@ -268,6 +278,36 @@ class TestWatchReload(ReviewTestCase):
             self.assertTrue(review.state.is_empty)
             self.assertEqual(counts_shown(review), [False, False])
 
+    async def test_failed_reload_keeps_the_review(self) -> None:
+        """Verify a diff jj can no longer show leaves the review and its notes alone."""
+        error = subprocess.CalledProcessError(
+            1, ["jj", "show"], stderr=JJ_MISSING_CHANGE_ERROR
+        )
+        async with watch_review(SIMPLE_DIFF) as (review, output):
+            review.state.hunks[0].notes.append(
+                neorev.HunkNote(
+                    kind=neorev.NoteKind.FLAG,
+                    target=neorev.HunkTarget(),
+                    text=HUNK_NOTE_TEXT,
+                )
+            )
+            review.state.global_notes.append(
+                neorev.GlobalNote(kind=neorev.NoteKind.QUESTION, text=GLOBAL_NOTE_TEXT)
+            )
+            with (
+                patch("neorev.subprocess.run", side_effect=error),
+                patch.object(review.app, "notify") as notify,
+            ):
+                review.app.reload()
+                await review.settle()
+            review.app.save_review()
+            written = output.read_text()
+        self.assertIn(HUNK_NOTE_TEXT, written)
+        self.assertIn(GLOBAL_NOTE_TEXT, written)
+        notify.assert_called_once_with(
+            JJ_MISSING_CHANGE_ERROR.strip(), severity="error"
+        )
+
     async def test_reload_waits_for_an_open_modal(self) -> None:
         """Verify a change under an open picker is held back until it closes."""
         fetched = asyncio.Event()
@@ -275,7 +315,7 @@ class TestWatchReload(ReviewTestCase):
         def fetch(source: neorev.JjSource) -> tuple[str, str]:  # noqa: ARG001
             """Record the diff being fetched again, and hand back a longer one."""
             fetched.set()
-            return TWO_HUNK_DIFF, JJ_WORKING_COPY_SOURCE
+            return TWO_HUNK_DIFF, JJ_CHANGE_SOURCE
 
         async with watch_review(SIMPLE_DIFF) as (review, _):
             with (
@@ -348,7 +388,7 @@ class TestWatcherShutdown(ReviewTestCase):
                 output_path=str(Path(tmp) / WATCH_OUTPUT_NAME),
                 diff_source=None,
                 diff_text="",
-                watch=neorev.JjSource(None),
+                watch=neorev.JjSource(FAKE_CHANGE_ID),
             )
             app = neorev.ReviewApp(state, session)
             with (
@@ -370,33 +410,38 @@ class TestWatcherShutdown(ReviewTestCase):
 class TestWatchSessionExit(unittest.TestCase):
     """Tests for watch-session output and clipboard handling on exit."""
 
-    def test_review_written_and_copied_on_quit(self) -> None:
-        """Verify quitting a watch session writes the file and fills the clipboard."""
-        clipboard = MagicMock()
-        with tempfile.TemporaryDirectory() as tmp:
-            output = str(Path(tmp) / WATCH_OUTPUT_NAME)
-            args = watch_session_args(output)
+    def test_review_written_on_quit_and_copied_unless_disabled(self) -> None:
+        """Verify quitting writes the file and fills the clipboard, except under -X."""
 
-            def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
-                """Approve every hunk instead of starting the UI."""
-                for hunk in app.state.hunks:
-                    hunk.approved = True
+        def run(app: neorev.ReviewApp, *, mouse: bool) -> None:  # noqa: ARG001
+            """Approve every hunk instead of starting the UI."""
+            self.assertEqual(app.session.watch, neorev.JjSource(FAKE_CHANGE_ID))
+            for hunk in app.state.hunks:
+                hunk.approved = True
 
-            with (
-                patch.object(neorev.ReviewApp, "run", run),
-                patch.object(
-                    neorev,
-                    "fetch_watch_diff",
-                    return_value=(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
-                ),
-                patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
-                patch.object(sys, "stderr", io.StringIO()),
-            ):
-                neorev.run_watch_session(args, neorev.JjSource(None))
-            content = Path(output).read_text()
-        self.assertEqual(clipboard.call_count, 1)
-        self.assertIn(ALL_CLEAR_TOKEN, content)
-        self.assertIn(APPROVED_HASHES_TOKEN, content)
+        for flags, copied in (([], True), (["-X"], False)):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                output = str(Path(tmp) / WATCH_OUTPUT_NAME)
+                args = watch_session_args(output, *flags)
+                with (
+                    patch.object(neorev.ReviewApp, "run", run),
+                    patch.object(
+                        neorev,
+                        "run_jj_diff",
+                        return_value=(SIMPLE_DIFF, JJ_CHANGE_SOURCE),
+                    ),
+                    patch.object(
+                        neorev, "copy_output_reference_to_clipboard"
+                    ) as clipboard,
+                    patch.object(sys, "stderr", io.StringIO()),
+                ):
+                    neorev.run_watch_session(args, neorev.JjSource(FAKE_CHANGE_ID))
+                content = Path(output).read_text()
+                self.assertEqual(
+                    clipboard.call_args_list, [call(output)] if copied else []
+                )
+                self.assertIn(ALL_CLEAR_TOKEN, content)
+                self.assertIn(APPROVED_HASHES_TOKEN, content)
 
     def test_untouched_review_writes_nothing(self) -> None:
         """Verify quitting without reviewing anything leaves no file behind."""
@@ -408,13 +453,13 @@ class TestWatchSessionExit(unittest.TestCase):
                 patch.object(neorev.ReviewApp, "run", MagicMock()),
                 patch.object(
                     neorev,
-                    "fetch_watch_diff",
-                    return_value=(SIMPLE_DIFF, JJ_WORKING_COPY_SOURCE),
+                    "run_jj_diff",
+                    return_value=(SIMPLE_DIFF, JJ_CHANGE_SOURCE),
                 ),
                 patch.object(neorev, "copy_output_reference_to_clipboard", clipboard),
                 patch.object(sys, "stderr", io.StringIO()),
             ):
-                neorev.run_watch_session(args, neorev.JjSource(None))
+                neorev.run_watch_session(args, neorev.JjSource(FAKE_CHANGE_ID))
             self.assertFalse(Path(output).exists())
         self.assertEqual(clipboard.call_count, 0)
 

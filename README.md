@@ -69,7 +69,7 @@ The interface uses [Nerd Font](https://www.nerdfonts.com/) icons (e.g. for file 
 1. Run `neorev` on a diff:
 
 ```bash
-# Review the current changes in the jj working copy ('jj show @'):
+# Review the jj working copy (@), or its closest non-empty mutable first-parent ancestor when @ is empty:
 neorev
 
 # Or pipe a diff explicitly:
@@ -102,13 +102,15 @@ q / Ctrl-C    Quit and write output to file
 
 Pasting `@review.md` in the agent window is all that is required. Since the output is unambiguous any additional message like "please process the attached review" is a pure waste of tokens and your time typing it.
 
-Pass `-x`/`--clip` to `neorev` to copy the message for the agent (`@OUTPUT`) to clipboard (requires `xclip`).
+When it writes a review file, `neorev` copies the message for the agent (`@OUTPUT`) to clipboard on exit (requires `xclip`); pass `-X`/`--no-clip` to skip it.
 
 Pass `-c`/`--clear` to discard a previous review and start fresh.
 
-Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-j` or auto-detected jj source — it cannot watch a piped diff). The current review is saved before each reload, just like quitting and reopening; with `-x`, the clipboard is only updated when you quit, never on an automatic reload.
+Pass `-w`/`--watch` to reload the review automatically when the repository changes (requires `inotifywait` and a `-j` or auto-detected jj source). The current review is saved before each reload, just like quitting and reopening; the clipboard is only updated when you quit, never on an automatic reload.
 
-If no path is given with `-o`, `neorev` stores review files in `~/.local/state/agents/reviews/`, in a per project subdirectory shared by the workspaces of a repository.
+A jj revision, given with `-j` or the default one, is resolved to its change once, at startup: the session keeps reviewing that change even if the revision later designates another one, e.g. `@` after `jj new`.
+
+If no path is given with `-o`, `neorev` stores review files in `~/.local/state/agents/reviews/`, in a per project subdirectory shared by the workspaces of a repository. A piped diff never queries the repository: its review goes to `neorev.md`, in a subdirectory named after the current directory.
 
 ## Example of workflow with [Jujutsu](https://github.com/jj-vcs/jj)
 
@@ -118,10 +120,10 @@ This basically applies the [squash workflow](https://steveklabnik.github.io/juju
 2. Create another empty commit on top of it, this will be the code **under review**: `jj new`
 3. Prompt the agent to start work
 4. When the agent is done:
-   - `jj show | neorev -x -o /tmp/review.md`
+   - `neorev`
    - if code fully meets expectations: `jj squash`, the end
    - if code partially meets expectations: `jj squash -i` to squash the good parts into the vetted commit
-5. Send `@/tmp/review.md` to the agent, go to 4
+5. Paste the clipboard (`@` followed by the review file path) to the agent, go to 4
 
 Notes :
 
