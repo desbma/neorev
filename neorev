@@ -2267,19 +2267,21 @@ def jj_root() -> str | None:
         return None
 
 
-def jj_workspace_roots() -> list[Path]:
-    """Return the root directory of every workspace of the current jj repo."""
-    output = run_jj(
+def jj_workspace_roots(current: Path) -> list[Path]:
+    """Return the store-holding workspace's root and every recorded workspace root."""
+    # jj records no root for workspaces created before jj 0.38
+    recorded = run_jj(
         [
             "jj",
             "workspace",
             "list",
             "--ignore-working-copy",
             "-T",
-            'root ++ "\\n"',
+            'if(root, root ++ "\\n")',
         ]
     )
-    return [Path(line) for line in output.splitlines()]
+    holder = jj_repo_dir(current).parent.parent
+    return [holder, *(Path(line) for line in recorded.splitlines())]
 
 
 def common_prefix(strings: list[str]) -> str:
@@ -2291,17 +2293,12 @@ def common_prefix(strings: list[str]) -> str:
     return first
 
 
-def shared_workspace_root(cwd: Path, ws_roots: list[Path]) -> Path:
-    """Return the directory shared by a repo's workspace roots, or *cwd*'s own root."""
+def shared_workspace_root(current: Path, ws_roots: list[Path]) -> Path:
+    """Return the directory shared by a repo's workspace roots, or *current* itself."""
     shared = Path(common_prefix([str(root) for root in ws_roots]).rstrip(os.sep))
     # a prefix cutting mid-component is not a real directory; back up to its parent
     if not shared.is_dir():
         shared = shared.parent
-    current = max(
-        (root for root in ws_roots if cwd.is_relative_to(root)),
-        key=lambda root: len(root.parts),
-        default=cwd,
-    )
     if len(current.parts) - len(shared.parts) >= WORKSPACE_SHARE_MAX_DEPTH_DELTA:
         return current
     return shared
@@ -2321,12 +2318,14 @@ def default_output_path(source: JjSource | None) -> str:
         "XDG_STATE_HOME",
         str(Path.home() / XDG_STATE_HOME_DEFAULT),
     )
-    cwd = Path.cwd()
     if source is None:
-        dirname = project_name(cwd)
+        dirname = project_name(Path.cwd())
         parts = [DEFAULT_OUTPUT_STEM]
     else:
-        dirname = project_name(shared_workspace_root(cwd, jj_workspace_roots()))
+        current = Path(run_jj(["jj", "root", "--ignore-working-copy"]))
+        dirname = project_name(
+            shared_workspace_root(current, jj_workspace_roots(current))
+        )
         parts = [source.change_id[:JJ_REV_LENGTH], DEFAULT_OUTPUT_STEM]
     filename = DEFAULT_OUTPUT_SEPARATOR.join(parts) + DEFAULT_OUTPUT_EXT
     return str(Path(xdg_state) / REVIEWS_STATE_DIR / dirname / filename)
@@ -2534,14 +2533,19 @@ def ensure_jj_or_exit(parser: argparse.ArgumentParser) -> None:
         exit(os.EX_USAGE)
 
 
-def jj_op_heads_dir(root: str) -> Path:
-    """Return the jj operation-heads directory, following a workspace repo pointer."""
-    repo = Path(root) / ".jj" / "repo"
+def jj_repo_dir(root: Path) -> Path:
+    """Return the jj repo directory of the workspace at *root*."""
+    repo = root / ".jj" / "repo"
     # In a non-default workspace, .jj/repo is a file holding the path to the
     # default workspace's shared repo directory rather than the directory itself.
     if repo.is_file():
         repo = (repo.parent / repo.read_text().strip()).resolve()
-    return repo / JJ_OP_HEADS_REL
+    return repo
+
+
+def jj_op_heads_dir(root: str) -> Path:
+    """Return the jj operation-heads directory of the workspace at *root*."""
+    return jj_repo_dir(Path(root)) / JJ_OP_HEADS_REL
 
 
 def watch_paths(root: str) -> list[str]:

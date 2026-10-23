@@ -20,6 +20,14 @@ PIPED_DIRNAME = "projets-piped"
 REPO_DIRNAME = "projets-proj"
 RESOLVED_REV = "trunk()..@"
 OTHER_CHANGE_ID = "zzzzzzzzkkkkkkkkzzzzzzzzkkkkkkkk"
+JJ_WORKSPACE_LIST_COMMAND = [
+    "jj",
+    "workspace",
+    "list",
+    "--ignore-working-copy",
+    "-T",
+    'if(root, root ++ "\\n")',
+]
 
 
 class TestArgParser(unittest.TestCase):
@@ -161,7 +169,7 @@ class TestDefaultOutputPath(unittest.TestCase):
             with (
                 patch.dict(os.environ, {"XDG_STATE_HOME": tmpdir}),
                 patch.object(neorev, "jj_workspace_roots", return_value=[workspace]),
-                patch.object(Path, "cwd", return_value=workspace),
+                patch.object(neorev, "run_jj", return_value=str(workspace)),
             ):
                 result = Path(
                     neorev.default_output_path(neorev.JjSource(FAKE_CHANGE_ID))
@@ -179,14 +187,14 @@ class TestDefaultOutputPath(unittest.TestCase):
             for workspace in (default_ws, feature_ws):
                 workspace.mkdir(parents=True)
             dirnames = []
-            for cwd in (default_ws, feature_ws, feature_ws / "src"):
+            for root in (default_ws, feature_ws):
                 with (
                     patch.object(
                         neorev,
                         "jj_workspace_roots",
                         return_value=[default_ws, feature_ws],
                     ),
-                    patch.object(Path, "cwd", return_value=cwd),
+                    patch.object(neorev, "run_jj", return_value=str(root)),
                 ):
                     output = neorev.default_output_path(neorev.JjSource(FAKE_CHANGE_ID))
                 dirnames.append(Path(output).parent.name)
@@ -259,15 +267,6 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
             result = neorev.shared_workspace_root(nested, [main, nested])
         self.assertEqual(result, nested)
 
-    def test_subdirectory_resolves_to_its_workspace_root(self) -> None:
-        """Verify a cwd below a workspace root is treated as that workspace."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main = Path(tmpdir) / "proj"
-            nested = main / ".worktrees" / "exp"
-            nested.mkdir(parents=True)
-            result = neorev.shared_workspace_root(nested / "src", [main, nested])
-        self.assertEqual(result, nested)
-
     def test_emits_no_warning(self) -> None:
         """Verify resolving the shared root raises no warning."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -276,6 +275,39 @@ class TestSharedWorkspaceRoot(unittest.TestCase):
             with warnings.catch_warnings(action="error"):
                 result = neorev.shared_workspace_root(main, [main])
         self.assertEqual(result, main)
+
+
+class TestJjWorkspaceRoots(unittest.TestCase):
+    """Tests for jj_workspace_roots."""
+
+    def test_lists_store_holder_and_recorded_roots(self) -> None:
+        """Return the store holder's root followed by every recorded root."""
+        current = Path("/repos/proj")
+        other = Path("/repos/proj-feature")
+        cases = (("", [current]), (str(other), [current, other]))
+        for recorded, expected in cases:
+            with (
+                self.subTest(recorded=recorded),
+                patch.object(neorev, "run_jj", return_value=recorded) as run,
+            ):
+                self.assertEqual(neorev.jj_workspace_roots(current), expected)
+                run.assert_called_once_with(JJ_WORKSPACE_LIST_COMMAND)
+
+    def test_unrecorded_store_holder_is_shared_by_every_workspace(self) -> None:
+        """Verify every workspace shares the root of an unrecorded store holder."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+            holder = base / "proj"
+            feature = base / "proj-feature"
+            (holder / ".jj" / "repo").mkdir(parents=True)
+            (feature / ".jj").mkdir(parents=True)
+            (feature / ".jj" / "repo").write_text("../../proj/.jj/repo")
+            results = []
+            for current in (holder, feature):
+                with patch.object(neorev, "run_jj", return_value=str(feature)):
+                    roots = neorev.jj_workspace_roots(current)
+                results.append(neorev.shared_workspace_root(current, roots))
+        self.assertEqual(results, [holder, holder])
 
 
 class TestJjRoot(unittest.TestCase):
