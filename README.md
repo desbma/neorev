@@ -16,9 +16,7 @@ Main screen, selecting a line in hunk:
 
 ---
 
-**This repository contains a personal tool that I publish for sharing, documentation and convenience.**
-
-**It may or may not work for your use case, and little effort has been made to support systems and workflows other than the ones I use.** For example, it has only been tested with my dark terminal theme and may not display well with others.
+**This repository contains a personal tool that I publish for sharing, documentation and convenience. It may or may not work for your use case, and little effort has been made to support systems and workflows other than the ones I use.** For example, it has only been tested with my dark terminal theme and may not display well with others.
 
 ---
 
